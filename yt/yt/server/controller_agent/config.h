@@ -598,7 +598,6 @@ DEFINE_REFCOUNTED_TYPE(TRemoteCopyOperationOptions)
 struct TGangManagerConfig
     : public NYTree::TYsonStruct
 {
-
     TDuration JobReincarnationTimeout;
 
     REGISTER_YSON_STRUCT(TGangManagerConfig);
@@ -1334,6 +1333,8 @@ struct TControllerAgentConfig
     bool EnableDynamicTableOutputChunkConstraintValidation;
 
     NServer::TOperationEventReporterConfigPtr OperationEventsReporter;
+
+    bool FailOperationsInEmptyTrees;
 
     REGISTER_YSON_STRUCT(TControllerAgentConfig);
 

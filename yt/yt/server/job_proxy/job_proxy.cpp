@@ -765,6 +765,7 @@ void TJobProxy::EnableRpcProxyInJobProxy(int rpcProxyWorkerThreadPoolSize, bool 
     }
 
     ApiServiceThreadPool_ = CreateThreadPool(rpcProxyWorkerThreadPoolSize, "RpcProxy");
+    auto apiInvoker = ApiServiceThreadPool_->GetInvoker();
 
     auto signatureGenerator = New<TProxySignatureGenerator>(*SupervisorProxy_, JobId_);
     connection->SetSignatureGenerator(std::move(signatureGenerator));
@@ -783,7 +784,7 @@ void TJobProxy::EnableRpcProxyInJobProxy(int rpcProxyWorkerThreadPoolSize, bool 
 
         auto localServerAddress = BuildServiceAddress(NNet::GetLocalHostName(), *Config_->BusServer->Port);
         auto shuffleService = CreateShuffleService(
-            ApiServiceThreadPool_->GetInvoker(),
+            apiInvoker,
             rootClient,
             localServerAddress);
         PublicRpcServer_->RegisterService(std::move(shuffleService));
@@ -803,9 +804,8 @@ void TJobProxy::EnableRpcProxyInJobProxy(int rpcProxyWorkerThreadPoolSize, bool 
 
     auto apiService = CreateApiService(
         Config_->JobProxyApiServiceStatic,
-        GetControlInvoker(),
-        ApiServiceThreadPool_->GetInvoker(),
-        ApiServiceThreadPool_->GetInvoker(),
+        apiInvoker,
+        [=] (const std::string&, const TFairShareThreadPoolTag&) { return apiInvoker; },
         connection,
         authenticationManager->GetRpcAuthenticator(),
         proxyCoordinator,
@@ -1367,6 +1367,21 @@ TStatistics TJobProxy::GetEnrichedStatistics() const
             statistics.AddSample(
                 "/latency/output/total/min_time_to_first_read_batch"_SP,
                 minOutputTimeToFirstBatch);
+        }
+
+        for (const auto& [index, timingStatistics] : SEnumerate(extendedStatistics.WriterTimingStatistics)) {
+            statistics.AddSample(
+                "/chunk_writer_statistics"_SP / TStatisticPathLiteral(ToString(index)) / "write_time"_L,
+                timingStatistics.WriteTime);
+            statistics.AddSample(
+                "/chunk_writer_statistics"_SP / TStatisticPathLiteral(ToString(index)) / "wait_time"_L,
+                timingStatistics.WaitTime);
+            statistics.AddSample(
+                "/chunk_writer_statistics"_SP / TStatisticPathLiteral(ToString(index)) / "idle_time"_L,
+                timingStatistics.IdleTime);
+            statistics.AddSample(
+                "/chunk_writer_statistics"_SP / TStatisticPathLiteral(ToString(index)) / "close_time"_L,
+                timingStatistics.CloseTime);
         }
     }
 
