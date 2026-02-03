@@ -75,6 +75,8 @@ PEERDIR(
     yt/yql/providers/yt/comp_nodes/dq/llvm16
     yt/yql/providers/yt/comp_nodes/llvm16
     contrib/ydb/library/yql/providers/yt/dq_task_preprocessor
+    contrib/ydb/core/mon
+    contrib/ydb/core/util
 
     yt/yql/plugin
 )

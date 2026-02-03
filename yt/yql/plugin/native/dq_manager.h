@@ -8,6 +8,8 @@
 #include <contrib/ydb/library/yql/providers/dq/service/service_node.h>
 #include <yql/essentials/providers/common/metrics/metrics_registry.h>
 
+#include <contrib/ydb/core/mon/mon.h>
+
 #include <library/cpp/yt/yson_string/string.h>
 #include <library/cpp/yt/memory/ref_counted.h>
 
@@ -62,7 +64,7 @@ private:
     ICoordinationHelper::TPtr Coordinator_;
     THolder<TServiceNode> ServiceNode_;
     IMetricsRegistryPtr MetricsRegistry_;
-    NActors::IActor* StatsCollector_;
+    std::unique_ptr<NActors::TMon> Mon_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////

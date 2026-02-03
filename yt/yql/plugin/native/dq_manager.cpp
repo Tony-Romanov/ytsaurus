@@ -136,12 +136,19 @@ void TDqManager::Start()
     YQL_LOG(INFO) << "Interconnect addr/port " << serviceNodeConfig.InterconnectAddress << ":" << serviceNodeConfig.Port;
     YQL_LOG(INFO) << "GRPC addr/port " << serviceNodeConfig.GrpcHostname << ":" << serviceNodeConfig.GrpcPort;
 
-    MetricsRegistry_ = CreateMetricsRegistry(GetSensorsGroupFor(NSensorComponent::kDq));
+    const auto sensors = GetSensorsGroupFor(NSensorComponent::kDq);
+    MetricsRegistry_ = CreateMetricsRegistry(sensors);
     ServiceNode_ = MakeHolder<TServiceNode>(serviceNodeConfig, threads, MetricsRegistry_);
 
-    StatsCollector_ = CreateStatsCollector(5, *ServiceNode_->GetSetup(), MetricsRegistry_->GetSensors());
+    Mon_ = std::make_unique<NActors::TMon>(NActors::TMon::TConfig{
+        .Port = 8808,
+        .Threads = 5,
+        .Title = "DQ monitoring"
+    });
+    Mon_->RegisterCountersPage("counters", "Counters", sensors);
+
     ActorSystem_ = ServiceNode_->StartActorSystem();
-    ActorSystem_->Register(StatsCollector_);
+    Mon_->Start(ActorSystem_);
     Coordinator_->StartRegistrator(ActorSystem_);
     Coordinator_->StartCleaner(ActorSystem_, {});
 
