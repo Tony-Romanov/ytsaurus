@@ -25,6 +25,7 @@ struct TDqManagerConfig
 {
     ui16 InterconnectPort;
     ui16 GrpcPort;
+    ui16 MonitoringPort;
     ui32 ActorThreads;
     bool UseIPv4;
 

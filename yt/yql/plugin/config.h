@@ -90,6 +90,7 @@ struct TDQManagerConfig
 {
     ui16 InterconnectPort;
     ui16 GrpcPort;
+    ui16 MonitoringPort;
     ui32 ActorThreads;
     bool UseIPv4;
     std::vector<TDQYTBackendPtr> YTBackends;

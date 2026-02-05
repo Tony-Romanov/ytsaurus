@@ -245,6 +245,8 @@ void TDQManagerConfig::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("grpc_port", &TThis::GrpcPort)
         .Default();
+    registrar.Parameter("monitoring_port", &TThis::MonitoringPort)
+        .Default();
     registrar.Parameter("actor_threads", &TThis::ActorThreads)
         .Default(4);
     registrar.Parameter("use_ipv4", &TThis::UseIPv4)

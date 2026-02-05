@@ -31,6 +31,8 @@ void TDqManagerConfig::Register(TRegistrar registrar)
         .GreaterThan(0);
     registrar.Parameter("grpc_port", &TThis::GrpcPort)
         .GreaterThan(0);
+    registrar.Parameter("monitoring_port", &TThis::MonitoringPort)
+        .Default(0);
     registrar.Parameter("actor_threads", &TThis::ActorThreads)
         .GreaterThan(0);
     registrar.Parameter("use_ipv4", &TThis::UseIPv4)
@@ -140,15 +142,18 @@ void TDqManager::Start()
     MetricsRegistry_ = CreateMetricsRegistry(sensors);
     ServiceNode_ = MakeHolder<TServiceNode>(serviceNodeConfig, threads, MetricsRegistry_);
 
-    Mon_ = std::make_unique<NActors::TMon>(NActors::TMon::TConfig{
-        .Port = 8808,
-        .Threads = 5,
-        .Title = "DQ monitoring"
-    });
-    Mon_->RegisterCountersPage("counters", "Counters", sensors);
-
+    if (const auto monPort = Config_->MonitoringPort) {
+        Mon_ = std::make_unique<NActors::TMon>(NActors::TMon::TConfig{
+            .Port = monPort,
+            .Threads = 5,
+            .Title = "DQ monitoring"
+        });
+        Mon_->RegisterCountersPage("counters", "Counters", sensors);
+    }
     ActorSystem_ = ServiceNode_->StartActorSystem();
-    Mon_->Start(ActorSystem_);
+    if (Mon_) {
+        Mon_->Start(ActorSystem_);
+    }
     Coordinator_->StartRegistrator(ActorSystem_);
     Coordinator_->StartCleaner(ActorSystem_, {});
 
