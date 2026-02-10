@@ -569,9 +569,8 @@ void TOperationControllerBase::InitializeInputTransactions()
         }
     }
 
-    auto clusterResolver = New<TClusterResolver>(InputClient_);
-    WaitFor(clusterResolver->Init())
-        .ThrowOnError();
+    auto clusterResolver = WaitFor(CreateClusterResolver(InputClient_))
+        .ValueOrThrow();
 
     InputTransactions_ = New<TInputTransactionManager>(
         InputClient_,
@@ -1179,6 +1178,10 @@ TOperationControllerPrepareResult TOperationControllerBase::SafePrepare()
     YT_ASSERT_INVOKER_AFFINITY(GetCancelableInvoker());
 
     SleepInPrepare();
+
+    if (Spec_->JobTestingOptions && Spec_->JobTestingOptions->FindChild("events_on_fs") && !Config_->TestingOptions->EnableEventsOnFs) {
+        THROW_ERROR_EXCEPTION("\"events_on_fs\" is not enabled");
+    }
 
     // Testing purpose code.
     if (Config_->EnableControllerFailureSpecOption &&

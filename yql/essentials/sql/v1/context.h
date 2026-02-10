@@ -112,6 +112,7 @@ public:
 
     TString MakeName(const TString& name);
 
+    IOutputStream& Fatal();
     IOutputStream& Error(NYql::TIssueCode code = NYql::TIssuesIds::DEFAULT_ERROR);
     IOutputStream& Error(NYql::TPosition pos, NYql::TIssueCode code = NYql::TIssuesIds::DEFAULT_ERROR);
     bool Warning(NYql::TPosition pos, NYql::TIssueCode code, std::function<void(IOutputStream&)> message,
@@ -264,6 +265,11 @@ public:
         if (YqlSelectMode_ != EYqlSelectMode::Disable) {
             DeriveColumnOrder = true;
         }
+    }
+
+    bool IsBackwardCompatibleFeatureAvailable(NYql::TLangVersion featureVer) const {
+        return NYql::IsBackwardCompatibleFeatureAvailable(
+            Settings.LangVer, featureVer, Settings.BackportMode);
     }
 
 private:

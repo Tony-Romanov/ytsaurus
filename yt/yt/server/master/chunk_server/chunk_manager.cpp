@@ -64,6 +64,7 @@
 #include <yt/yt/server/master/node_tracker_server/node_tracker.h>
 #include <yt/yt/server/master/node_tracker_server/rack.h>
 
+#include <yt/yt/server/master/object_server/helpers.h>
 #include <yt/yt/server/master/object_server/object_manager.h>
 #include <yt/yt/server/master/object_server/type_handler_detail.h>
 
@@ -72,9 +73,6 @@
 #include <yt/yt/server/master/security_server/security_manager.h>
 
 #include <yt/yt/server/master/sequoia_server/config.h>
-
-// COMPAT(gritukan)
-#include <yt/yt/server/master/table_server/table_node.h>
 
 #include <yt/yt/server/master/tablet_server/tablet.h>
 #include <yt/yt/server/master/tablet_server/tablet_manager.h>
@@ -877,7 +875,7 @@ public:
                 continue;
             }
 
-            auto* location = FindLocationOnConfirmation(chunk->GetId(), node, replica);
+            auto* location = FindLocationOnConfirmation(chunk->GetId(), node, replica, /*failOnLocationByIndexAndUuidMismatch*/ true);
             if (!IsObjectAlive(location)) {
                 // Failure has been already logged inside FindLocationOnConfirmation.
                 continue;
@@ -2245,7 +2243,7 @@ public:
     {
         ValidateMediumName(name);
 
-        if (FindMediumByName(name)) {
+        if (FindMediumByName(name, /*throwOnInvalidId*/ true)) {
             THROW_ERROR_EXCEPTION(
                 NYTree::EErrorCode::AlreadyExists,
                 "Medium %Qv already exists",
@@ -2315,7 +2313,7 @@ public:
             THROW_ERROR_EXCEPTION("Builtin medium cannot be renamed");
         }
 
-        if (FindMediumByName(newName)) {
+        if (FindMediumByName(newName, /*throwOnInvalidId*/ true)) {
             THROW_ERROR_EXCEPTION(
                 NYTree::EErrorCode::AlreadyExists,
                 "Medium %Qv already exists",
@@ -2356,15 +2354,34 @@ public:
         ChunkReplicator_->ScheduleGlobalChunkRefresh();
     }
 
-    TMedium* FindMediumByName(const std::string& name) const override
+    TMedium* FindMediumByName(const std::string& name, bool throwOnInvalidId) const override
     {
-        auto it = NameToMediumMap_.find(name);
-        return it == NameToMediumMap_.end() ? nullptr : it->second;
+        return Visit(ParseObjectNameOrId(name),
+            [&] (TObjectId mediumId) -> TMedium* {
+                auto specifiedType = TypeFromId(mediumId);
+                if (!IsMediumType(specifiedType)) {
+                    if (throwOnInvalidId) {
+                        THROW_ERROR_EXCEPTION("Invalid medium id")
+                            << TErrorAttribute("medium_id", mediumId);
+                    }
+                    return nullptr;
+                }
+                return FindMedium(mediumId);
+            },
+            [&] (TStringBuf name) -> TMedium* {
+                return GetOrDefault(NameToMediumMap_, name, nullptr);
+            },
+            [&] (TError error) -> TMedium* {
+                if (throwOnInvalidId) {
+                    THROW_ERROR error;
+                }
+                return nullptr;
+            });
     }
 
     TMedium* GetMediumByNameOrThrow(const std::string& name) const override
     {
-        auto* medium = FindMediumByName(name);
+        auto* medium = FindMediumByName(name, /*throwOnInvalidId*/ true);
         if (!IsObjectAlive(medium)) {
             THROW_ERROR_EXCEPTION(
                 NChunkClient::EErrorCode::NoSuchMedium,
@@ -2736,7 +2753,8 @@ private:
     TChunkLocation* FindLocationOnConfirmation(
         TChunkId chunkId,
         TNode* node,
-        const TChunkReplicaWithLocation& replica)
+        const TChunkReplicaWithLocation& replica,
+        bool failOnLocationByIndexAndUuidMismatch)
     {
         const auto& dataNodeTracker = Bootstrap_->GetDataNodeTracker();
         auto dataNodeTrackerDynamicConfig = GetDynamicConfig()->DataNodeTracker;
@@ -2790,16 +2808,31 @@ private:
                 locationByUuid = dataNodeTracker->FindChunkLocationByUuid(locationUuid);
             }
 
-            YT_LOG_ALERT_IF(locationByIndex.value() != locationByUuid.value(),
-                "UUID and index for the same location points to different locations "
-                "(ChunkId: %v, NodeId: %v, NodeAddress: %v, LocationByIndexId: %v, LocationIndex: %v, LocationByUuidId: %v, LocationUuid: %v)",
-                chunkId,
-                node->GetId(),
-                node->GetDefaultAddress(),
-                locationByIndex.value() ? locationByIndex.value()->GetId() : NullObjectId,
-                locationIndex,
-                locationByUuid.value() ? locationByUuid.value()->GetId() : NullObjectId,
-                locationUuid);
+            if (locationIndex != InvalidChunkLocationIndex && locationUuid != InvalidChunkLocationUuid && locationUuid != EmptyChunkLocationUuid && locationByIndex.value() != locationByUuid.value()) {
+                YT_LOG_ALERT("UUID and index for the same location points to different locations "
+                    "(ChunkId: %v, NodeId: %v, NodeAddress: %v, LocationByIndexId: %v, LocationIndex: %v, LocationByUuidId: %v, LocationUuid: %v)",
+                    chunkId,
+                    node->GetId(),
+                    node->GetDefaultAddress(),
+                    locationByIndex.value() ? locationByIndex.value()->GetId() : NullObjectId,
+                    locationIndex,
+                    locationByUuid.value() ? locationByUuid.value()->GetId() : NullObjectId,
+                    locationUuid);
+
+                if (failOnLocationByIndexAndUuidMismatch) {
+                    THROW_ERROR_EXCEPTION("UUID and index for the same location points to different locations")
+                        << TErrorAttribute("chunk_id", chunkId)
+                        << TErrorAttribute("node_id", node->GetId())
+                        << TErrorAttribute("node_address", node->GetDefaultAddress())
+                        << TErrorAttribute("location_index", locationIndex)
+                        << TErrorAttribute("location_uuid", locationUuid)
+                        << TErrorAttribute("location_by_index_id", locationByIndex.value() ? locationByIndex.value()->GetId() : NullObjectId)
+                        << TErrorAttribute("location_by_uuid_id", locationByUuid.value() ? locationByUuid.value()->GetId() : NullObjectId);
+                } else {
+                    // NB: If locations mismatch and we cannot throw, better to return nullptr.
+                    return nullptr;
+                }
+            }
         }
 
         TChunkLocation* location = nullptr;
@@ -3603,9 +3636,9 @@ private:
                 auto replica = FromProto<TChunkReplicaWithLocation>(protoReplica);
                 auto nodeId = replica.GetNodeId();
                 auto locationIndex = replica.GetChunkLocationIndex();
-                auto enableLocationIndexesInChunkConfirmation = GetDynamicConfig()->DataNodeTracker->EnableLocationIndexesInChunkConfirmation;
-                if (!enableLocationIndexesInChunkConfirmation || locationIndex == InvalidChunkLocationIndex) {
-                    YT_LOG_ALERT_IF(enableLocationIndexesInChunkConfirmation,
+                auto useLocationIndexesInSequoiaChunkConfirmation = GetDynamicConfig()->DataNodeTracker->UseLocationIndexesInSequoiaChunkConfirmation;
+                if (!useLocationIndexesInSequoiaChunkConfirmation || locationIndex == InvalidChunkLocationIndex) {
+                    YT_LOG_ALERT_IF(useLocationIndexesInSequoiaChunkConfirmation,
                         "Sequoia chunk replica confirmation is missing location index "
                         "(ChunkId: %v, LocationUuid: %v, NodeId: %v)",
                         chunkId,
@@ -3616,7 +3649,7 @@ private:
                         continue;
                     }
 
-                    auto* location = FindLocationOnConfirmation(chunkId, node, replica);
+                    auto* location = FindLocationOnConfirmation(chunkId, node, replica, /*failOnLocationByIndexAndUuidMismatch*/ false);
                     if (!IsObjectAlive(location)) {
                         continue;
                     }
@@ -3738,9 +3771,9 @@ private:
             auto replica = FromProto<TChunkReplicaWithLocation>(protoReplica);
             auto nodeId = replica.GetNodeId();
             auto locationIndex = replica.GetChunkLocationIndex();
-            auto enableLocationIndexesInChunkConfirmation = GetDynamicConfig()->DataNodeTracker->EnableLocationIndexesInChunkConfirmation;
-            if (!enableLocationIndexesInChunkConfirmation || locationIndex == InvalidChunkLocationIndex) {
-                YT_LOG_ALERT_IF(enableLocationIndexesInChunkConfirmation,
+            auto useLocationIndexesInSequoiaChunkConfirmation = GetDynamicConfig()->DataNodeTracker->UseLocationIndexesInSequoiaChunkConfirmation;
+            if (!useLocationIndexesInSequoiaChunkConfirmation || locationIndex == InvalidChunkLocationIndex) {
+                YT_LOG_ALERT_IF(useLocationIndexesInSequoiaChunkConfirmation,
                     "Received Sequoia chunk replica confirmation request without location index "
                     "(ChunkId: %v, LocationUuid: %v, NodeId: %v)",
                     chunkId,
@@ -3751,7 +3784,7 @@ private:
                     continue;
                 }
 
-                auto* location = FindLocationOnConfirmation(chunkId, node, replica);
+                auto* location = FindLocationOnConfirmation(chunkId, node, replica, /*failOnLocationByIndexAndUuidMismatch*/ false);
                 if (!location) {
                     continue;
                 }
@@ -5418,6 +5451,13 @@ private:
 
         // COMPAT(kvk1920): move to OnAfterSnapshotLoaded
         for (auto [mediumId, medium] : MediumMap_) {
+            if (auto error = CheckObjectName(medium->GetName()); !error.IsOK()) {
+                YT_LOG_ALERT(error, "Medium with invalid name encountered (Id: %v, Index: %v, Name: %v)",
+                    mediumId,
+                    medium->GetIndex(),
+                    medium->GetName());
+            }
+
             RegisterMedium(medium);
         }
 
@@ -6994,6 +7034,11 @@ private:
 
         YT_VERIFY(!IndexToMediumMap_[mediumIndex]);
         IndexToMediumMap_[mediumIndex] = medium;
+
+        YT_LOG_INFO("Medium created (Id: %v, Name: %v, Index: %v)",
+            medium->GetId(),
+            medium->GetName(),
+            medium->GetIndex());
     }
 
     void UnregisterMedium(TMedium* medium)
