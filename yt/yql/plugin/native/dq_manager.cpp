@@ -145,8 +145,10 @@ void TDqManager::Start()
     if (const auto monPort = Config_->MonitoringPort) {
         Mon_ = std::make_unique<NActors::TMon>(NActors::TMon::TConfig{
             .Port = monPort,
+            .Address = localAddress,
             .Threads = 5,
-            .Title = "DQ monitoring"
+            .Title = "DQ monitoring",
+            .Host = hostName
         });
         Mon_->RegisterCountersPage("counters", "Counters", sensors);
     }
