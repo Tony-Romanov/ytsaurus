@@ -97,6 +97,7 @@ def get_dynamic_master_config():
                 "enable_validation_full_heartbeats": True,
                 "validation_full_heartbeat_period": 1000,
                 "validation_full_heartbeat_splay": 200,
+                "validate_sequoia_replicas": True,
             },
         },
 
@@ -119,7 +120,6 @@ def get_dynamic_master_config():
 
         "object_manager": {
             "gc_sweep_period": 10,
-            "fix_resolve_prerequisite_path_to_local_object_for_symlinks": True,
             "prohibit_prerequisite_revisions_differ_from_execution_paths": True,
         },
 
