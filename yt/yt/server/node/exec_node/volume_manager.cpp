@@ -5,6 +5,7 @@
 #include "bootstrap.h"
 #include "helpers.h"
 #include "private.h"
+#include "volume_counters.h"
 
 #include <yt/yt/server/node/cluster_node/config.h>
 #include <yt/yt/server/node/cluster_node/dynamic_config_manager.h>
@@ -151,110 +152,6 @@ IImageReaderPtr CreateCypressFileImageReader(
     return CreateCypressFileImageReader(
         std::move(reader),
         std::move(logger));
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-class TVolumeProfilerCounters
-{
-public:
-    TVolumeProfilerCounters()
-        : VolumeProfiler_("/volumes")
-    { }
-
-    TCounter GetCounter(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = CreateKey(tagSet, name);
-
-        auto guard = Guard(Lock_);
-        auto [it, inserted] = Counters_.emplace(key, TCounter());
-        if (inserted) {
-            it->second = VolumeProfiler_.WithTags(tagSet).Counter(name);
-        }
-
-        return it->second;
-    }
-
-    TGauge GetGauge(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = CreateKey(tagSet, name);
-
-        auto guard = Guard(Lock_);
-        auto [it, inserted] = Gauges_.emplace(key, TGauge());
-        if (inserted) {
-            it->second = VolumeProfiler_.WithTags(tagSet).Gauge(name);
-        }
-
-        return it->second;
-    }
-
-    TEventTimer GetTimeHistogram(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = CreateKey(tagSet, name);
-
-        auto guard = Guard(Lock_);
-        auto [it, inserted] = EventTimers_.emplace(key, TEventTimer());
-        if (inserted) {
-            std::vector<TDuration> bounds{
-                TDuration::Zero(),
-                TDuration::MilliSeconds(100),
-                TDuration::MilliSeconds(500),
-                TDuration::Seconds(1),
-                TDuration::Seconds(5),
-                TDuration::Seconds(10),
-            };
-            it->second = VolumeProfiler_.WithTags(tagSet).TimeHistogram(name, std::move(bounds));
-        }
-
-        return it->second;
-    }
-
-    TEventTimer GetTimer(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = CreateKey(tagSet, name);
-
-        auto guard = Guard(Lock_);
-        auto [it, inserted] = EventTimers_.emplace(key, TEventTimer());
-        if (inserted) {
-            it->second = VolumeProfiler_.WithTags(tagSet).Timer(name);
-        }
-
-        return it->second;
-    }
-
-    static TTagSet MakeTagSet(const TString& volumeType, const TString& volumeFilePath)
-    {
-        return TTagSet({{"type", volumeType}, {"file_path", volumeFilePath}});
-    }
-
-    static TVolumeProfilerCounters* Get()
-    {
-        return Singleton<TVolumeProfilerCounters>();
-    }
-
-private:
-    using TKey = TTagList;
-
-    static TKey CreateKey(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = tagSet.Tags();
-        key.push_back({"name", name});
-        return key;
-    }
-
-private:
-    const TProfiler VolumeProfiler_;
-
-    YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, Lock_);
-    THashMap<TKey, TCounter> Counters_;
-    THashMap<TKey, TGauge> Gauges_;
-    THashMap<TKey, TEventTimer> EventTimers_;
-};
-
-TTaggedCounters<int>& VolumeCounters()
-{
-    static TTaggedCounters<int> result;
-    return result;
 }
 
 } // namespace
@@ -453,36 +350,6 @@ public:
 
 private:
     std::variant<TLayerPtr, IVolumePtr> Variant_;
-};
-
-////////////////////////////////////////////////////////////////////////////////
-
-struct TLayerLocationPerformanceCounters
-{
-    TLayerLocationPerformanceCounters() = default;
-
-    explicit TLayerLocationPerformanceCounters(const TProfiler& profiler)
-    {
-        LayerCount = profiler.Gauge("/layer_count");
-        VolumeCount = profiler.Gauge("/volume_count");
-
-        UsedSpace = profiler.Gauge("/used_space");
-        AvailableSpace = profiler.Gauge("/available_space");
-        TotalSpace = profiler.Gauge("/total_space");
-        Full = profiler.Gauge("/full");
-
-        ImportLayerTimer = profiler.Timer("/import_layer_time");
-    }
-
-    TGauge LayerCount;
-    TGauge VolumeCount;
-
-    TGauge TotalSpace;
-    TGauge UsedSpace;
-    TGauge AvailableSpace;
-    TGauge Full;
-
-    TEventTimer ImportLayerTimer;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2414,44 +2281,6 @@ private:
 };
 
 DEFINE_REFCOUNTED_TYPE(TLayer)
-
-////////////////////////////////////////////////////////////////////////////////
-
-class TTmpfsLayerCacheCounters
-{
-public:
-    explicit TTmpfsLayerCacheCounters(TProfiler profiler)
-        : Profiler_(std::move(profiler))
-    { }
-
-    TCounter GetCounter(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = CreateKey(tagSet, name);
-
-        auto guard = Guard(Lock_);
-        auto [it, inserted] = Counters_.emplace(key, TCounter());
-        if (inserted) {
-            it->second = Profiler_.WithTags(tagSet).Counter(name);
-        }
-
-        return it->second;
-    }
-
-private:
-    using TKey = TTagList;
-
-    static TKey CreateKey(const TTagSet& tagSet, const TString& name)
-    {
-        auto key = tagSet.Tags();
-        key.push_back({"name", name});
-        return key;
-    }
-
-    const TProfiler Profiler_;
-
-    YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, Lock_);
-    THashMap<TKey, TCounter> Counters_;
-};
 
 ////////////////////////////////////////////////////////////////////////////////
 
