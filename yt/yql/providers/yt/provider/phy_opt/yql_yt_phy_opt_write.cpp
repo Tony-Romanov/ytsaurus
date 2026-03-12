@@ -736,7 +736,7 @@ TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::YtDqWrite(TExprBase nod
     return node;
 }
 
-TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::Fill(TExprBase node, TExprContext& ctx) const {
+TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::Fill(TExprBase node, TExprContext& ctx, const TGetParents& getParents) const {
     if (State_->PassiveExecution) {
         return node;
     }
@@ -749,7 +749,7 @@ TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::Fill(TExprBase node, TE
         return node;
     }
 
-    auto cluster = TString{write.DataSink().Cluster().Value()};
+    auto cluster = write.DataSink().Cluster().StringValue();
     TSyncMap syncList;
     const ERuntimeClusterSelectionMode selectionMode =
         State_->Configuration->RuntimeClusterSelection.Get().GetOrElse(DEFAULT_RUNTIME_CLUSTER_SELECTION);
@@ -773,12 +773,50 @@ TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::Fill(TExprBase node, TE
     } else {
         return {};
     }
-    TYtOutTableInfo outTable(outItemType, State_->Configuration->UseNativeYtTypes.Get().GetOrElse(DEFAULT_USE_NATIVE_YT_TYPES) ? NTCF_ALL : NTCF_NONE);
+
+    TVector<TExprBase> tables;
+    const auto nativeFlags = State_->Configuration->UseNativeYtTypes.Get().GetOrElse(DEFAULT_USE_NATIVE_YT_TYPES) ? NTCF_ALL : NTCF_NONE;
+    if (const auto nth = write.Content().Maybe<TCoNth>()) {
+        if (const auto demux = nth.Cast().Tuple().Maybe<TCoDemux>()) {
+            const auto parents = getParents();
+            if (const auto it = parents->find(demux.Cast().Raw()); parents->cend() != it) {
+                tables.reserve(it->second.size());
+                if (std::all_of(it->second.cbegin(), it->second.cend(), [parents, &ctx, nativeFlags, &tables](const TExprNode* nth) {
+                    const auto jt = parents->find(nth);
+                    if (parents->cend() == jt || 1U != jt->second.size() || !(*jt->second.cbegin())->IsCallable(TYtWriteTable::CallableName()))
+                        return false;
+
+                    const TYtWriteTable wr(*jt->second.cbegin());
+                    const auto content = wr.Content();
+                    if (content.Ref().GetConstraint<TSortedConstraintNode>())
+                        return false;
+
+                    const TStructExprType* outItemType = nullptr;
+                    if (auto type = GetSequenceItemType(content, false, ctx)) {
+                        if (EnsurePersistableType(content.Pos(), *type, ctx)) {
+                            outItemType = type->Cast<TStructExprType>();
+
+                            TYtOutTableInfo outTable(outItemType, nativeFlags);
+                            tables.emplace_back(outTable.ToExprNode(ctx, wr.Pos()));
+                        } else
+                            return false;
+                    } else {
+                        return false;
+                    }
+
+                    return true;
+                })) {
+                    return node;
+                }
+            }
+        }
+    }
+
+    TYtOutTableInfo outTable(outItemType, nativeFlags);
 
     {
-        auto path = write.Table().Name().StringValue();
         auto commitEpoch = TEpochInfo::Parse(write.Table().CommitEpoch().Ref()).GetOrElse(0);
-        auto dstRowSpec = State_->TablesData->GetTable(write.Table().Cluster().StringValue(), path, commitEpoch).RowSpec;
+        auto dstRowSpec = State_->TablesData->GetTable(write.Table().Cluster().StringValue(), write.Table().Name().StringValue(), commitEpoch).RowSpec;
         outTable.RowSpec->SetColumnOrder(dstRowSpec->GetColumnOrder());
     }
     auto content = write.Content();
