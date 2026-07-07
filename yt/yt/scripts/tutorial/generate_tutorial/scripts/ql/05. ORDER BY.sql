@@ -1,6 +1,3 @@
--- Fetches a limited set of products ordered by first_appeared timestamp.
--- Timestamps are given in microseconds here.
-
     id
    ,name
    ,first_appeared
