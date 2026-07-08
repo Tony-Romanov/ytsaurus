@@ -5,6 +5,7 @@
 #include "sql_select_yql.h"
 #include "select_yql.h"
 #include "sql_select.h"
+#include "sql_values.h"
 #include "object_processing.h"
 #include "source.h"
 #include "antlr_token.h"
@@ -15,6 +16,7 @@
 #include <yql/essentials/core/langver/feature.gen.h>
 #include <yql/essentials/utils/yql_paths.h>
 
+#include <util/generic/hash_set.h>
 #include <util/generic/scope.h>
 #include <util/string/join.h>
 
@@ -25,6 +27,16 @@ namespace {
 using namespace NSQLTranslationV1;
 
 using NSQLTranslation::ESqlMode;
+
+const NYql::TFeature& LegacyWithCTEFeature() {
+    static const NYql::TFeature Feature = {
+        .Name = "LegacyWithCTE",
+        .Description = "WITH CTE in SQL syntax",
+        .MinLangVer = NYql::GetMaxLangVersion(),
+    };
+
+    return Feature;
+}
 
 template <typename Callback>
 void VisitAllFields(const NProtoBuf::Message& msg, Callback& callback) {
@@ -1393,12 +1405,27 @@ bool TSqlTranslation::TableRefImpl(const TRule_table_ref& node, TTableRef& resul
     auto& block = node.GetBlock3();
     switch (block.Alt_case()) {
         case TRule_table_ref::TBlock3::kAlt1: {
+            auto pair = TableKeyImpl(block.GetAlt1().GetRule_table_key1(), *this, hasAt);
+            if (!node.HasBlock1() && !hasAt && !isBinding) {
+                if (auto cte = Ctx_.Scoped->LookupNode(pair.first)) {
+                    if (!pair.second.empty()) {
+                        Ctx_.Error() << "VIEW is not supported for CTE";
+                        return false;
+                    }
+
+                    if (effectiveProvider) {
+                        *effectiveProvider = service;
+                    }
+                    result.Source = BuildInnerSource(Ctx_.Pos(), cte, service, cluster);
+                    return true;
+                }
+            }
+
             if (!isBinding && cluster.Empty()) {
-                Ctx_.Error() << "No cluster name given and no default cluster is selected";
+                Ctx_.Error(pos) << "No cluster name given and no default cluster is selected";
                 return false;
             }
 
-            auto pair = TableKeyImpl(block.GetAlt1().GetRule_table_key1(), *this, hasAt);
             if (isBinding) {
                 TString binding = pair.first;
                 auto view = pair.second;
@@ -4278,6 +4305,160 @@ TNodePtr TSqlTranslation::NamedNode(const TRule_named_nodes_stmt& rule, TVector<
         case TRule_named_nodes_stmt::TBlock3::ALT_NOT_SET:
             YQL_ENSURE(false, "Unreachable");
     }
+}
+
+bool TSqlTranslation::PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVector<TSymbolNameWithPos>& names, TNodePtr nodeExpr) {
+    TVector<TNodePtr> nodes;
+    auto subquery = nodeExpr->GetSource();
+    if (subquery && Mode_ == NSQLTranslation::ESqlMode::LIBRARY && Ctx_.ScopeLevel == 0) {
+        for (size_t i = 0; i < names.size(); ++i) {
+            nodes.push_back(BuildInvalidSubqueryRef(subquery->GetPos()));
+        }
+    } else if (subquery) {
+        const auto alias = Ctx_.MakeName("subquerynode");
+        const auto ref = Ctx_.MakeName("subquery");
+        blocks.push_back(BuildSubquery(subquery, alias,
+                                       Mode_ == NSQLTranslation::ESqlMode::SUBQUERY, names.size() == 1 ? -1 : names.size(), Ctx_.Scoped));
+        blocks.back()->SetLabel(ref);
+
+        for (size_t i = 0; i < names.size(); ++i) {
+            nodes.push_back(BuildSubqueryRef(blocks.back(), ref, names.size() == 1 ? -1 : i));
+        }
+    } else if (!Ctx_.CompactNamedExprs || nodeExpr->GetUdfNode()) {
+        // Unlike other nodes, TUdfNode is not an independent node, but more like a set of parameters which should be
+        // applied on UDF call site. For example, TUdfNode can not be Translate()d.
+        // So we can't add it to blocks and use reference, instead we store the TUdfNode itself as named node.
+        // TODO: remove this special case.
+        if (names.size() > 1) {
+            auto tupleRes = BuildTupleResult(nodeExpr, names.size());
+            for (size_t i = 0; i < names.size(); ++i) {
+                nodes.push_back(nodeExpr->Y("Nth", tupleRes, nodeExpr->Q(ToString(i))));
+            }
+        } else {
+            nodes.push_back(std::move(nodeExpr));
+        }
+    } else if (auto source = GetYqlSource(nodeExpr)) {
+        const auto alias = Ctx_.MakeName("yqlsubquerynode");
+        const auto ref = Ctx_.MakeName("yqlsubquery");
+
+        blocks.push_back(BuildYqlSubquery(source, alias));
+        blocks.back()->SetLabel(ref);
+
+        for (size_t i = 0; i < names.size(); ++i) {
+            nodes.push_back(BuildYqlSubqueryRef(blocks.back(), ref));
+        }
+    } else {
+        const auto ref = Ctx_.MakeName("namedexprnode");
+        blocks.push_back(BuildNamedExpr(names.size() > 1 ? BuildTupleResult(nodeExpr, names.size()) : nodeExpr));
+        blocks.back()->SetLabel(ref);
+        for (size_t i = 0; i < names.size(); ++i) {
+            nodes.push_back(BuildNamedExprReference(blocks.back(), ref, names.size() == 1 ? TMaybe<size_t>() : i));
+        }
+    }
+
+    for (size_t i = 0; i < names.size(); ++i) {
+        PushNamedNode(names[i].Pos, names[i].Name, nodes[i]);
+    }
+    return true;
+}
+
+TNodePtr TSqlTranslation::LegacyCTEValue(const TRule_cte_value& rule) {
+    switch (rule.GetAltCase()) {
+        case TRule_cte_value::kAltCteValue1: {
+            TSqlSelect select(*this);
+            TPosition pos;
+            auto source = select.Build(rule.GetAlt_cte_value1().GetRule_select_stmt1(), pos);
+            if (!source) {
+                return nullptr;
+            }
+
+            return BuildSourceNode(pos, std::move(source));
+        }
+        case TRule_cte_value::kAltCteValue2: {
+            TPosition pos;
+            auto source = TSqlValues(*this).Build(rule.GetAlt_cte_value2().GetRule_values_stmt1(), pos);
+            if (!source) {
+                return nullptr;
+            }
+
+            return BuildSourceNode(pos, std::move(source));
+        }
+        case TRule_cte_value::ALT_NOT_SET:
+            YQL_ENSURE(false, "Unreachable");
+    }
+}
+
+TSQLStatus TSqlTranslation::BuildLegacyCTEs(const TRule_cte_with_clause& rule, TVector<TString>& pushedNames) {
+    if (!Ctx_.EnsureAvailable(Ctx_.TokenPosition(rule.GetToken1()), LegacyWithCTEFeature())) {
+        return std::unexpected(ESQLError::Basic);
+    }
+
+    THashSet<TString> names;
+    auto buildOne = [&](const TRule_cte_binding& binding) -> TSQLStatus {
+        if (binding.HasBlock1()) {
+            Token(binding.GetBlock1().GetToken1());
+            Ctx_.Error() << "RECURSIVE CTE is available only with YqlSelect";
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        const auto& key = binding.GetRule_cte_key2();
+        TString name = Id(key.GetRule_id_table_or_type1(), *this);
+        if (name.empty()) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        TPosition position = Ctx_.Pos();
+        if (key.HasBlock2()) {
+            Token(key.GetBlock2().GetRule_pure_column_list1().GetToken1());
+            Ctx_.Error() << "CTE column aliases are available only with YqlSelect";
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        if (!names.insert(name).second) {
+            Ctx_.Error(position)
+                << "Bad CTE: "
+                << "Redefinition is forbidden: "
+                << name;
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        TNodePtr value = LegacyCTEValue(binding.GetRule_cte_value5());
+        if (!value) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        TVector<TSymbolNameWithPos> cteName = {{
+            .Name = name,
+            .Pos = position,
+        }};
+        if (!PushNamedNodeBlocks(Ctx_.GetCurrentBlocks(), cteName, std::move(value))) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        pushedNames.push_back(std::move(name));
+        return std::monostate();
+    };
+
+    if (auto status = buildOne(rule.GetRule_cte_binding2()); !status) {
+        return std::unexpected(status.error());
+    }
+
+    for (const auto& block : rule.GetBlock3()) {
+        if (auto status = buildOne(block.GetRule_cte_binding2()); !status) {
+            return std::unexpected(status.error());
+        }
+    }
+
+    return std::monostate();
+}
+
+bool TSqlTranslation::PopLegacyCTEs(const TVector<TString>& pushedNames) {
+    bool result = true;
+    for (auto it = pushedNames.rbegin(); it != pushedNames.rend(); ++it) {
+        result &= PopNamedNode(*it);
+    }
+
+    return result;
 }
 
 bool TSqlTranslation::ImportStatement(const TRule_import_stmt& stmt, TVector<TString>* namesPtr) {

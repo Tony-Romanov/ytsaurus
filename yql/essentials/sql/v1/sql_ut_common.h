@@ -15728,6 +15728,70 @@ Y_UNIT_TEST(RecursiveReferenceFromSubquery) {
 
 } // Y_UNIT_TEST_SUITE(YqlSelectWithCTE)
 
+Y_UNIT_TEST_SUITE(LegacyWithCTE) {
+
+NSQLTranslation::TTranslationSettings Settings() {
+    NSQLTranslation::TTranslationSettings settings;
+    settings.LangVer = NYql::GetMaxLangVersion();
+    settings.YqlSelect = NSQLTranslation::EYqlSelect::Disable;
+    return settings;
+}
+
+Y_UNIT_TEST(AstEqualsNamedExpression) {
+    auto settings = Settings();
+
+    auto named = SqlToYqlWithSettings(R"sql(
+        $expr = SELECT key, subkey FROM plato.Input WHERE key > "0";
+        SELECT * FROM $expr;
+    )sql", settings);
+    UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
+
+    auto cte = SqlToYqlWithSettings(R"sql(
+        WITH expr AS (SELECT key, subkey FROM plato.Input WHERE key > "0")
+        SELECT * FROM expr;
+    )sql", settings);
+    UNIT_ASSERT_C(cte.IsOk(), Err2Str(cte));
+
+    UNIT_ASSERT_NO_DIFF(GetPrettyPrint(cte), GetPrettyPrint(named));
+}
+
+Y_UNIT_TEST(LinearVisibility) {
+    auto settings = Settings();
+
+    auto named = SqlToYqlWithSettings(R"sql(
+        $x = SELECT 0 + 1 AS a;
+        $y = SELECT a + 1 AS a FROM $x;
+        SELECT * FROM $y;
+    )sql", settings);
+    UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
+
+    auto cte = SqlToYqlWithSettings(R"sql(
+        WITH
+            x AS (SELECT 0 + 1 AS a),
+            y AS (SELECT a + 1 AS a FROM x)
+        SELECT * FROM y;
+    )sql", settings);
+    UNIT_ASSERT_C(cte.IsOk(), Err2Str(cte));
+
+    UNIT_ASSERT_NO_DIFF(GetPrettyPrint(cte), GetPrettyPrint(named));
+}
+
+Y_UNIT_TEST(LangVersion) {
+    NSQLTranslation::TTranslationSettings settings;
+    settings.YqlSelect = NSQLTranslation::EYqlSelect::Disable;
+
+    auto res = SqlToYqlWithSettings(R"sql(
+        WITH expr AS (SELECT 1)
+        SELECT * FROM expr;
+    )sql", settings);
+    UNIT_ASSERT(!res.IsOk());
+    UNIT_ASSERT_STRING_CONTAINS(
+        Err2Str(res),
+        "WITH CTE in SQL syntax is not available before language version");
+}
+
+} // Y_UNIT_TEST_SUITE(LegacyWithCTE)
+
 Y_UNIT_TEST_SUITE(ColumnDefault) {
 
 Y_UNIT_TEST(AlterColumnSetDefault) {

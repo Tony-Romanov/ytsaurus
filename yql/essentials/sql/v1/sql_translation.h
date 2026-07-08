@@ -197,6 +197,10 @@ protected:
                        TVector<TSymbolNameWithPos>& aliases);
     bool NamedBindParam(const TRule_named_bind_parameter& node, TSymbolNameWithPos& name, TSymbolNameWithPos& alias);
     TNodePtr NamedNode(const TRule_named_nodes_stmt& rule, TVector<TSymbolNameWithPos>& names);
+    bool PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVector<TSymbolNameWithPos>& names, TNodePtr nodeExpr);
+    TNodePtr LegacyCTEValue(const TRule_cte_value& rule);
+    TSQLStatus BuildLegacyCTEs(const TRule_cte_with_clause& rule, TVector<TString>& pushedNames);
+    bool PopLegacyCTEs(const TVector<TString>& pushedNames);
 
     bool ImportStatement(const TRule_import_stmt& stmt, TVector<TString>* namesPtr = nullptr);
     TNodePtr DoStatement(const TRule_do_stmt& stmt, bool makeLambda, const TVector<TString>& args = {});

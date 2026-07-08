@@ -8,6 +8,8 @@
 
 #include <yql/essentials/core/langver/feature.gen.h>
 
+#include <util/generic/scope.h>
+
 namespace NSQLTranslationV1 {
 
 using namespace NSQLv1Generated;
@@ -1515,10 +1517,18 @@ template <typename TRule>
              std::same_as<TRule, TRule_select_unparenthesized_stmt> ||
              std::same_as<TRule, TRule_select_subexpr>
 TSourcePtr TSqlSelect::BuildStmt(const TRule& node, TPosition& pos) {
+    TVector<TString> cteNames;
+    bool cleanupCTEs = true;
+    Y_DEFER {
+        if (cleanupCTEs) {
+            PopLegacyCTEs(cteNames);
+        }
+    };
+
     if (node.HasBlock1()) {
-        Token(node.GetBlock1().GetRule_cte_with_clause1().GetToken1());
-        Ctx_.Error() << "WITH CTE is available only with YqlSelect";
-        return nullptr;
+        if (auto status = BuildLegacyCTEs(node.GetBlock1().GetRule_cte_with_clause1(), cteNames); !status) {
+            return nullptr;
+        }
     }
 
     TBuildExtra extra;
@@ -1534,7 +1544,14 @@ TSourcePtr TSqlSelect::BuildStmt(const TRule& node, TPosition& pos) {
         static_assert(false, "Change implementation according to grammar changes.");
     }
 
-    return BuildStmt(std::move(result), std::move(extra));
+    result = BuildStmt(std::move(result), std::move(extra));
+
+    cleanupCTEs = false;
+    if (!PopLegacyCTEs(cteNames)) {
+        return nullptr;
+    }
+
+    return result;
 }
 
 TSourcePtr TSqlSelect::BuildSubSelect(const TRule_select_kind_partial& node) {

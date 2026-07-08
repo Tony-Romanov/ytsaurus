@@ -370,56 +370,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
-            TVector<TNodePtr> nodes;
-            auto subquery = nodeExpr->GetSource();
-            if (subquery && Mode_ == NSQLTranslation::ESqlMode::LIBRARY && Ctx_.ScopeLevel == 0) {
-                for (size_t i = 0; i < names.size(); ++i) {
-                    nodes.push_back(BuildInvalidSubqueryRef(subquery->GetPos()));
-                }
-            } else if (subquery) {
-                const auto alias = Ctx_.MakeName("subquerynode");
-                const auto ref = Ctx_.MakeName("subquery");
-                blocks.push_back(BuildSubquery(subquery, alias,
-                                               Mode_ == NSQLTranslation::ESqlMode::SUBQUERY, names.size() == 1 ? -1 : names.size(), Ctx_.Scoped));
-                blocks.back()->SetLabel(ref);
-
-                for (size_t i = 0; i < names.size(); ++i) {
-                    nodes.push_back(BuildSubqueryRef(blocks.back(), ref, names.size() == 1 ? -1 : i));
-                }
-            } else if (!Ctx_.CompactNamedExprs || nodeExpr->GetUdfNode()) {
-                // Unlike other nodes, TUdfNode is not an independent node, but more like a set of parameters which should be
-                // applied on UDF call site. For example, TUdfNode can not be Translate()d
-                // So we can't add it to blocks and use reference, instead we store the TUdfNode itself as named node
-                // TODO: remove this special case
-                if (names.size() > 1) {
-                    auto tupleRes = BuildTupleResult(nodeExpr, names.size());
-                    for (size_t i = 0; i < names.size(); ++i) {
-                        nodes.push_back(nodeExpr->Y("Nth", tupleRes, nodeExpr->Q(ToString(i))));
-                    }
-                } else {
-                    nodes.push_back(std::move(nodeExpr));
-                }
-            } else if (auto source = GetYqlSource(nodeExpr)) {
-                const auto alias = Ctx_.MakeName("yqlsubquerynode");
-                const auto ref = Ctx_.MakeName("yqlsubquery");
-
-                blocks.push_back(BuildYqlSubquery(source, alias));
-                blocks.back()->SetLabel(ref);
-
-                for (size_t i = 0; i < names.size(); ++i) {
-                    nodes.push_back(BuildYqlSubqueryRef(blocks.back(), ref));
-                }
-            } else {
-                const auto ref = Ctx_.MakeName("namedexprnode");
-                blocks.push_back(BuildNamedExpr(names.size() > 1 ? BuildTupleResult(nodeExpr, names.size()) : nodeExpr));
-                blocks.back()->SetLabel(ref);
-                for (size_t i = 0; i < names.size(); ++i) {
-                    nodes.push_back(BuildNamedExprReference(blocks.back(), ref, names.size() == 1 ? TMaybe<size_t>() : i));
-                }
-            }
-
-            for (size_t i = 0; i < names.size(); ++i) {
-                PushNamedNode(names[i].Pos, names[i].Name, nodes[i]);
+            if (!PushNamedNodeBlocks(blocks, names, std::move(nodeExpr))) {
+                return false;
             }
             break;
         }

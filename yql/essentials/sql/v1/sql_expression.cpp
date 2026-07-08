@@ -2682,10 +2682,31 @@ TNodeResult TSqlExpression::SelectSubExpr(const TRule_select_subexpr& node) {
             SmartParenthesisMode_);
     }
 
+    TVector<TString> cteNames;
+    bool cleanupCTEs = true;
+    Y_DEFER {
+        if (cleanupCTEs) {
+            PopLegacyCTEs(cteNames);
+        }
+    };
+
     if (node.HasBlock1()) {
-        Token(node.GetBlock1().GetRule_cte_with_clause1().GetToken1());
-        Ctx_.Error() << "WITH CTE is available only with YqlSelect";
-        return std::unexpected(ESQLError::Basic);
+        const auto& core = node.GetRule_select_subexpr_core2();
+        const bool isSelect = IsSelect(
+            core
+                .GetRule_select_subexpr_intersect1()
+                .GetRule_select_or_expr1());
+
+        if (!isSelect) {
+            Token(node.GetBlock1().GetRule_cte_with_clause1().GetToken1());
+            Ctx_.Error() << "A WITH clause can only be used before a SELECT statement, "
+                            "but the expression that follows it is not a SELECT";
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        if (auto status = BuildLegacyCTEs(node.GetBlock1().GetRule_cte_with_clause1(), cteNames); !status) {
+            return std::unexpected(status.error());
+        }
     }
 
     TNodeResult result = std::unexpected(ESQLError::Basic);
@@ -2703,10 +2724,15 @@ TNodeResult TSqlExpression::SelectSubExpr(const TRule_select_subexpr& node) {
 
     if (TSourcePtr source = MoveOutIfSource(*result)) {
         if (IsSourceAllowed_) {
-            return TNonNull(TNodePtr(std::move(source)));
+            result = TNonNull(TNodePtr(std::move(source)));
+        } else {
+            result = Wrap(ToSubSelectNode(std::move(source)));
         }
+    }
 
-        result = Wrap(ToSubSelectNode(std::move(source)));
+    cleanupCTEs = false;
+    if (!PopLegacyCTEs(cteNames)) {
+        return std::unexpected(ESQLError::Basic);
     }
 
     return result;
