@@ -31,7 +31,7 @@ using NSQLTranslation::ESqlMode;
 const NYql::TFeature& LegacyWithCTEFeature() {
     static const NYql::TFeature Feature = {
         .Name = "LegacyWithCTE",
-        .Description = "WITH CTE in SQL syntax",
+        .Description = "WITH CTE",
         .MinLangVer = NYql::GetMaxLangVersion(),
     };
 

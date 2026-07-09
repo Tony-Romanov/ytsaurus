@@ -15738,15 +15738,15 @@ NSQLTranslation::TTranslationSettings Settings() {
 }
 
 Y_UNIT_TEST(AstEqualsNamedExpression) {
-    auto settings = Settings();
+    const auto settings = Settings();
 
-    auto named = SqlToYqlWithSettings(R"sql(
+    const auto named = SqlToYqlWithSettings(R"sql(
         $expr = SELECT key, subkey FROM plato.Input WHERE key > "0";
         SELECT * FROM $expr;
     )sql", settings);
     UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
 
-    auto cte = SqlToYqlWithSettings(R"sql(
+    const auto cte = SqlToYqlWithSettings(R"sql(
         WITH expr AS (SELECT key, subkey FROM plato.Input WHERE key > "0")
         SELECT * FROM expr;
     )sql", settings);
@@ -15756,16 +15756,16 @@ Y_UNIT_TEST(AstEqualsNamedExpression) {
 }
 
 Y_UNIT_TEST(LinearVisibility) {
-    auto settings = Settings();
+    const auto settings = Settings();
 
-    auto named = SqlToYqlWithSettings(R"sql(
+    const auto named = SqlToYqlWithSettings(R"sql(
         $x = SELECT 0 + 1 AS a;
         $y = SELECT a + 1 AS a FROM $x;
         SELECT * FROM $y;
     )sql", settings);
     UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
 
-    auto cte = SqlToYqlWithSettings(R"sql(
+    const auto cte = SqlToYqlWithSettings(R"sql(
         WITH
             x AS (SELECT 0 + 1 AS a),
             y AS (SELECT a + 1 AS a FROM x)
@@ -15780,14 +15780,14 @@ Y_UNIT_TEST(LangVersion) {
     NSQLTranslation::TTranslationSettings settings;
     settings.YqlSelect = NSQLTranslation::EYqlSelect::Disable;
 
-    auto res = SqlToYqlWithSettings(R"sql(
+    const auto res = SqlToYqlWithSettings(R"sql(
         WITH expr AS (SELECT 1)
         SELECT * FROM expr;
     )sql", settings);
     UNIT_ASSERT(!res.IsOk());
     UNIT_ASSERT_STRING_CONTAINS(
         Err2Str(res),
-        "WITH CTE in SQL syntax is not available before language version");
+        "WITH CTE is not available before language version");
 }
 
 } // Y_UNIT_TEST_SUITE(LegacyWithCTE)
