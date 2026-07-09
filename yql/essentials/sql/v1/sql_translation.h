@@ -24,6 +24,8 @@ struct TReadyCTE {
     }
 };
 
+const NYql::TFeature& LegacyWithCTEFeature();
+
 // Do not use it to get a position for a SQL hint.
 // Use TContext::TokenPosition instead.
 inline TPosition GetPos(const TToken& token) {
@@ -197,7 +199,7 @@ protected:
                        TVector<TSymbolNameWithPos>& aliases);
     bool NamedBindParam(const TRule_named_bind_parameter& node, TSymbolNameWithPos& name, TSymbolNameWithPos& alias);
     TNodePtr NamedNode(const TRule_named_nodes_stmt& rule, TVector<TSymbolNameWithPos>& names);
-    bool PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVector<TSymbolNameWithPos>& names, TNodePtr nodeExpr);
+    bool PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVector<TSymbolNameWithPos>& names, TNodePtr nodeExpr, bool isCTE = false);
     TNodePtr LegacyCTEValue(const TRule_cte_value& rule);
     TSQLStatus BuildLegacyCTEs(const TRule_cte_with_clause& rule, TVector<TString>& pushedNames);
     bool PopLegacyCTEs(const TVector<TString>& pushedNames);

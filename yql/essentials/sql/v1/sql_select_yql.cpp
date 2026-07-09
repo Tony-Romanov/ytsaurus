@@ -8,6 +8,7 @@
 
 #include <yql/essentials/sql/v1/proto_parser/parse_tree.h>
 
+#include <util/generic/hash_set.h>
 #include <util/generic/overloaded.h>
 #include <util/generic/scope.h>
 
@@ -85,14 +86,23 @@ public:
     }
 
 private:
-    TSQLStatus Build(const TRule_cte_with_clause& rule) {
+    TSQLStatus Build(const TRule_cte_with_clause& rule, TVector<TString>& pushedNames) {
         auto bindings = RawCTEs(rule);
         if (!bindings) {
             return std::unexpected(bindings.error());
         }
 
+        THashSet<TString> names;
         for (auto& binding : *bindings) {
-            auto result = Build(binding);
+            if (!names.insert(binding.Alias.Name).second) {
+                Ctx_.Error(binding.Alias.Position)
+                    << "Bad CTE: "
+                    << "Redefinition is forbidden: "
+                    << binding.Alias.Name;
+                return std::unexpected(ESQLError::Basic);
+            }
+
+            auto result = Build(binding, pushedNames);
             if (!result) {
                 return std::unexpected(result.error());
             }
@@ -156,7 +166,17 @@ private:
         };
     }
 
-    TSQLStatus Build(const TRawCTE& binding) {
+    bool IsNamedNodeCTE(const TRawCTE& binding) const {
+        return Ctx_.GetYqlSelectMode() == EYqlSelect::Force &&
+               !binding.IsRecursive &&
+               binding.Alias.Columns.empty();
+    }
+
+    TSQLStatus Build(const TRawCTE& binding, TVector<TString>& pushedNames) {
+        if (IsNamedNodeCTE(binding)) {
+            return BuildNamedNodeCTE(binding, pushedNames);
+        }
+
         TString name = binding.Alias.Name;
         TPosition position = binding.Alias.Position;
 
@@ -205,6 +225,38 @@ private:
         return std::monostate();
     }
 
+    TSQLStatus BuildNamedNodeCTE(const TRawCTE& binding, TVector<TString>& pushedNames) {
+        if (!Ctx_.EnsureAvailable(binding.Alias.Position, LegacyWithCTEFeature())) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        TNodeResult result = [&] {
+            TYqlSelect that(*this);
+            that.CurrentCTE_ = Nothing();
+            return that.Build(*binding.ParseTree);
+        }();
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+
+        TNodePtr source = GetYqlSource(*result);
+        if (!source) {
+            Ctx_.Error(binding.Alias.Position) << "Expected CTE source";
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        TVector<TSymbolNameWithPos> cteName = {{
+            .Name = binding.Alias.Name,
+            .Pos = binding.Alias.Position,
+        }};
+        if (!PushNamedNodeBlocks(Ctx_.GetCurrentBlocks(), cteName, ToTableExpression(std::move(source)), /*isCTE=*/true)) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        pushedNames.push_back(binding.Alias.Name);
+        return std::monostate();
+    }
+
     TNodeResult Build(const TRule_cte_value& rule) {
         switch (rule.GetAltCase()) {
             case TRule_cte_value::kAltCteValue1:
@@ -217,21 +269,51 @@ private:
     }
 
     TNodeResult BuildForked(const TRule_select_stmt& rule) {
-        if (auto status = BuildCTE(rule); !status) {
+        TVector<TString> cteNames;
+        bool cleanupCTEs = true;
+        Y_DEFER {
+            if (cleanupCTEs) {
+                PopLegacyCTEs(cteNames);
+            }
+        };
+
+        if (auto status = BuildCTE(rule, cteNames); !status) {
             return std::unexpected(status.error());
         }
 
         const auto& core = rule.GetRule_select_stmt_core2();
-        return Finalize(BuildUnion(core, TYqlSelectArgs()));
+        auto result = Finalize(BuildUnion(core, TYqlSelectArgs()));
+
+        cleanupCTEs = false;
+        if (!PopLegacyCTEs(cteNames)) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        return result;
     }
 
     TNodeResult BuildForked(const TRule_select_unparenthesized_stmt& rule) {
-        if (auto status = BuildCTE(rule); !status) {
+        TVector<TString> cteNames;
+        bool cleanupCTEs = true;
+        Y_DEFER {
+            if (cleanupCTEs) {
+                PopLegacyCTEs(cteNames);
+            }
+        };
+
+        if (auto status = BuildCTE(rule, cteNames); !status) {
             return std::unexpected(status.error());
         }
 
         const auto& core = rule.GetRule_select_unparenthesized_stmt_core2();
-        return Finalize(BuildUnion(core, TYqlSelectArgs()));
+        auto result = Finalize(BuildUnion(core, TYqlSelectArgs()));
+
+        cleanupCTEs = false;
+        if (!PopLegacyCTEs(cteNames)) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        return result;
     }
 
     TNodeResult BuildForked(
@@ -239,7 +321,15 @@ private:
         EColumnRefState state,
         ESmartParenthesis smartParenthesis)
     {
-        if (auto status = BuildCTE(rule); !status) {
+        TVector<TString> cteNames;
+        bool cleanupCTEs = true;
+        Y_DEFER {
+            if (cleanupCTEs) {
+                PopLegacyCTEs(cteNames);
+            }
+        };
+
+        if (auto status = BuildCTE(rule, cteNames); !status) {
             return std::unexpected(status.error());
         }
 
@@ -258,7 +348,14 @@ private:
         }
 
         if (!IsOnlySubExpr(rule)) {
-            return Finalize(BuildUnion(core, TYqlSelectArgs()));
+            auto result = Finalize(BuildUnion(core, TYqlSelectArgs()));
+
+            cleanupCTEs = false;
+            if (!PopLegacyCTEs(cteNames)) {
+                return std::unexpected(ESQLError::Basic);
+            }
+
+            return result;
         }
 
         const auto& intersect = core.GetRule_select_subexpr_intersect1();
@@ -267,7 +364,14 @@ private:
         const auto& select_or_expr = intersect.GetRule_select_or_expr1();
         YQL_ENSURE(intersect.GetBlock2().empty(), "Unexpected (intersect_op select_or_expr)*");
 
-        return Build(select_or_expr, state, smartParenthesis);
+        auto result = Build(select_or_expr, state, smartParenthesis);
+
+        cleanupCTEs = false;
+        if (!PopLegacyCTEs(cteNames)) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        return result;
     }
 
     const auto& GetFirstArgument(const auto& rule) {
@@ -314,9 +418,9 @@ private:
         requires std::is_same_v<TRule, TRule_select_stmt> ||
                  std::is_same_v<TRule, TRule_select_unparenthesized_stmt> ||
                  std::is_same_v<TRule, TRule_select_subexpr>
-    TSQLStatus BuildCTE(const TRule& rule) {
+    TSQLStatus BuildCTE(const TRule& rule, TVector<TString>& pushedNames) {
         if (rule.HasBlock1()) {
-            auto status = Build(rule.GetBlock1().GetRule_cte_with_clause1());
+            auto status = Build(rule.GetBlock1().GetRule_cte_with_clause1(), pushedNames);
             if (!status) {
                 return std::unexpected(status.error());
             }
@@ -1114,7 +1218,8 @@ private:
                     block.GetAlt1().GetRule_table_key1(),
                     std::move(service),
                     std::move(cluster),
-                    isAnonymous);
+                    isAnonymous,
+                    isClusterExplicit);
             case TRule_table_ref_TBlock3::kAlt2:
                 return Unsupported("an_id_expr LPAREN (table_arg (COMMA table_arg)* COMMA?)? RPAREN");
             case TRule_table_ref_TBlock3::kAlt3:
@@ -1134,10 +1239,28 @@ private:
         const TRule_table_key& rule,
         TString service,
         TDeferredAtom cluster,
-        bool isAnonymous)
+        bool isAnonymous,
+        bool isClusterExplicit)
     {
+        TString key = Id(rule.GetRule_id_table_or_type1(), *this);
+        if (key.empty()) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        if (!isClusterExplicit && !isAnonymous && !rule.HasBlock2()) {
+            if (TNodePtr node = Ctx_.Scoped->LookupNode(key)) {
+                if (auto source = GetYqlSource(node)) {
+                    return TYqlSource{
+                        .Node = std::move(source),
+                    };
+                }
+
+                Ctx_.Error() << "Expected CTE source";
+                return std::unexpected(ESQLError::Basic);
+            }
+        }
+
         if (cluster.Empty()) {
-            const TString key = Id(rule.GetRule_id_table_or_type1(), *this);
             Ctx_.Error() << "No cluster name given and no default cluster is selected. "
                          << "If '" << key << "' is meant to be a CTE, "
                          << "check that it is defined and visible in the current scope";
@@ -1146,11 +1269,6 @@ private:
 
         if (rule.HasBlock2()) {
             return Unsupported("(VIEW view_name)");
-        }
-
-        TString key = Id(rule.GetRule_id_table_or_type1(), *this);
-        if (key.empty()) {
-            return std::unexpected(ESQLError::Basic);
         }
 
         TYqlTableRefArgs args = {

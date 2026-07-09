@@ -722,7 +722,7 @@ TNodePtr TTranslation::GetNamedNode(const TString& name) {
     return SafeClone(res);
 }
 
-TString TTranslation::PushNamedNode(TPosition namePos, const TString& name, const TNodeBuilderByName& builder) {
+TString TTranslation::PushNamedNode(TPosition namePos, const TString& name, const TNodeBuilderByName& builder, bool isCTE) {
     TString resultName = name;
     if (IsAnonymousName(name)) {
         resultName = "$_yql_anonymous_name_" + ToString(Ctx_.AnonymousNameIndex++);
@@ -737,12 +737,12 @@ TString TTranslation::PushNamedNode(TPosition namePos, const TString& name, cons
         mapIt = result.first;
     }
 
-    mapIt->second.push_front(MakeIntrusive<TNodeWithUsageInfo>(node, namePos, Ctx_.ScopeLevel));
+    mapIt->second.push_front(MakeIntrusive<TNodeWithUsageInfo>(node, namePos, Ctx_.ScopeLevel, isCTE));
     return resultName;
 }
 
-TString TTranslation::PushNamedNode(NYql::TPosition namePos, const TString& name, NSQLTranslationV1::TNodePtr node) {
-    return PushNamedNode(namePos, name, [node](const TString&) { return node; });
+TString TTranslation::PushNamedNode(NYql::TPosition namePos, const TString& name, NSQLTranslationV1::TNodePtr node, bool isCTE) {
+    return PushNamedNode(namePos, name, [node](const TString&) { return node; }, isCTE);
 }
 
 TString TTranslation::PushNamedAtom(TPosition namePos, const TString& name) {
@@ -767,6 +767,9 @@ bool TTranslation::PopNamedNode(const TString& name) {
     auto& top = mapIt->second.front();
     if (!top->IsUsed && !Ctx_.HasPendingErrors && !name.StartsWith("$_")) {
         if (!Ctx_.Warning(top->NamePos, TIssuesIds::YQL_UNUSED_SYMBOL, [&](auto& out) {
+                if (top->IsCTE) {
+                    out << "CTE ";
+                }
                 out << "Symbol " << name << " is not used";
             })) {
             return false;
@@ -789,6 +792,9 @@ bool TTranslation::WarnUnusedNodes() const {
         for (const auto& item : items) {
             if (!item->IsUsed && item->Level == Ctx_.ScopeLevel) {
                 if (!Ctx_.Warning(item->NamePos, TIssuesIds::YQL_UNUSED_SYMBOL, [&](auto& out) {
+                        if (item->IsCTE) {
+                            out << "CTE ";
+                        }
                         out << "Symbol " << name << " is not used";
                     })) {
                     return false;

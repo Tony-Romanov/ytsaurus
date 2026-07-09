@@ -31,10 +31,11 @@ inline bool IsStreamingService(const TString& service) {
 }
 
 struct TNodeWithUsageInfo: public TThrRefBase {
-    explicit TNodeWithUsageInfo(TNodePtr node, TPosition namePos, int level)
+    explicit TNodeWithUsageInfo(TNodePtr node, TPosition namePos, int level, bool isCTE = false)
         : Node(std::move(node))
         , NamePos(std::move(namePos))
         , Level(level)
+        , IsCTE(isCTE)
     {
     }
 
@@ -42,6 +43,7 @@ struct TNodeWithUsageInfo: public TThrRefBase {
     TPosition NamePos;
     int Level = 0;
     bool IsUsed = false;
+    bool IsCTE = false;
 };
 
 using TNodeWithUsageInfoPtr = TIntrusivePtr<TNodeWithUsageInfo>;
@@ -511,8 +513,8 @@ public:
     TNodePtr GetNamedNode(const TString& name);
 
     using TNodeBuilderByName = std::function<TNodePtr(const TString& effectiveName)>;
-    TString PushNamedNode(TPosition namePos, const TString& name, const TNodeBuilderByName& builder);
-    TString PushNamedNode(TPosition namePos, const TString& name, TNodePtr node);
+    TString PushNamedNode(TPosition namePos, const TString& name, const TNodeBuilderByName& builder, bool isCTE = false);
+    TString PushNamedNode(TPosition namePos, const TString& name, TNodePtr node, bool isCTE = false);
     TString PushNamedAtom(TPosition namePos, const TString& name);
     bool PopNamedNode(const TString& name);
     [[nodiscard]] bool WarnUnusedNodes() const;

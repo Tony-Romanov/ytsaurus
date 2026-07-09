@@ -15543,7 +15543,7 @@ Y_UNIT_TEST(LinearVisibilityOK) {
 
     TWordCountHive stat = {"YqlSelect"};
     VerifyProgram(res, stat);
-    UNIT_ASSERT_VALUES_EQUAL(stat["YqlSelect"], 3);
+    UNIT_ASSERT_VALUES_EQUAL(stat["YqlSelect"], 5);
 }
 
 Y_UNIT_TEST(LinearVisibilityErr) {
@@ -15730,64 +15730,72 @@ Y_UNIT_TEST(RecursiveReferenceFromSubquery) {
 
 Y_UNIT_TEST_SUITE(LegacyWithCTE) {
 
-NSQLTranslation::TTranslationSettings Settings() {
+NSQLTranslation::TTranslationSettings Settings(NSQLTranslation::EYqlSelect mode) {
     NSQLTranslation::TTranslationSettings settings;
     settings.LangVer = NYql::GetMaxLangVersion();
-    settings.YqlSelect = NSQLTranslation::EYqlSelect::Disable;
+    settings.YqlSelect = mode;
     return settings;
 }
 
+void ForEachMode(std::function<void(const NSQLTranslation::TTranslationSettings&)> test) {
+    for (const auto mode : {NSQLTranslation::EYqlSelect::Disable, NSQLTranslation::EYqlSelect::Force}) {
+        test(Settings(mode));
+    }
+}
+
 Y_UNIT_TEST(AstEqualsNamedExpression) {
-    const auto settings = Settings();
+    ForEachMode([](const auto& settings) {
+        const auto named = SqlToYqlWithSettings(R"sql(
+            $expr = SELECT key, subkey FROM plato.Input WHERE key > "0";
+            SELECT * FROM $expr;
+        )sql", settings);
+        UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
 
-    const auto named = SqlToYqlWithSettings(R"sql(
-        $expr = SELECT key, subkey FROM plato.Input WHERE key > "0";
-        SELECT * FROM $expr;
-    )sql", settings);
-    UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
+        const auto cte = SqlToYqlWithSettings(R"sql(
+            WITH expr AS (SELECT key, subkey FROM plato.Input WHERE key > "0")
+            SELECT * FROM expr;
+        )sql", settings);
+        UNIT_ASSERT_C(cte.IsOk(), Err2Str(cte));
 
-    const auto cte = SqlToYqlWithSettings(R"sql(
-        WITH expr AS (SELECT key, subkey FROM plato.Input WHERE key > "0")
-        SELECT * FROM expr;
-    )sql", settings);
-    UNIT_ASSERT_C(cte.IsOk(), Err2Str(cte));
-
-    UNIT_ASSERT_NO_DIFF(GetPrettyPrint(cte), GetPrettyPrint(named));
+        UNIT_ASSERT_NO_DIFF(GetPrettyPrint(cte), GetPrettyPrint(named));
+    });
 }
 
 Y_UNIT_TEST(LinearVisibility) {
-    const auto settings = Settings();
+    ForEachMode([](const auto& settings) {
+        const auto named = SqlToYqlWithSettings(R"sql(
+            $x = SELECT 0 + 1 AS a;
+            $y = SELECT a + 1 AS a FROM $x;
+            SELECT * FROM $y;
+        )sql", settings);
+        UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
 
-    const auto named = SqlToYqlWithSettings(R"sql(
-        $x = SELECT 0 + 1 AS a;
-        $y = SELECT a + 1 AS a FROM $x;
-        SELECT * FROM $y;
-    )sql", settings);
-    UNIT_ASSERT_C(named.IsOk(), Err2Str(named));
+        const auto cte = SqlToYqlWithSettings(R"sql(
+            WITH
+                x AS (SELECT 0 + 1 AS a),
+                y AS (SELECT a + 1 AS a FROM x)
+            SELECT * FROM y;
+        )sql", settings);
+        UNIT_ASSERT_C(cte.IsOk(), Err2Str(cte));
 
-    const auto cte = SqlToYqlWithSettings(R"sql(
-        WITH
-            x AS (SELECT 0 + 1 AS a),
-            y AS (SELECT a + 1 AS a FROM x)
-        SELECT * FROM y;
-    )sql", settings);
-    UNIT_ASSERT_C(cte.IsOk(), Err2Str(cte));
-
-    UNIT_ASSERT_NO_DIFF(GetPrettyPrint(cte), GetPrettyPrint(named));
+        UNIT_ASSERT_NO_DIFF(GetPrettyPrint(cte), GetPrettyPrint(named));
+    });
 }
 
 Y_UNIT_TEST(LangVersion) {
-    NSQLTranslation::TTranslationSettings settings;
-    settings.YqlSelect = NSQLTranslation::EYqlSelect::Disable;
+    for (const auto mode : {NSQLTranslation::EYqlSelect::Disable, NSQLTranslation::EYqlSelect::Force}) {
+        NSQLTranslation::TTranslationSettings settings;
+        settings.YqlSelect = mode;
 
-    const auto res = SqlToYqlWithSettings(R"sql(
-        WITH expr AS (SELECT 1)
-        SELECT * FROM expr;
-    )sql", settings);
-    UNIT_ASSERT(!res.IsOk());
-    UNIT_ASSERT_STRING_CONTAINS(
-        Err2Str(res),
-        "WITH CTE is not available before language version");
+        const auto res = SqlToYqlWithSettings(R"sql(
+            WITH expr AS (SELECT 1)
+            SELECT * FROM expr;
+        )sql", settings);
+        UNIT_ASSERT(!res.IsOk());
+        UNIT_ASSERT_STRING_CONTAINS(
+            Err2Str(res),
+            "WITH CTE is not available before language version");
+    }
 }
 
 } // Y_UNIT_TEST_SUITE(LegacyWithCTE)

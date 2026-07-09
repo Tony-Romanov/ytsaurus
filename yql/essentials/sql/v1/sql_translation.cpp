@@ -28,16 +28,6 @@ using namespace NSQLTranslationV1;
 
 using NSQLTranslation::ESqlMode;
 
-const NYql::TFeature& LegacyWithCTEFeature() {
-    static const NYql::TFeature Feature = {
-        .Name = "LegacyWithCTE",
-        .Description = "WITH CTE",
-        .MinLangVer = NYql::GetMaxLangVersion(),
-    };
-
-    return Feature;
-}
-
 template <typename Callback>
 void VisitAllFields(const NProtoBuf::Message& msg, Callback& callback) {
     const auto* descr = msg.GetDescriptor();
@@ -125,6 +115,16 @@ namespace NSQLTranslationV1 {
 using NALPDefaultAntlr4::SQLv1Antlr4Lexer;
 
 using namespace NSQLv1Generated;
+
+const NYql::TFeature& LegacyWithCTEFeature() {
+    static const NYql::TFeature Feature = {
+        .Name = "LegacyWithCTE",
+        .Description = "WITH CTE",
+        .MinLangVer = NYql::GetMaxLangVersion(),
+    };
+
+    return Feature;
+}
 
 TIdentifier GetKeywordId(TTranslation& ctx, const TRule_keyword& node) {
     // keyword:
@@ -4307,7 +4307,7 @@ TNodePtr TSqlTranslation::NamedNode(const TRule_named_nodes_stmt& rule, TVector<
     }
 }
 
-bool TSqlTranslation::PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVector<TSymbolNameWithPos>& names, TNodePtr nodeExpr) {
+bool TSqlTranslation::PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVector<TSymbolNameWithPos>& names, TNodePtr nodeExpr, bool isCTE) {
     TVector<TNodePtr> nodes;
     auto subquery = nodeExpr->GetSource();
     if (subquery && Mode_ == NSQLTranslation::ESqlMode::LIBRARY && Ctx_.ScopeLevel == 0) {
@@ -4357,7 +4357,7 @@ bool TSqlTranslation::PushNamedNodeBlocks(TVector<TNodePtr>& blocks, const TVect
     }
 
     for (size_t i = 0; i < names.size(); ++i) {
-        PushNamedNode(names[i].Pos, names[i].Name, nodes[i]);
+        PushNamedNode(names[i].Pos, names[i].Name, nodes[i], isCTE);
     }
     return true;
 }
@@ -4431,7 +4431,7 @@ TSQLStatus TSqlTranslation::BuildLegacyCTEs(const TRule_cte_with_clause& rule, T
             .Name = name,
             .Pos = position,
         }};
-        if (!PushNamedNodeBlocks(Ctx_.GetCurrentBlocks(), cteName, std::move(value))) {
+        if (!PushNamedNodeBlocks(Ctx_.GetCurrentBlocks(), cteName, std::move(value), /*isCTE=*/true)) {
             return std::unexpected(ESQLError::Basic);
         }
 
