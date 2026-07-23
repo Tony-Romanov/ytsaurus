@@ -1371,6 +1371,25 @@ Y_UNIT_TEST(ColumnsAtSimpleSelect) {
     }
 }
 
+Y_UNIT_TEST(ColumnsInserting) {
+    auto engine = MakeSqlCompletionEngineUT();
+    const TVector<TCandidate> expected = {
+        {.Kind = ColumnName, .Content = "course"},
+        {.Kind = ColumnName, .Content = "room"},
+        {.Kind = ColumnName, .Content = "time"},
+    };
+
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course, # room FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course, #, room FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course, #, room AS r FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course AS c, #, room FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course AS c, # room FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course, # 'foo' AS foo FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course, # room AS r FROM example.`/yql/tutorial`;"), expected);
+    UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT course, # 'foo' FROM example.`/yql/tutorial`;"), expected);
+//  UNIT_ASSERT_VALUES_EQUAL(CompleteTop(expected.size(), engine, "SELECT # 123 FROM example.`/yql/tutorial`;"), expected);
+}
+
 Y_UNIT_TEST(ColumnsAtJoin) {
     auto engine = MakeSqlCompletionEngineUT();
     {
