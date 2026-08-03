@@ -1,4 +1,5 @@
 RECURSE(
+    complete
     fmrrun
     mrjob
     ytrun

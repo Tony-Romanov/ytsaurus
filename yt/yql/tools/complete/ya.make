@@ -1,9 +1,7 @@
-IF (NOT EXPORT_CMAKE OR NOT OPENSOURCE OR OPENSOURCE_PROJECT != "yt")
-
-PROGRAM()
+PROGRAM(complete)
 
 PEERDIR(
-    library/cpp/getopt
+    library/cpp/json
     library/cpp/iterator
     yql/essentials/sql/v1/ide/completion
     yql/essentials/sql/v1/ide/completion/name/cluster/static
@@ -19,9 +17,8 @@ PEERDIR(
 )
 
 SRCS(
-    yql_complete.cpp
+    complete.cpp
+    completion_factory.cpp
 )
 
 END()
-
-ENDIF()

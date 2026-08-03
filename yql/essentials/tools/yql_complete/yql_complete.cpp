@@ -1,19 +1,25 @@
-#include "completion_factory.h"
-
 #include <yql/essentials/sql/v1/ide/completion/sql_complete.h>
+#include <yql/essentials/sql/v1/ide/completion/name/cluster/static/discovery.h>
+#include <yql/essentials/sql/v1/ide/completion/name/object/simple/static/schema_json.h>
 #include <yql/essentials/sql/v1/ide/completion/name/service/ranking/frequency.h>
+#include <yql/essentials/sql/v1/ide/completion/name/service/ranking/ranking.h>
+#include <yql/essentials/sql/v1/ide/completion/name/service/static/name_service.h>
+#include <yql/essentials/sql/v1/ide/completion/name/service/cluster/name_service.h>
+#include <yql/essentials/sql/v1/ide/completion/name/service/schema/name_service.h>
+#include <yql/essentials/sql/v1/ide/completion/name/service/union/name_service.h>
+
+#include <yql/essentials/sql/v1/lexer/antlr4_pure/lexer.h>
+#include <yql/essentials/sql/v1/lexer/antlr4_pure_ansi/lexer.h>
 
 #include <yql/essentials/utils/utf8.h>
 
 #include <library/cpp/getopt/last_getopt.h>
 #include <library/cpp/json/json_reader.h>
-#include <library/cpp/json/json_writer.h>
+#include <library/cpp/iterator/iterate_keys.h>
+#include <library/cpp/iterator/functools.h>
 
-#include <util/generic/vector.h>
 #include <util/charset/utf8.h>
 #include <util/stream/file.h>
-
-#include <cctype>
 
 NSQLComplete::TFrequencyData LoadFrequencyDataFromFile(TString filepath) {
     TString text = TUnbufferedFileInput(filepath).ReadAll();
@@ -27,6 +33,16 @@ NJson::TJsonMap LoadSchemaJsonFromFile(TString filepath) {
         ythrow yexception() << "Failed to parse JSON: '" << text << "'";
     }
     return map;
+}
+
+NSQLComplete::TLexerSupplier MakePureLexerSupplier() {
+    NSQLTranslationV1::TLexers lexers;
+    lexers.Antlr4Pure = NSQLTranslationV1::MakeAntlr4PureLexerFactory();
+    lexers.Antlr4PureAnsi = NSQLTranslationV1::MakeAntlr4PureAnsiLexerFactory();
+    return [lexers = std::move(lexers)](bool ansi) {
+        return NSQLTranslationV1::MakeLexer(
+            lexers, ansi, NSQLTranslationV1::ELexerFlavor::Pure);
+    };
 }
 
 size_t UTF8PositionToBytes(const TStringBuf text, size_t position) {
@@ -45,7 +61,7 @@ NSQLComplete::TCompletionInput MakeCompletionInput(TString& text, TMaybe<ui64> p
         return NSQLComplete::SharpedInput(text);
     }
 
-    if (lengthUtf8 < *pos) {
+    if (lengthUtf8 <= *pos) {
         ythrow yexception() << "provided position " << *pos << " is out of range " << lengthUtf8;
     }
 
@@ -53,167 +69,6 @@ NSQLComplete::TCompletionInput MakeCompletionInput(TString& text, TMaybe<ui64> p
         .Text = text,
         .CursorPosition = UTF8PositionToBytes(text, *pos),
     };
-}
-
-enum class EReadDocumentResult {
-    Complete,
-    EndOfStream,
-    Incomplete,
-};
-
-EReadDocumentResult ReadJsonDocument(IInputStream& input, TString& document) {
-    document.clear();
-
-    for (char current; input.ReadChar(current);) {
-        if (!std::isspace(static_cast<unsigned char>(current))) {
-            document.push_back(current);
-            break;
-        }
-    }
-
-    if (document.empty()) {
-        return EReadDocumentResult::EndOfStream;
-    }
-
-    const char first = document.front();
-    if (first != '{' && first != '[' && first != '"') {
-        for (char current; input.ReadChar(current);) {
-            if (std::isspace(static_cast<unsigned char>(current))) {
-                break;
-            }
-            document.push_back(current);
-        }
-        return EReadDocumentResult::Complete;
-    }
-
-    bool isInString = (first == '"');
-    bool isEscaped = false;
-    TVector<char> closingCharacters;
-    if (first == '{') {
-        closingCharacters.push_back('}');
-    } else if (first == '[') {
-        closingCharacters.push_back(']');
-    }
-
-    for (char current; input.ReadChar(current);) {
-        document.push_back(current);
-
-        if (isInString) {
-            if (isEscaped) {
-                isEscaped = false;
-            } else if (current == '\\') {
-                isEscaped = true;
-            } else if (current == '"') {
-                isInString = false;
-                if (closingCharacters.empty()) {
-                    return EReadDocumentResult::Complete;
-                }
-            }
-            continue;
-        }
-
-        if (current == '"') {
-            isInString = true;
-        } else if (current == '{') {
-            closingCharacters.push_back('}');
-        } else if (current == '[') {
-            closingCharacters.push_back(']');
-        } else if (current == '}' || current == ']') {
-            if (!closingCharacters.empty() && closingCharacters.back() == current) {
-                closingCharacters.pop_back();
-                if (closingCharacters.empty()) {
-                    return EReadDocumentResult::Complete;
-                }
-            } else if (!closingCharacters.empty() && closingCharacters.front() == current) {
-                // Let the JSON parser report mismatched nested brackets, but
-                // terminate the malformed top-level document for recovery.
-                return EReadDocumentResult::Complete;
-            }
-        }
-    }
-
-    return EReadDocumentResult::Incomplete;
-}
-
-void WriteStreamResponse(const TVector<NSQLComplete::TCandidate>& candidates) {
-    NJson::TJsonArray response;
-    for (const auto& candidate : candidates) {
-        response.AppendValue(NJson::TJsonMap{
-            {"word", candidate.Content},
-            {"type", ToString(candidate.Kind)},
-        });
-    }
-
-    NJson::WriteJson(&Cout, &response, false);
-    Cout << Endl;
-}
-
-void WriteEmptyStreamResponse() {
-    WriteStreamResponse({});
-}
-
-void LogStreamError(TStringBuf message) {
-    Cerr << "Failed to process stream request: " << message << Endl;
-}
-
-void ReadRequest(TStringBuf document, const TCompletionFactory& completionFactory) {
-    try {
-        NJson::TJsonValue request;
-        NJson::ReadJsonTree(document, &request, true);
-        if (!request.IsMap()) {
-            ythrow yexception() << "request must be a map";
-        }
-
-        TString query;
-        if (request.Has("query")) {
-            if (!request["query"].IsString()) {
-                ythrow yexception() << "query must be a string";
-            }
-            query = request["query"].GetStringSafe();
-        }
-
-        const ui64 queryLength = GetNumberOfUTF8Chars(query);
-        ui64 position = queryLength;
-        if (request.Has("position")) {
-            if (!request["position"].IsUInteger()) {
-                ythrow yexception() << "position must be a non-negative integer";
-            }
-            position = Min<ui64>(request["position"].GetUIntegerSafe(), queryLength);
-        }
-
-        const NJson::TJsonValue* schema = nullptr;
-        if (request.Has("schema")) {
-            schema = &request["schema"];
-        }
-
-        auto engine = completionFactory.MakeEngine(schema);
-        auto input = MakeCompletionInput(query, position);
-        auto output = engine->CompleteAsync(input).ExtractValueSync();
-        WriteStreamResponse(output.Candidates);
-    } catch (const std::exception& error) {
-        LogStreamError(error.what());
-        WriteEmptyStreamResponse();
-    } catch (...) {
-        LogStreamError(CurrentExceptionMessage());
-        WriteEmptyStreamResponse();
-    }
-}
-
-void RunStream(const TCompletionFactory& completionFactory) {
-    for (;;) {
-        TString document;
-        const auto readResult = ReadJsonDocument(Cin, document);
-        if (readResult == EReadDocumentResult::EndOfStream) {
-            return;
-        }
-        if (readResult == EReadDocumentResult::Incomplete) {
-            LogStreamError("unexpected end of input inside JSON");
-            WriteEmptyStreamResponse();
-            return;
-        }
-
-        ReadRequest(document, completionFactory);
-    }
 }
 
 int Run(int argc, char** argv) {
@@ -224,13 +79,11 @@ int Run(int argc, char** argv) {
     TString freqFileName;
     TString schemaFileName;
     TMaybe<ui64> pos;
-    bool streamMode = false;
     opts.AddLongOption('i', "input", "input file").RequiredArgument("input").StoreResult(&inFileName);
     opts.AddLongOption('q', "query", "input query text").RequiredArgument("query").StoreResult(&inQueryText);
     opts.AddLongOption('f', "freq", "frequences file").StoreResult(&freqFileName);
     opts.AddLongOption('s', "schema", "schema file").StoreResult(&schemaFileName);
     opts.AddLongOption('p', "pos", "position").StoreResult(&pos);
-    opts.AddLongOption("stream", "process a stream of JSON requests from stdin").NoArgument().StoreTrue(&streamMode);
     opts.SetFreeArgsNum(0);
     opts.AddHelpOption();
 
@@ -238,22 +91,6 @@ int Run(int argc, char** argv) {
 
     if (res.Has("input") && res.Has("query")) {
         ythrow yexception() << "use either 'input' or 'query', not both";
-    }
-
-    NSQLComplete::TFrequencyData frequency;
-    if (freqFileName.empty()) {
-        frequency = NSQLComplete::LoadFrequencyData();
-    } else {
-        frequency = LoadFrequencyDataFromFile(freqFileName);
-    }
-    TCompletionFactory completionFactory(std::move(frequency));
-
-    if (streamMode) {
-        if (res.Has("input") || res.Has("query") || res.Has("schema") || res.Has("pos")) {
-            ythrow yexception() << "--stream cannot be combined with --input, --query, --schema, or --pos";
-        }
-        RunStream(completionFactory);
-        return 0;
     }
 
     TString queryString;
@@ -268,11 +105,42 @@ int Run(int argc, char** argv) {
         queryString = in.ReadAll();
     }
 
-    TMaybe<NJson::TJsonMap> schema;
-    if (!schemaFileName.empty()) {
-        schema = LoadSchemaJsonFromFile(schemaFileName);
+    NSQLComplete::TFrequencyData frequency;
+    if (freqFileName.empty()) {
+        frequency = NSQLComplete::LoadFrequencyData();
+    } else {
+        frequency = LoadFrequencyDataFromFile(freqFileName);
     }
-    auto engine = completionFactory.MakeEngine(schema ? &*schema : nullptr);
+    auto ranking = NSQLComplete::MakeDefaultRanking(frequency);
+
+    TVector<NSQLComplete::INameService::TPtr> services;
+
+    services.emplace_back(
+        NSQLComplete::MakeStaticNameService(
+            NSQLComplete::LoadDefaultNameSet(), ranking));
+
+    if (!schemaFileName.empty()) {
+        NJson::TJsonMap schema = LoadSchemaJsonFromFile(schemaFileName);
+
+        services.emplace_back(
+            NSQLComplete::MakeSchemaNameService(
+                NSQLComplete::MakeSimpleSchema(
+                    NSQLComplete::MakeStaticSimpleSchema(schema))));
+
+        auto clustersIt = NFuncTools::Filter(
+            [](const auto& x) { return !x.empty(); },
+            IterateKeys(schema.GetMapSafe()));
+        TVector<TString> clusters(clustersIt.begin(), clustersIt.end());
+
+        services.emplace_back(
+            NSQLComplete::MakeClusterNameService(
+                NSQLComplete::MakeStaticClusterDiscovery(std::move(clusters))));
+    }
+
+    auto engine = NSQLComplete::MakeSqlCompletionEngine(
+        MakePureLexerSupplier(),
+        NSQLComplete::MakeUnionNameService(std::move(services), ranking));
+
     auto input = MakeCompletionInput(queryString, pos);
     auto output = engine->CompleteAsync(input).ExtractValueSync();
     for (const auto& c : output.Candidates) {
