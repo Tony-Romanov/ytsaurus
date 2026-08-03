@@ -115,7 +115,7 @@ void WriteResponse(const TVector<NSQLComplete::TCandidate>& candidates) {
     NJson::TJsonArray response;
     for (const auto& candidate : candidates) {
         response.AppendValue(NJson::TJsonMap{
-            {"word", candidate.Content},
+            {"suggestion", candidate.Content},
             {"type", ToString(candidate.Kind)},
         });
     }
