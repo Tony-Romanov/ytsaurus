@@ -4,15 +4,22 @@
 
 #include <yql/essentials/utils/utf8.h>
 
+#include <library/cpp/getopt/last_getopt.h>
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/json/json_writer.h>
 
 #include <util/charset/utf8.h>
 #include <util/generic/vector.h>
+#include <util/stream/file.h>
 
 #include <cctype>
 
 namespace {
+
+NSQLComplete::TFrequencyData LoadFrequencyDataFromFile(TString filepath) {
+    TString text = TUnbufferedFileInput(filepath).ReadAll();
+    return NSQLComplete::Pruned(NSQLComplete::ParseJsonFrequencyData(text));
+}
 
 size_t UTF8PositionToBytes(TStringBuf text, size_t position) {
     const TStringBuf substr = SubstrUTF8(text, position, text.length());
@@ -175,7 +182,7 @@ void ReadRequest(TStringBuf document, const TCompletionFactory& completionFactor
     }
 }
 
-void Run(const TCompletionFactory& completionFactory) {
+void RunStream(const TCompletionFactory& completionFactory) {
     for (;;) {
         TString document;
         const auto readResult = ReadJsonDocument(Cin, document);
@@ -192,18 +199,48 @@ void Run(const TCompletionFactory& completionFactory) {
     }
 }
 
-} // namespace
+int Run(int argc, char** argv) {
+    NLastGetopt::TOpts opts = NLastGetopt::TOpts::Default();
+    opts.SetTitle("YQL completion service operating over a JSON stream on stdin and stdout");
+    opts.SetFreeArgsNum(0);
+    opts.AddSection("Stream protocol",
+        R"(Input is a sequence of JSON maps.
+Each map may contain query (string), position (integer), and schema (map).
+Unknown fields are ignored. Missing query means an empty string.
+Missing or out-of-range position means the end of query.
+Each response is one JSON array followed by a newline.
+Every array item contains suggestion and type strings.
+Request errors are written to stderr and produce an empty response array.
+    )");
+    opts.AddSection("Example",
+        R"(Input: {"query":"SEL","position":3,schema:{}}
+Output: [{"suggestion":"SELECT","type":"Keyword"}]
+    )");
 
-int main(int argc, char**) {
-    if (argc != 1) {
-        Cerr << "complete does not accept command-line arguments" << Endl;
-        return 1;
+    TString frequencyFileName;
+    opts.AddLongOption('f', "frequences", "frequency data JSON file")
+        .RequiredArgument("FILE")
+        .StoreResult(&frequencyFileName);
+
+    NLastGetopt::TOptsParseResult result(&opts, argc, argv);
+
+    NSQLComplete::TFrequencyData frequency;
+    if (frequencyFileName.empty()) {
+        frequency = NSQLComplete::LoadFrequencyData();
+    } else {
+        frequency = LoadFrequencyDataFromFile(frequencyFileName);
     }
 
+    TCompletionFactory completionFactory(std::move(frequency));
+    RunStream(completionFactory);
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
     try {
-        TCompletionFactory completionFactory(NSQLComplete::LoadFrequencyData());
-        Run(completionFactory);
-        return 0;
+        return Run(argc, argv);
     } catch (...) {
         Cerr << CurrentExceptionMessage() << Endl;
         return 1;

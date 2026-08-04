@@ -1,6 +1,7 @@
 PROGRAM(complete)
 
 PEERDIR(
+    library/cpp/getopt
     library/cpp/json
     library/cpp/iterator
     yql/essentials/sql/v1/ide/completion
