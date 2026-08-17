@@ -60,14 +60,15 @@ bool HasJavaCompanionResource(const TFlowViewPtr& flowView)
 
 TExtendedWorkerDescription DescribeWorker(
     const TFlowViewPtr& flowView,
-    const std::string& workerAddress)
+    const std::string& workerAddress,
+    const std::string& deployStageUrl)
 {
     TExtendedWorkerDescription description;
 
     auto worker = GetOrDefault(flowView->State->Workers, workerAddress);
     if (!worker) {
         THROW_ERROR_EXCEPTION("Worker not found")
-            << TErrorAttribute("worker_address", workerAddress);
+            .With("worker_address", workerAddress);
     }
 
     auto workerPartitions = GetOrDefault(GetWorkersPartitionIntermediateDescriptions(flowView, workerAddress), workerAddress);
@@ -107,6 +108,11 @@ TExtendedWorkerDescription DescribeWorker(
                 Format("* Memory flamegraph: [%v](%v)\n", memoryFlamegraphAddress, memoryFlamegraphAddress);
         }
 
+        std::string deployStageLink;
+        if (!deployStageUrl.empty()) {
+            deployStageLink = Format("Deploy stage pods: [%v](%v)\n\n", deployStageUrl, deployStageUrl);
+        }
+
         auto& message = description.Messages.emplace_back();
         message.Level = ELogLevel::Info;
         message.Text = "Useful links";
@@ -116,6 +122,7 @@ TExtendedWorkerDescription DescribeWorker(
             Format("Worker rpc address: `%v`\n\n", worker->RpcAddress) +
             Format("Worker monitoring address: `%v`\n\n", worker->MonitoringAddress) +
             Format("Worker remote shell command: `%v`\n\n", worker->RemoteShellCommand) +
+            deployStageLink +
             Format("Worker incarnation id: `%v`\n\n", worker->IncarnationId) +
             Format("Worker vcpu factor: %v\n\n", worker->VcpuFactor) +
             Format("Worker vcpu limit: %v\n\n", worker->VcpuLimit) +

@@ -1,11 +1,12 @@
 RECURSE(
     cpp
+    docker
+    go
     python
 )
 
 IF (NOT OPENSOURCE)
     RECURSE(
-        docker
         java
         kotlin
     )

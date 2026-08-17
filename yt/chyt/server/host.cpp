@@ -9,6 +9,7 @@
 #include "health_checker.h"
 #include "helpers.h"
 #include "invoker_liveness_checker.h"
+#include "materialized_view_coordinator.h"
 #include "memory_watchdog.h"
 #include "query_context.h"
 #include "query_registry.h"
@@ -244,6 +245,13 @@ public:
     {
         YT_VERIFY(context_ && context.expired());
         context = context_;
+        if (CypressObjectRepository_ && Config_->MaterializedViews) {
+            MaterializedViewCoordinator_ = New<TMaterializedViewCoordinator>(
+                Owner_,
+                CypressObjectRepository_,
+                Config_->MaterializedViews,
+                ChannelFactory_);
+        }
     }
 
     void InitQueryRegistry()
@@ -302,6 +310,14 @@ public:
             ElectionManager_->Start();
         }
 
+        if (MaterializedViewCoordinator_) {
+            if (ElectionManager_) {
+                MaterializedViewCoordinator_->Start();
+            } else {
+                YT_TLOG_WARNING("Materialized view background processing is disabled because no election manager is configured");
+            }
+        }
+
         CreateOrchidNode();
         StartDiscovery();
 
@@ -355,9 +371,9 @@ public:
 
             if (!resultOrError.IsOK()) {
                 errors.push_back(resultOrError
-                    << TErrorAttribute("path", paths[index])
-                    << TErrorAttribute("permission", "read")
-                    << TErrorAttribute("columns", paths[index].GetColumns()));
+                    .With("path", paths[index])
+                    .With("permission", "read")
+                    .With("columns", paths[index].GetColumns()));
             } else {
                 rowLevelAclPerTable[index] = resultOrError.Value().RowLevelAcl;
             }
@@ -368,7 +384,7 @@ public:
                 errors.resize(MaxInnerErrorCount);
             }
 
-            THROW_ERROR_EXCEPTION("Error validating permissions for user %Qv", user) << errors;
+            THROW_ERROR_EXCEPTION("Error validating permissions for user %Qv", user).With(errors);
         }
 
         return rowLevelAclPerTable;
@@ -463,10 +479,10 @@ public:
             }
         }
 
-        YT_LOG_DEBUG("Getting object attributes (HitCount: %v, MissedCount: %v, User: %v)",
-            paths.size() - missedPaths.size(),
-            missedPaths.size(),
-            user);
+        YT_TLOG_DEBUG("Getting object attributes")
+            .With("HitCount", paths.size() - missedPaths.size())
+            .With("MissedCount", missedPaths.size())
+            .With("User", user);
 
         std::reverse(missedPaths.begin(), missedPaths.end());
 
@@ -497,9 +513,9 @@ public:
 
     void InvalidateCachedObjectAttributes(const std::vector<std::pair<TYPath, NHydra::TRevision>>& paths)
     {
-        YT_LOG_DEBUG("Invalidating locally cached table attributes (PathCount: %v, Paths: %v)",
-            paths.size(),
-            MakeShrunkFormattableView(paths, TDefaultFormatter{}, 10));
+        YT_TLOG_DEBUG("Invalidating locally cached table attributes")
+            .With("PathCount", paths.size())
+            .With("Paths", MakeShrunkFormattableView(paths, TDefaultFormatter{}, 10));
 
         for (const auto& [path, refreshRevision] : paths) {
             TableAttributeCache_->InvalidateActiveAndSetRefreshRevision(path, refreshRevision);
@@ -511,10 +527,10 @@ public:
         EInvalidateCacheMode mode,
         TDuration timeout)
     {
-        YT_LOG_DEBUG("Invalidating cached table attributes in clique (PathCount: %v, Mode: %v, Timeout: %v)",
-            paths.size(),
-            mode,
-            timeout);
+        YT_TLOG_DEBUG("Invalidating cached table attributes in clique")
+            .With("PathCount", paths.size())
+            .With("Mode", mode)
+            .With("Timeout", timeout);
 
         if (mode == EInvalidateCacheMode::None) {
             return;
@@ -566,7 +582,7 @@ public:
 
     TClusterNodes GetNodes(bool alwaysIncludeLocal) const
     {
-        auto nodeList = FilterNodesByCliqueId(Discovery_->List());
+        auto nodeList = GetDiscoveryNodes();
         TClusterNodes result;
         result.reserve(nodeList.size());
 
@@ -592,6 +608,11 @@ public:
         }
 
         return result;
+    }
+
+    TDiscoveryNodes GetDiscoveryNodes() const
+    {
+        return FilterNodesByCliqueId(Discovery_->List());
     }
 
     IClusterNodePtr GetLocalNode() const
@@ -740,21 +761,6 @@ public:
             /*relative_table_path*/ "");
     }
 
-    DB::DatabasePtr CreateYTDatabase() const
-    {
-        return NYT::NClickHouseServer::CreateYTDatabase();
-    }
-
-    std::vector<DB::DatabasePtr> CreateUserDefinedDatabases() const
-    {
-        std::vector<DB::DatabasePtr> result;
-        result.reserve(Config_->DatabaseDirectories.size());
-        for (const auto& [databaseName, root] : Config_->DatabaseDirectories) {
-            result.push_back(NYT::NClickHouseServer::CreateDirectoryDatabase(databaseName, root));
-        }
-        return result;
-    }
-
     std::vector<TString> GetUserDefinedDatabaseNames() const
     {
         std::vector<TString> result;
@@ -783,7 +789,8 @@ public:
 
     void SetSqlObjectOnOtherInstances(const TString& objectName, const NClickHouseServer::TSqlObjectInfo& info) const
     {
-        YT_LOG_DEBUG("Setting SQL object on other instances (ObjectName: %v)", objectName);
+        YT_TLOG_DEBUG("Setting SQL object on other instances")
+            .With("ObjectName", objectName);
 
         auto instances = Discovery_->List();
 
@@ -814,7 +821,8 @@ public:
 
     void RemoveSqlObjectOnOtherInstances(const TString& objectName, NHydra::TRevision revision) const
     {
-        YT_LOG_DEBUG("Removing SQL object on other instances (ObjectName: %v)", objectName);
+        YT_TLOG_DEBUG("Removing SQL object on other instances")
+            .With("ObjectName", objectName);
 
         auto instances = Discovery_->List();
 
@@ -845,7 +853,8 @@ public:
 
     void ReloadDictionaryGlobally(const std::string& configPath) const
     {
-        YT_LOG_DEBUG("Reloading dictionary on all instances (ConfigPath: %v)", configPath);
+        YT_TLOG_DEBUG("Reloading dictionary on all instances")
+            .With("ConfigPath", configPath);
 
         const auto& externalDictionariesLoader = GetContext()->getExternalDictionariesLoader();
         externalDictionariesLoader.reloadConfig(TCypressObjectRepository::CypressConfigRepositoryName, configPath);
@@ -875,12 +884,47 @@ public:
             .ThrowOnError();
     }
 
-    TCypressObjectRepositoryPtr GetCypressObjectRepository()
+    TCypressObjectRepositoryPtr GetCypressObjectRepository() const
     {
         THROW_ERROR_EXCEPTION_IF(
             !CypressObjectRepository_,
-            "Clique doesn't have configured CypressObjectRepository");
+            "Clique has no configured CypressObjectRepository");
         return CypressObjectRepository_;
+    }
+
+    TMaterializedViewCoordinatorPtr GetMaterializedViewCoordinator() const
+    {
+        THROW_ERROR_EXCEPTION_IF(
+            !MaterializedViewCoordinator_,
+            "Clique has no configured materialized view coordinator");
+        return MaterializedViewCoordinator_;
+    }
+
+    void RefreshCypressObjectRepositoryGlobally() const
+    {
+        YT_TLOG_DEBUG("Refreshing Cypress object repository on all instances");
+
+        auto instances = Discovery_->List();
+        using TResponse = NRpc::TTypedClientResponse<TRspRefreshCypressObjectRepository>::TResult;
+        std::vector<TFuture<TResponse>> futures;
+        futures.reserve(instances.size());
+
+        for (auto [instanceId, attributes] : instances) {
+            if (instanceId == ToString(Config_->InstanceId)) {
+                // The local snapshot has already been refreshed by the writer.
+                continue;
+            }
+
+            auto channel = ChannelFactory_->CreateChannel(
+                NNet::BuildServiceAddress(attributes->Get<TString>("host"), attributes->Get<int>("rpc_port")));
+            TClickHouseServiceProxy proxy(channel);
+
+            auto req = proxy.RefreshCypressObjectRepository();
+            futures.push_back(req->Invoke());
+        }
+
+        WaitFor(AllSet(futures))
+            .ThrowOnError();
     }
 
     void PrepareClickHouseUser(const std::string& userName)
@@ -906,6 +950,9 @@ public:
 
         auto& accessControl = getContext()->getAccessControl();
         auto userId = accessControl.find(DB::AccessEntityType::USER, userName);
+        if (!userId) {
+            return;
+        }
         auto entity = accessControl.read(*userId);
         auto user = std::static_pointer_cast<DB::User>(entity->clone());
 
@@ -970,6 +1017,7 @@ private:
     IMultiReaderMemoryManagerPtr ParallelReaderMemoryManager_;
 
     TCypressObjectRepositoryPtr CypressObjectRepository_;
+    TMaterializedViewCoordinatorPtr MaterializedViewCoordinator_;
     IDictionaryAccessControlPtr DictionaryAccessControl_;
 
     NProfiling::TEventTimer AttributeFetchTimeCounter_;
@@ -1072,9 +1120,9 @@ private:
         YT_UNUSED_FUTURE(Discovery_->UpdateList());
     }
 
-    THashMap<std::string, NYTree::IAttributeDictionaryPtr> FilterNodesByCliqueId(const THashMap<std::string, NYTree::IAttributeDictionaryPtr>& nodes) const
+    TDiscoveryNodes FilterNodesByCliqueId(const TDiscoveryNodes& nodes) const
     {
-        THashMap<std::string, NYTree::IAttributeDictionaryPtr> result;
+        TDiscoveryNodes result;
         for (const auto& [key, attributes] : nodes) {
             if (!attributes || !attributes->Contains("clique_id")) {
                 continue;
@@ -1089,7 +1137,7 @@ private:
 
     void MakeGossip()
     {
-        YT_LOG_DEBUG("Gossip started");
+        YT_TLOG_DEBUG("Gossip started");
 
         // Instances can be banned because of transient errors (e.g. network errors).
         // Pinging banned instances can help to restore clique faster after such errors.
@@ -1123,13 +1171,16 @@ private:
             if (!responseIt->IsOK() || responseIt->Value()->instance_id() != name ||
                 FromProto<EInstanceState>(responseIt->Value()->instance_state()) == EInstanceState::Stopped)
             {
-                YT_LOG_WARNING("Banning instance (Address: %v, HttpPort: %v, TcpPort: %v, RpcPort: %v, JobId: %v, State: %v)",
-                    attributes->Get<TString>("host"),
-                    attributes->Get<ui64>("http_port"),
-                    attributes->Get<ui64>("tcp_port"),
-                    attributes->Get<ui64>("rpc_port"),
-                    name,
-                    (responseIt->IsOK() ? Format("%v", FromProto<EInstanceState>(responseIt->Value()->instance_state())) : "Request failed"));
+                auto state = responseIt->IsOK()
+                    ? Format("%v", FromProto<EInstanceState>(responseIt->Value()->instance_state()))
+                    : "Request failed";
+                YT_TLOG_WARNING("Banning instance")
+                    .With("Address", attributes->Get<TString>("host"))
+                    .With("HttpPort", attributes->Get<ui64>("http_port"))
+                    .With("TcpPort", attributes->Get<ui64>("tcp_port"))
+                    .With("RpcPort", attributes->Get<ui64>("rpc_port"))
+                    .With("JobId", name)
+                    .With("State", state);
                 dead.push_back(name);
             } else {
                 alive.push_back(name);
@@ -1142,15 +1193,17 @@ private:
         }
         Discovery_->Ban(dead);
 
-        YT_LOG_DEBUG("Gossip completed (Alive: %v, Dead: %v)", alive.size(), dead.size());
+        YT_TLOG_DEBUG("Gossip completed")
+            .With("Alive", alive.size())
+            .With("Dead", dead.size());
     }
 
     void DoHandleIncomingGossip(const TString& instanceId, EInstanceState state)
     {
         if (state != EInstanceState::Active) {
-            YT_LOG_DEBUG("Received gossip from non-active instance (InstanceId: %v, State: %v)",
-                instanceId,
-                state);
+            YT_TLOG_DEBUG("Received gossip from non-active instance")
+                .With("InstanceId", instanceId)
+                .With("State", state);
             Discovery_->Ban(instanceId);
             return;
         }
@@ -1166,10 +1219,10 @@ private:
         auto& counter = UnknownInstancePingCounter_[instanceId];
         ++counter;
 
-        YT_LOG_DEBUG("Received gossip from unknown instance (InstanceId: %v, State: %v, Counter: %v)",
-            instanceId,
-            state,
-            counter);
+        YT_TLOG_DEBUG("Received gossip from unknown instance")
+            .With("InstanceId", instanceId)
+            .With("State", state)
+            .With("Counter", counter);
 
         if (counter >= Config_->Gossip->UnknownInstancePingLimit) {
             return;
@@ -1203,10 +1256,10 @@ private:
         WaitFor(RootClient_->CreateNode(path, EObjectType::Orchid, options))
             .ThrowOnError();
 
-        YT_LOG_INFO("Initialized orchid node (Host: %v, Port: %v, OrchidNodePath: %v)",
-            host,
-            Ports_.Rpc,
-            path);
+        YT_TLOG_INFO("Initialized orchid node")
+            .With("Host", host)
+            .With("Port", Ports_.Rpc)
+            .With("OrchidNodePath", path);
     }
 
     void RegisterFactories()
@@ -1348,6 +1401,11 @@ TClusterNodes THost::GetNodes(bool alwaysIncludeLocal) const
     return Impl_->GetNodes(alwaysIncludeLocal);
 }
 
+TDiscoveryNodes THost::GetDiscoveryNodes() const
+{
+    return Impl_->GetDiscoveryNodes();
+}
+
 IClusterNodePtr THost::GetLocalNode() const
 {
     return Impl_->GetLocalNode();
@@ -1418,16 +1476,6 @@ void THost::PopulateSystemDatabase(DB::IDatabase* systemDatabase) const
     return Impl_->PopulateSystemDatabase(systemDatabase);
 }
 
-std::shared_ptr<DB::IDatabase> THost::CreateYTDatabase() const
-{
-    return Impl_->CreateYTDatabase();
-}
-
-std::vector<DB::DatabasePtr> THost::CreateUserDefinedDatabases() const
-{
-    return Impl_->CreateUserDefinedDatabases();
-}
-
 std::vector<TString> THost::GetUserDefinedDatabaseNames() const
 {
     return Impl_->GetUserDefinedDatabaseNames();
@@ -1460,7 +1508,6 @@ NTableClient::TTableColumnarStatisticsCachePtr THost::GetTableColumnarStatistics
 
 THost::~THost() = default;
 
-
 bool THost::HasUserDefinedSqlObjectStorage() const
 {
     return Impl_->HasUserDefinedSqlObjectStorage();
@@ -1489,6 +1536,16 @@ void THost::ReloadDictionaryGlobally(const std::string& configPath) const
 TCypressObjectRepositoryPtr THost::GetCypressObjectRepository() const
 {
     return Impl_->GetCypressObjectRepository();
+}
+
+TMaterializedViewCoordinatorPtr THost::GetMaterializedViewCoordinator() const
+{
+    return Impl_->GetMaterializedViewCoordinator();
+}
+
+void THost::RefreshCypressObjectRepositoryGlobally() const
+{
+    Impl_->RefreshCypressObjectRepositoryGlobally();
 }
 
 void THost::PrepareClickHouseUser(const std::string& userName)

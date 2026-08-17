@@ -68,9 +68,8 @@ public:
         , LocalClient_(std::move(localClient))
         , ReplicationCardUpdatesBatcher_(std::move(replicationCardUpdatesBatcher))
         , Logger(TabletNodeLogger()
-            .WithTag("%v, ReplicationCardId: %v",
-                tablet->GetLoggingTag(),
-                replicationCardId))
+            .WithTags(tablet->GetLoggingTags())
+            .WithTag("ReplicationCardId", replicationCardId))
         , ConfigurationLock_(New<TAsyncSemaphore>(1))
         , SelfInvoker_(Tablet_->GetEpochAutomatonInvoker())
     { }
@@ -201,8 +200,8 @@ private:
                 ReconfigureTabletWriteMode();
             } catch (std::exception& ex) {
                 auto error = TError(ex)
-                    << TErrorAttribute("tablet_id", Tablet_->GetId())
-                    << TErrorAttribute("table_path", Tablet_->GetTablePath());
+                    .With("tablet_id", Tablet_->GetId())
+                    .With("table_path", Tablet_->GetTablePath());
                 YT_LOG_ERROR(error, "Failed to reconfigure tablet write mode");
             }
         } else {

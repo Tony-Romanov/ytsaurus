@@ -320,7 +320,7 @@ void TNode::ValidateRegistered() const
     }
 
     THROW_ERROR_EXCEPTION(NNodeTrackerClient::EErrorCode::InvalidState, "Node is not registered")
-        << TErrorAttribute("local_node_state", state);
+        .With("local_node_state", state);
 }
 
 void TNode::SetClusterNodeStatistics(NNodeTrackerClient::NProto::TClusterNodeStatistics&& statistics)
@@ -1174,6 +1174,11 @@ void TNode::SetHost(THost* host)
     if (Host_) {
         Host_->AddNode(this);
     }
+}
+
+void TNode::SetHost(TTestingTag, THost* host)
+{
+    SetHost(host);
 }
 
 bool TNode::GetEffectiveDisableWriteSessions() const

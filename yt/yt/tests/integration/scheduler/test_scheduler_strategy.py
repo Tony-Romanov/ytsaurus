@@ -184,6 +184,65 @@ class TestResourceUsage(YTEnvSetup, PrepareTables):
         release_breakpoint()
         op.track()
 
+    @authors("eshcherbin")
+    def test_estimated_guarantee_share_ignores_integral_guarantees(self):
+        total_cpu_limit = get("//sys/scheduler/orchid/scheduler/cluster/resource_limits/cpu")
+
+        create_pool(
+            "burst_pool",
+            attributes={
+                "integral_guarantees": {
+                    "guarantee_type": "burst",
+                    "resource_flow": {"cpu": 0.3 * total_cpu_limit},
+                    "burst_guarantee_resources": {"cpu": 0.3 * total_cpu_limit},
+                },
+            },
+        )
+
+        create_pool(
+            "relaxed_pool",
+            attributes={
+                "integral_guarantees": {
+                    "guarantee_type": "relaxed",
+                    "resource_flow": {"cpu": 0.7 * total_cpu_limit},
+                },
+            },
+        )
+
+        expected_shares = {
+            "<Root>": 0.0,
+            "burst_pool": 0.0,
+            "relaxed_pool": 0.0,
+        }
+
+        @wait_no_assert
+        def check_estimated_guarantee_shares():
+            for pool, expected_share in expected_shares.items():
+                actual_share = get(scheduler_orchid_pool_path(pool) + "/dominant_estimated_guarantee_share")
+                assert are_almost_equal(actual_share, expected_share)
+
+    @authors("eshcherbin")
+    def test_estimated_guarantee_share_of_pool_with_strong_and_integral_guarantees(self):
+        total_cpu_limit = get("//sys/scheduler/orchid/scheduler/cluster/resource_limits/cpu")
+
+        create_pool(
+            "mixed_pool",
+            attributes={
+                "strong_guarantee_resources": {"cpu": 0.3 * total_cpu_limit},
+                "integral_guarantees": {
+                    "guarantee_type": "burst",
+                    "resource_flow": {"cpu": 0.4 * total_cpu_limit},
+                    "burst_guarantee_resources": {"cpu": 0.4 * total_cpu_limit},
+                },
+            },
+        )
+
+        @wait_no_assert
+        def check_estimated_guarantee_shares():
+            for pool in ["<Root>", "mixed_pool"]:
+                actual_share = get(scheduler_orchid_pool_path(pool) + "/dominant_estimated_guarantee_share")
+                assert are_almost_equal(actual_share, 0.3)
+
     @authors("ignat")
     def test_resource_limits(self):
         resource_limits = {"cpu": 1.0, "memory": 1000 * 1024 * 1024, "network": 10}
@@ -309,6 +368,35 @@ class TestResourceUsage(YTEnvSetup, PrepareTables):
 
         wait(lambda: get(scheduler_orchid_operation_path(big_op.id) + "/resource_usage/cpu") == 2.0)
         wait(lambda: get(scheduler_orchid_operation_path(small_op.id) + "/resource_usage/cpu") == 2.0)
+
+    @authors("yaishenka")
+    def test_infinite_resource_limits_overcommit_during_preemption(self):
+        if not self.use_precommit_for_preemption:
+            pytest.skip("Infinite overcommit requires use_precommit_for_preemption")
+
+        update_pool_tree_config_option("default", "enable_infinite_resource_limits_overcommit", True)
+
+        create_pool("pool")
+        set("//sys/pool_trees/default/pool/@resource_limits", {"cpu": 4.0})
+
+        big_op = run_sleeping_vanilla(job_count=2, task_patch={"cpu_limit": 2.0}, spec={"pool": "pool"})
+        wait(lambda: get(scheduler_orchid_operation_path(big_op.id) + "/resource_usage/cpu", default=None) == 4.0)
+
+        # NB: The allocation demands 2 CPU over the pool limit and no overcommit tolerance
+        # is configured, so it can only be scheduled with infinite overcommit.
+        small_op = run_sleeping_vanilla(job_count=1, task_patch={"cpu_limit": 2.0}, spec={"pool": "pool"})
+
+        wait(lambda: get(scheduler_orchid_operation_path(small_op.id) + "/resource_usage/cpu", default=None) == 2.0)
+        wait(lambda: get(scheduler_orchid_operation_path(big_op.id) + "/resource_usage/cpu") == 2.0)
+
+    @authors("yaishenka")
+    def test_infinite_resource_limits_overcommit_requires_precommit_for_preemption(self):
+        if self.use_precommit_for_preemption:
+            pytest.skip("The invalid combination requires use_precommit_for_preemption to be disabled")
+
+        with raises_yt_error("Infinite resource limits overcommit requires precommit for preemption"):
+            update_pool_tree_config_option(
+                "default", "enable_infinite_resource_limits_overcommit", True, wait_for_orchid=False)
 
     @authors("yaishenka")
     @pytest.mark.skipif(is_asan_build(), reason="Large operation memory usage corrupts test")

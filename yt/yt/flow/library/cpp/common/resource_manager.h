@@ -2,7 +2,12 @@
 
 #include "public.h"
 
+#include <yt/yt/flow/library/cpp/file_storage/public.h>
+
 #include <yt/yt/core/logging/log.h>
+
+#include <yt/yt/client/cache/public.h>
+#include <yt/yt/client/ypath/rich.h>
 
 #include <yt/yt/library/profiling/sensor.h>
 
@@ -16,6 +21,9 @@ struct TResourceManagerContext
     : public TRefCounted
 {
     IPipelineAuthenticatorPtr PipelineAuthenticator;
+    NClient::NCache::IClientsCachePtr ClientsCache;
+    NYPath::TRichYPath PipelinePath;
+    NFileStorage::IFileStoragePtr FileStorage;
     NLogging::TLogger Logger;
     NProfiling::TProfiler Profiler;
     IStatusProfilerPtr StatusProfiler;
@@ -29,6 +37,15 @@ struct TResourceManagerContext
 };
 
 DEFINE_REFCOUNTED_TYPE(TResourceManagerContext);
+
+////////////////////////////////////////////////////////////////////////////////
+
+//! Identity state carried across resource manager recreation.
+struct TResourceInstanceState
+{
+    TResourceInstanceId InstanceId;
+    ui64 IncarnationGeneration{};
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -83,6 +100,10 @@ struct IResourceManager
     //! Returns the current preload state (Preloading / Preloaded) for each resource
     //! that is in the active preload set.
     virtual THashMap<TResourceId, EPreloadedResourceState> GetPreloadedStates() const = 0;
+
+    //! Returns resource identity state suitable for constructing a successor manager,
+    //! including retained identities absent from this manager's resource specification.
+    virtual THashMap<TResourceId, TResourceInstanceState> GetResourceInstanceStates() const = 0;
 };
 
 DEFINE_REFCOUNTED_TYPE(IResourceManager);
@@ -93,7 +114,8 @@ IResourceManagerPtr CreateResourceManager(
     TResourceManagerContextPtr managerContext,
     const THashMap<TResourceId, TResourceSpecPtr>& resources,
     const THashMap<TResourceId, TDynamicResourceSpecPtr>& dynamicResourceSpecs,
-    const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions = {});
+    const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions = {},
+    const THashMap<TResourceId, TResourceInstanceState>& predecessorInstanceStates = {});
 
 ////////////////////////////////////////////////////////////////////////////////
 

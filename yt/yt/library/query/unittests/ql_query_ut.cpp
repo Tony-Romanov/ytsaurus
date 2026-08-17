@@ -48,7 +48,7 @@ using namespace NYson;
 
 using NCodegen::EExecutionBackend;
 
-YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "TestLogger");
+YT_DEFINE_LEAKY_GLOBAL(const NLogging::TLogger, Logger, "TestLogger");
 
 TEnumIndexedArray<EExecutionBackend, TSharedRef> GetTestUdfImplementationFiles(TStringBuf name)
 {
@@ -11471,7 +11471,7 @@ TEST_F(TQueryEvaluateTest, YsonLengthComposite)
     };
 
     auto resultSplit = MakeSplit({
-        {"length", EValueType::Int64}
+        {"length", EValueType::Int64},
     });
 
     auto result = YsonToRows({
@@ -11503,7 +11503,7 @@ TEST_F(TQueryEvaluateTest, YsonLengthCompositeStruct)
     };
 
     auto resultSplit = MakeSplit({
-        {"length", EValueType::Int64}
+        {"length", EValueType::Int64},
     });
 
     auto result = YsonToRows({
@@ -11529,7 +11529,7 @@ TEST_F(TQueryEvaluateTest, YsonLengthCompositeNestedList)
     };
 
     auto resultSplit = MakeSplit({
-        {"length", EValueType::Int64}
+        {"length", EValueType::Int64},
     });
 
     auto result = YsonToRows({

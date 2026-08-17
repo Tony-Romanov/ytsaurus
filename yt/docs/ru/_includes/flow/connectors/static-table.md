@@ -20,6 +20,28 @@
 
 {% include [NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TSource](../../../flow/generated_docs/NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TSource.md) %}
 
+### Запись в статические таблицы в порядке прихода
+
+Класс синка: `NYT::NFlow::NStaticTableConnector::TArrivalOrderTableSink`.
+
+Синк создаёт непрерывную последовательность таблиц с фиксированным шагом `table_period`. Непустой текущий слот закрывается по границе времени либо при достижении `max_row_count`/`max_data_weight`; закрытие по лимиту также сдвигает следующий логический таймстемп на один период, поэтому последовательность может обогнать wall clock. Пока последовательность впереди wall clock, закрытие по времени не срабатывает: неполный батч будет записан, только когда wall clock догонит текущий логический таймстемп, а рестарт этого не сбрасывает — отставание хранится во внешнем стейте. Величина задержки пропорциональна всплеску: число слотов, закрытых по лимиту, умноженное на `table_period`. Пустой слот `T` создаётся строго по порядку, только если `T <= wall clock` и при этом известный ненулевой системный watermark входного stream строго больше `T + table_period`. Поэтому равенства watermark границе недостаточно, а пустые таблицы в будущем не создаются.
+
+Таблица и прогресс коммитятся одной master-транзакцией. Прогресс лежит в атрибуте `@progress` самой `output_directory` и содержит владельца `(pipeline, computation, sink id)`, общую последовательность таблиц и отдельный frontier `(system_timestamp, message_id)` для каждой партиции. Все партиции делят одну последовательность таблиц, а frontier используется для дедупликации при replay: при частично покрытом replay синк записывает только непокрытый хвост без перезапуска job. Callback доставки вызывается только после успешного внешнего коммита и следующего коммита Flow. Писатели прогресса разводятся shared-локом с ключом атрибута `progress`, поэтому создание выходных таблиц в той же директории не блокируется.
+
+Каждому синку нужна собственная `output_directory`: если в атрибуте записан другой владелец, синк падает с ошибкой и просит удалить атрибут вручную. Перед передачей директории другому пайплайну остановите пишущий пайплайн; новый владелец продолжит сетку после самой свежей таблицы в директории. Директорию с детьми без атрибута `table_timestamp` синк не принимает: он падает с ошибкой, пока их не уберут. В частности, main и DLQ одного reader должны писать в разные директории. Frontier партиции удаляется, как только её `system_timestamp` опускается ниже системного watermark входного stream — к этому моменту партиция гарантированно доставила всё, что произвела, поэтому её frontier больше не нужен.
+
+`output_directory` может находиться на кластере, отличном от кластера пайплайна. Обязательный параметр `table_ttl` задаёт время жизни выходных таблиц: через `table_ttl` после своего `table_timestamp` таблица удаляется (через Cypress `expiration_time`), поэтому директория держит не более `table_ttl / table_period` таблиц; спека с отношением больше 40000 отклоняется из-за лимита Cypress на число детей.
+
+Синк требует ровно одного входного stream и возрастающих `MessageId` внутри него, поэтому применим в `Transform`- и `SwiftOrderedSource`-computation. Партиция идентифицируется по `SourceKey`, если он есть, иначе по `PartitionId`. Схема выходных таблиц берётся из входного stream. Вес сообщения для лимита `max_data_weight` по умолчанию равен размеру сообщения; опциональная `data_weight_column` (тип `int64` или `uint64`, неотрицательные значения) задаёт пользовательский вес, а `null` в ней означает размер сообщения. Транзакция инициализации и коммита повторяется до успеха или отмены job. Чтобы пустые таблицы создавались даже без входных сообщений, пользовательская source computation должна заранее инициализировать каждый sink в `DoInit`.
+
+##### Статическая спека:
+
+{% include [NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink](../../../flow/generated_docs/NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink.md) %}
+
+##### Динамическая спека:
+
+{% include [NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink](../../../flow/generated_docs/NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink.md) %}
+
 ## Импорт статической таблицы в стейт {#import-into-state}
 
 Типичный сценарий: батч-процесс (YQL{% if audience == "internal" %}, Nirvana{% endif %}, &hellip;) периодически пересобирает справочник в виде статической YT-таблицы, а реалтайм-пайплайн должен джойнить свой поток против свежей версии этого справочника. Коннектор `static_table` поддерживает этот сценарий "из коробки", позволяя загрузить такую таблицу в [стейт](../../../flow/concepts/stateful.md) пайплайна с произвольной бизнес-логикой над каждой строкой перед записью.
@@ -112,6 +134,7 @@
 - Python: [`examples/python/static_table_join`]({{source-root}}/yt/yt/flow/examples/python/static_table_join)
 - Java: [`examples/java/static_table_join`]({{source-root}}/yt/yt/flow/examples/java/static_table_join)
 - Kotlin: [`examples/kotlin/static_table_join`]({{source-root}}/yt/yt/flow/examples/kotlin/static_table_join)
+- Go: [`examples/go/static_table_join`]({{source-root}}/yt/yt/flow/examples/go/static_table_join)
 
 ## Альтернативы {#alternatives}
 
@@ -137,6 +160,7 @@
 - Python: [`examples/python/external_state_join`]({{source-root}}/yt/yt/flow/examples/python/external_state_join)
 - Java: [`examples/java/external_state_join`]({{source-root}}/yt/yt/flow/examples/java/external_state_join)
 - Kotlin: [`examples/kotlin/external_state_join`]({{source-root}}/yt/yt/flow/examples/kotlin/external_state_join)
+- Go: [`examples/go/external_state_join`]({{source-root}}/yt/yt/flow/examples/go/external_state_join)
 
 В тестах примеров `yt_sync` сначала собирает `reference.v1` и линкует `current → reference.v1`, пайплайн обогащает событие значением `v1`, затем собирается `reference.v2`, симлинк атомарно перенаправляется на новую версию, и для **того же ключа** пайплайн начинает отдавать значение `v2`.
 

@@ -32,6 +32,12 @@ FAKE_MESSAGE_ID = "1"
 UNSET_TIMESTAMP = 0
 
 
+def _guid_parts_from_str(guid_str: str):
+    """Inverse of :func:`_guid_to_str`."""
+    first, second = guid_str.split("-")
+    return int(first, 16), int(second, 16)
+
+
 def _guid_to_str(guid_proto) -> str:
     """Convert a TGuid protobuf to string."""
     return f"{guid_proto.first:x}-{guid_proto.second:x}"
@@ -316,7 +322,7 @@ def external_states_to_proto(states_holder: StatesHolder, TState, TStateItem):
 
 def map_process_batch_request(request, job: Job, streams_context: FlowStreamsContext) -> RequestContext:
     """Map TReqProcessBatch to RequestContext."""
-    job_id = _guid_to_str(request.request_id)
+    job_id = _guid_to_str(request.job_id)
     request_id = _guid_to_str(request.request_id)
     key_schema = job.group_by_schema
     stream_specs = job.stream_specs

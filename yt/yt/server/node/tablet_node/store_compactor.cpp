@@ -87,6 +87,8 @@
 #include <library/cpp/iterator/enumerate.h>
 #include <library/cpp/iterator/zip.h>
 
+#include <library/cpp/yt/system/thread_name.h>
+
 namespace NYT::NTabletNode {
 
 using namespace NApi;
@@ -322,7 +324,7 @@ struct TCompactionTask
     const IInvokerPtr Invoker;
     const TCancelableContextPtr CancelableContext;
 
-    const std::string TabletLoggingTag;
+    const NLogging::TLoggingTagList TabletLoggingTags;
 
     // These fields are filled upon task invocation.
     TWeakPtr<TStoreCompactor> Owner;
@@ -529,6 +531,18 @@ private:
             .ValueOrThrow();
     }
 
+    IInvokerPtr ComputeCompressionInvoker() const
+    {
+        if (!Bootstrap_->GetTabletNodeDynamicConfig()->StoreCompactor->ReuseCompactionInvokerForWriterCompression) {
+            return nullptr;
+        }
+
+        auto threadName = std::string(GetCurrentThreadName().ToStringBuf());
+        YT_VERIFY(threadName.starts_with("StoreCompact:") || threadName.starts_with("Query:"));
+
+        return GetCurrentInvoker();
+    }
+
     TCompactionSessionFinalizeResult Finalize()
     {
         WaitFor(AllSucceeded(std::move(CloseFutures_)))
@@ -593,7 +607,8 @@ private:
                 std::move(underlyingWriter),
                 WriteBlocksOptions_,
                 /*dataSink*/ std::nullopt,
-                BlockCache_),
+                BlockCache_,
+                ComputeCompressionInvoker()),
             TabletSnapshot_->PhysicalSchema,
             HunkChunkPayloadWriter_,
             HunkChunkWriterStatistics_,
@@ -1017,9 +1032,9 @@ public:
                 return std::vector<std::unique_ptr<TCompactionTask>>();
             }
 
-            auto Logger = TabletNodeLogger().WithTag("CellId: %v, TaskKind: %v",
-                slot->GetCellId(),
-                taskKind);
+            auto Logger = TabletNodeLogger()
+                .WithTag("CellId", slot->GetCellId())
+                .WithTag("TaskKind", taskKind);
 
             std::vector<std::unique_ptr<TCompactionTask>> tasks;
             tasks.reserve(requests.size());
@@ -1276,7 +1291,7 @@ private:
         if (tablet->GetMountRevision() != request.Tablet->GetMountRevision()) {
             YT_LOG_DEBUG("Compaction task declined: mount revision mismatch (%v, "
                 "ActualMountRevision: %v, RequestMountRevision: %v)",
-                tablet->GetLoggingTag(),
+                tablet->GetLoggingTags(),
                 tablet->GetMountRevision(),
                 request.Tablet->GetMountRevision());
             return nullptr;
@@ -1284,14 +1299,14 @@ private:
 
         if (!tablet->SmoothMovementData().IsTabletStoresUpdateAllowed(/*isCommonFlush*/ false)) {
             YT_LOG_DEBUG("Compaction task declined: tablet participates in smooth movement (%v)",
-                tablet->GetLoggingTag());
+                tablet->GetLoggingTags());
             return nullptr;
         }
 
         if (request.DiscardStores && tablet->GetTableSchema()->HasTtlColumn()) {
             YT_LOG_DEBUG("Compaction task declined: tablet has TTL column and has been compacted "
                 "by discard stores (%v)",
-                tablet->GetLoggingTag());
+                tablet->GetLoggingTags());
             return nullptr;
         }
 
@@ -1483,7 +1498,7 @@ private:
             tabletSnapshot->TablePath,
             tabletSnapshot->TabletId));
 
-        logger->AddTag("TransactionId: %v", transaction->GetId());
+        logger->AddTag("TransactionId", transaction->GetId());
 
         YT_LOG_INFO("Partition compaction transaction created");
 
@@ -1502,7 +1517,7 @@ private:
             tabletSnapshot->TablePath,
             tabletSnapshot->TabletId));
 
-        logger->AddTag("TransactionId: %v", transaction->GetId());
+        logger->AddTag("TransactionId", transaction->GetId());
 
         YT_LOG_INFO("Eden partitioning transaction created");
 
@@ -1542,9 +1557,8 @@ private:
         };
 
         auto Logger = TabletNodeLogger()
-            .WithTag("%v, ReadSessionId: %v",
-                task->TabletLoggingTag,
-                chunkReadOptions.ReadSessionId);
+            .WithTags(task->TabletLoggingTags)
+            .WithTag("ReadSessionId", chunkReadOptions.ReadSessionId);
 
         auto doneGuard = Finally([&] {
             if (Bootstrap_->GetTabletNodeDynamicConfig()->StoreCompactor->ScheduleNewTasksAfterTaskCompletion) {
@@ -1832,8 +1846,8 @@ private:
                 .BackgroundErrors[ETabletBackgroundActivity::Partitioning].Store(TError());
         } catch (const std::exception& ex) {
             auto error = TError(ex)
-                << TErrorAttribute("tablet_id", tabletSnapshot->TabletId)
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::Partitioning);
+                .With("tablet_id", tabletSnapshot->TabletId)
+                .With("background_activity", ETabletBackgroundActivity::Partitioning);
 
             tabletSnapshot->TabletRuntimeData->Errors
                 .BackgroundErrors[ETabletBackgroundActivity::Partitioning].Store(error);
@@ -1873,7 +1887,8 @@ private:
                 reader->GetDataStatistics(),
                 writerDataStatistics,
                 chunkReadOptions.HunkChunkReaderStatistics,
-                partitioningResult.HunkWriter->GetDataStatistics());
+                partitioningResult.HunkWriter->GetDataStatistics(),
+                partitioningResult.HunkWriter->GetDataWeight());
         }
 
         eden->ExitCompactionState(EPartitionState::Partitioning);
@@ -1906,11 +1921,11 @@ private:
             for (const auto& store : stores) {
                 retainedTimestamp = std::max(retainedTimestamp, store->GetMaxTimestamp());
             }
-            ++retainedTimestamp;
+            retainedTimestamp = TTimestamp(retainedTimestamp.Underlying() + 1);
 
             NTabletServer::NProto::TReqUpdateTabletStores actionRequest;
             actionRequest.set_create_hunk_chunks_during_prepare(true);
-            actionRequest.set_retained_timestamp(retainedTimestamp);
+            actionRequest.set_retained_timestamp(ToProto(retainedTimestamp));
             actionRequest.set_update_reason(ToProto(ETabletStoresUpdateReason::Compaction));
             AddStoresToRemove(&actionRequest, stores);
 
@@ -1933,8 +1948,8 @@ private:
                 .BackgroundErrors[ETabletBackgroundActivity::Compaction].Store(TError());
         } catch (const std::exception& ex) {
             auto error = TError(ex)
-                << TErrorAttribute("tablet_id", tabletSnapshot->TabletId)
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::Compaction);
+                .With("tablet_id", tabletSnapshot->TabletId)
+                .With("background_activity", ETabletBackgroundActivity::Compaction);
 
             tabletSnapshot->TabletRuntimeData->Errors
                 .BackgroundErrors[ETabletBackgroundActivity::Compaction].Store(error);
@@ -1961,9 +1976,8 @@ private:
         };
 
         auto Logger = TabletNodeLogger()
-            .WithTag("%v, ReadSessionId: %v",
-                task->TabletLoggingTag,
-                chunkReadOptions.ReadSessionId);
+            .WithTags(task->TabletLoggingTags)
+            .WithTag("ReadSessionId", chunkReadOptions.ReadSessionId);
 
         auto doneGuard = Finally([&] {
             if (Bootstrap_->GetTabletNodeDynamicConfig()->StoreCompactor->ScheduleNewTasksAfterTaskCompletion) {
@@ -2059,11 +2073,13 @@ private:
             return;
         }
 
-        Logger.AddTag("Eden: %v, PartitionRange: %v .. %v, PartitionId: %v",
-            partition->IsEden(),
+        Logger.AddTag("Eden", partition->IsEden());
+        Logger.AddTagFormat(
+            "PartitionRange",
+            "%v .. %v",
             partition->GetPivotKey(),
-            partition->GetNextPivotKey(),
-            partition->GetId());
+            partition->GetNextPivotKey());
+        Logger.AddTag("PartitionId", partition->GetId());
 
         partition->EnterCompactionState(EPartitionState::Compacting);
 
@@ -2198,7 +2214,7 @@ private:
 
             NTabletServer::NProto::TReqUpdateTabletStores actionRequest;
             actionRequest.set_create_hunk_chunks_during_prepare(true);
-            actionRequest.set_retained_timestamp(retainedTimestamp);
+            actionRequest.set_retained_timestamp(ToProto(retainedTimestamp));
             actionRequest.set_update_reason(ToProto(ETabletStoresUpdateReason::Compaction));
             AddStoresToAdd(&actionRequest, compactionResult.StoreWriter);
             AddStoresToAdd(&actionRequest, compactionResult.HunkWriter);
@@ -2252,8 +2268,8 @@ private:
                 .BackgroundErrors[ETabletBackgroundActivity::Compaction].Store(TError());
         } catch (const std::exception& ex) {
             auto error = TError(ex)
-                << TErrorAttribute("tablet_id", tabletSnapshot->TabletId)
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::Compaction);
+                .With("tablet_id", tabletSnapshot->TabletId)
+                .With("background_activity", ETabletBackgroundActivity::Compaction);
 
             tabletSnapshot->TabletRuntimeData->Errors
                 .BackgroundErrors[ETabletBackgroundActivity::Compaction].Store(error);
@@ -2295,7 +2311,8 @@ private:
                 reader->GetDataStatistics(),
                 compactionResult.StoreWriter->GetDataStatistics(),
                 chunkReadOptions.HunkChunkReaderStatistics,
-                compactionResult.HunkWriter->GetDataStatistics());
+                compactionResult.HunkWriter->GetDataStatistics(),
+                compactionResult.HunkWriter->GetDataWeight());
         }
 
         partition->ExitCompactionState(EPartitionState::Compacting);
@@ -2509,7 +2526,7 @@ TCompactionTask::TCompactionTask(
     , Slot(slot)
     , Invoker(tablet->GetEpochAutomatonInvoker())
     , CancelableContext(tablet->GetCancelableContext())
-    , TabletLoggingTag(tablet->GetLoggingTag())
+    , TabletLoggingTags(tablet->GetLoggingTags())
 { }
 
 void TCompactionTask::Prepare(

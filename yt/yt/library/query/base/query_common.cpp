@@ -9,8 +9,8 @@ namespace NYT::NQueryClient {
 
 using namespace NTableClient;
 
-using NYT::ToProto;
 using NYT::FromProto;
+using NYT::ToProto;
 
 using namespace NHydra;
 
@@ -342,8 +342,8 @@ void FromProto(TFeatureFlags* original, const NProto::TFeatureFlags& serialized)
 
 void ToProto(NProto::TQueryOptions* serialized, const TQueryOptions& original)
 {
-    serialized->set_timestamp(original.TimestampRange.Timestamp);
-    serialized->set_retention_timestamp(original.TimestampRange.RetentionTimestamp);
+    serialized->set_timestamp(ToProto(original.TimestampRange.Timestamp));
+    serialized->set_retention_timestamp(ToProto(original.TimestampRange.RetentionTimestamp));
     serialized->set_verbose_logging(original.VerboseLogging);
     serialized->set_new_range_inference(original.NewRangeInference);
     serialized->set_adaptive_ordered_schemaful_reader(original.AdaptiveOrderedSchemafulReader);
@@ -383,8 +383,8 @@ void ToProto(NProto::TQueryOptions* serialized, const TQueryOptions& original)
 
 void FromProto(TQueryOptions* original, const NProto::TQueryOptions& serialized)
 {
-    original->TimestampRange.Timestamp = serialized.timestamp();
-    original->TimestampRange.RetentionTimestamp = serialized.retention_timestamp();
+    original->TimestampRange.Timestamp = FromProto<TTimestamp>(serialized.timestamp());
+    original->TimestampRange.RetentionTimestamp = FromProto<TTimestamp>(serialized.retention_timestamp());
     original->VerboseLogging = serialized.verbose_logging();
     original->MaxSubqueries = serialized.max_subqueries();
     original->EnableCodeCache = serialized.enable_code_cache();
@@ -474,8 +474,22 @@ void FromProto(TQueryOptions* original, const NProto::TQueryOptions& serialized)
 TQueryOptions GetJoinSubqueryOptions(const TQueryOptions& queryOptions)
 {
     auto result = queryOptions;
-    result.MaxSubqueries = 1;
     result.MergeVersionedRows = true;
+
+    return result;
+}
+
+TQueryOptions ApplyPatch(const TQueryOptions& base, const TJoinSubqueryOptionsPatch& patch)
+{
+    auto result = base;
+
+    if (patch.Timestamp) {
+        result.TimestampRange.Timestamp = *patch.Timestamp;
+    }
+
+    if (patch.MaxSubqueries) {
+        result.MaxSubqueries = *patch.MaxSubqueries;
+    }
 
     return result;
 }

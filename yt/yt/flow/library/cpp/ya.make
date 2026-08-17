@@ -1,5 +1,6 @@
 RECURSE(
     pipeline_helpers
+    buffers
     client
     delta_codecs
     native_client
@@ -11,8 +12,9 @@ RECURSE(
     connectors
     controller
     controller/describe
-    multiplexer
+    file_storage
     misc
+    multiplexer
     parsers
     process_function
     tables

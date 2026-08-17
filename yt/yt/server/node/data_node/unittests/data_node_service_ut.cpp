@@ -6,6 +6,9 @@
 #include <yt/yt/server/node/data_node/data_node_service.h>
 #include <yt/yt/server/node/data_node/chunk_store.h>
 #include <yt/yt/server/node/data_node/master_connector.h>
+#include <yt/yt/server/node/data_node/medium_aware_block_cache_manager.h>
+#include <yt/yt/server/node/data_node/medium_directory_manager.h>
+#include <yt/yt/server/node/data_node/medium_updater.h>
 #include <yt/yt/server/node/data_node/network_statistics.h>
 #include <yt/yt/server/node/data_node/session.h>
 #include <yt/yt/server/node/data_node/session_manager.h>
@@ -61,6 +64,11 @@ using namespace NConcurrency;
 
 using NYT::NBus::EMultiplexingBand;
 using NNative::TConnectionDynamicConfig;
+
+////////////////////////////////////////////////////////////////////////////////
+
+constexpr int TestSsdMediumIndex = 42;
+constexpr auto TestSsdMediumName = "ssd_blobs";
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -209,6 +217,16 @@ public:
     const TMediumUpdaterPtr& GetMediumUpdater() const override
     {
         return Bootstrap_->GetMediumUpdater();
+    }
+
+    const IMediumAwareBlockCacheManagerPtr& GetMediumAwareBlockCacheManager() const override
+    {
+        return Bootstrap_->GetMediumAwareBlockCacheManager();
+    }
+
+    NChunkClient::IBlockCachePtr GetBlockCacheForMedium(int mediumIndex) const override
+    {
+        return Bootstrap_->GetBlockCacheForMedium(mediumIndex);
     }
 
     const NConcurrency::IThroughputThrottlerPtr& GetThrottler(EDataNodeThrottlerKind kind) const override
@@ -482,6 +500,7 @@ public:
         bool EnableSequentialIORequests = true;
         i64 CoalescedReadMaxGapSize = 10_MB;
         i64 BlockCacheCapacity = 0;
+        i64 PerLocationBlockCacheCapacity = 0;
         bool RejectOversizedBlockCacheItems = false;
         int ClusterConnectionThreadPoolSize = 4;
         int ReadThreadCount = 1;
@@ -492,6 +511,7 @@ public:
         std::vector<double> IOWeights = {1.};
         std::vector<int> SessionCountLimits = {1024};
         bool UseProbePutBlocks = false;
+        bool EnableProbePutBlocksFairShare = false;
         bool SkipWriteThrottlingLocations = false;
         bool AlwaysThrottleLocation = false;
         bool EnableWriteThrottlingWritableCheck = false;
@@ -500,6 +520,7 @@ public:
         bool WaitPrecedingBlocksReceived = true;
         TEnumIndexedArray<EWorkloadCategory, std::optional<double>> FairShareWorkloadCategoryWeights;
         TDuration DelayBeforePerformPutBlocks = TDuration::Seconds(2);
+        bool EnableMediumAwareBlockCache = false;
     };
 
     TDataNodeTest() = default;
@@ -566,6 +587,22 @@ public:
         cacheConfig->RejectOversizedItems = TestParams_.RejectOversizedBlockCacheItems;
         bootstrapConfig->DataNode->BlockCache->CompressedData = cacheConfig;
         bootstrapConfig->DataNode->BlockCache->UncompressedData = cacheConfig;
+
+        if (TestParams_.EnableMediumAwareBlockCache) {
+            auto createMediumBlockCacheConfig = [&] {
+                auto config = New<TBlockCacheConfig>();
+                config->CompressedData->Capacity = TestParams_.PerLocationBlockCacheCapacity;
+                return config;
+            };
+
+            auto managerConfig = bootstrapConfig->DataNode->MediumAwareBlockCacheManager;
+            managerConfig->Enable = true;
+            managerConfig->BlockCacheConfigPerMediumPerLocation[DefaultStoreMediumName] =
+                createMediumBlockCacheConfig();
+            managerConfig->BlockCacheConfigPerMediumPerLocation[TestSsdMediumName] =
+                createMediumBlockCacheConfig();
+        }
+
         bootstrapConfig->DataNode->ChooseLocationBasedOnIOWeight = TestParams_.ChooseLocationBasedOnIOWeight;
         bootstrapConfig->DataNode->SkipWriteThrottlingLocations = TestParams_.SkipWriteThrottlingLocations;
 
@@ -649,7 +686,10 @@ public:
 
         MasterConnectorMock_ = New<TMasterConnectorMock>();
         EXPECT_CALL(*MasterConnectorMock_, IsOnline).WillRepeatedly(testing::Return(true));
-        DataNodeBootstrap_ = New<TDataNodeBootstrapMock>(ClusterNodeBootstrap_->GetDataNodeBootstrap(), MasterConnectorMock_);
+        DataNodeBootstrapMock_ = New<TDataNodeBootstrapMock>(
+            ClusterNodeBootstrap_->GetDataNodeBootstrap(),
+            MasterConnectorMock_);
+        DataNodeBootstrap_ = DataNodeBootstrapMock_;
 
         // if (CellDirectoryMock_) {
         //     testing::Mock::AllowLeak(CellDirectoryMock_.Get());
@@ -665,6 +705,7 @@ public:
 
         DataNodeService_ = CreateDataNodeService(DataNodeBootstrap_->GetConfig()->DataNode, DataNodeBootstrap_.Get());
         DataNodeBootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->UseProbePutBlocks = TestParams_.UseProbePutBlocks;
+        DataNodeBootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->EnableProbePutBlocksFairShare = TestParams_.EnableProbePutBlocksFairShare;
         DataNodeBootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->TestingOptions->AlwaysThrottleLocation = TestParams_.AlwaysThrottleLocation;
         DataNodeBootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->EnableWriteThrottlingWritableCheck = TestParams_.EnableWriteThrottlingWritableCheck;
         DataNodeBootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->EnableInThrottlerQueueWritableCheck = TestParams_.EnableInThrottlerQueueWritableCheck;
@@ -686,6 +727,7 @@ public:
         DataNodeService_->Stop().BlockingWait();
         DataNodeService_.Reset();
         DataNodeBootstrap_.Reset();
+        DataNodeBootstrapMock_.Reset();
         ClusterNodeBootstrap_.Reset();
         ActionQueue_->Shutdown(true);
         ActionQueue_.Reset();
@@ -698,6 +740,34 @@ public:
 
     const NDataNode::IBootstrapPtr& GetDataNodeBootstrap() const {
         return DataNodeBootstrap_;
+    }
+
+    void UpdateLocationMedium(const TChunkLocationPtr& location, int mediumIndex)
+    {
+        auto bootstrap = DataNodeBootstrap_;
+        auto locationUuid = location->GetUuid();
+
+        WaitFor(BIND([bootstrap, locationUuid, mediumIndex] {
+            NChunkClient::NProto::TMediumDirectory mediumDirectory;
+            auto addMedium = [&] (const std::string& name, int index) {
+                auto* descriptor = mediumDirectory.add_medium_descriptors();
+                descriptor->set_name(name);
+                descriptor->set_index(index);
+                descriptor->set_priority(0);
+                descriptor->mutable_domestic_medium_descriptor();
+            };
+            addMedium(DefaultStoreMediumName, DefaultStoreMediumIndex);
+            addMedium(TestSsdMediumName, TestSsdMediumIndex);
+
+            bootstrap->GetMediumDirectoryManager()->UpdateMediumDirectory(mediumDirectory);
+
+            NDataNodeTrackerClient::NProto::TMediumOverrides mediumOverrides;
+            auto* mediumOverride = mediumOverrides.add_overrides();
+            ToProto(mediumOverride->mutable_location_uuid(), locationUuid);
+            mediumOverride->set_medium_index(mediumIndex);
+            bootstrap->GetMediumUpdater()->UpdateLocationMedia(mediumOverrides);
+        }).AsyncVia(bootstrap->GetControlInvoker()).Run())
+            .ThrowOnError();
     }
 
     const NConcurrency::TActionQueuePtr& GetActionQueue() const
@@ -742,7 +812,12 @@ public:
         return req->Invoke();
     }
 
-    auto PutBlocks(const TSessionId& sessionId, const std::vector<TBlock>& blocks, int firstBlockIndex, i64 cumulativeBlockSize)
+    auto PutBlocks(
+        const TSessionId& sessionId,
+        const std::vector<TBlock>& blocks,
+        int firstBlockIndex,
+        i64 cumulativeBlockSize,
+        bool populateCache = false)
     {
         auto channel = ChannelFactory_->CreateChannel(DataNodeServiceAddress);
         TDataNodeServiceProxy proxy(channel);
@@ -753,6 +828,7 @@ public:
         ToProto(req->mutable_session_id(), sessionId);
         req->set_first_block_index(firstBlockIndex);
         req->set_cumulative_block_size(cumulativeBlockSize);
+        req->set_populate_cache(populateCache);
         req->SetTimeout(RequestTimeout_);
         SetRpcAttachedBlocks(req, blocks);
 
@@ -845,7 +921,8 @@ public:
         int blockSize,
         bool useProbePutBlocks = false,
         bool preallocateDiskSpace = false,
-        bool useDirectIo = false)
+        bool useDirectIo = false,
+        bool populateCache = false)
     {
         auto blocks = CreateBlocks(blockCount, blockSize, Generator_);
         auto cummulativeBlockSize = CalculateCummulativeBlockSize(blocks);
@@ -863,7 +940,13 @@ public:
         std::iota(std::begin(indices), std::end(indices), 0);
         std::random_shuffle(std::begin(indices), std::end(indices));
         for (auto i : indices) {
-            putBlocks[i] = PutBlocks(sessionId, {blocks[i]}, i, cummulativeBlockSize).AsVoid();
+            putBlocks[i] = PutBlocks(
+                sessionId,
+                {blocks[i]},
+                i,
+                cummulativeBlockSize,
+                populateCache)
+                .AsVoid();
         }
         WaitFor(AllSucceeded(putBlocks))
             .ThrowOnError();
@@ -891,6 +974,7 @@ private:
     INodeMemoryTrackerPtr MemoryTracker_;
     NConcurrency::TActionQueuePtr ActionQueue_;
     NClusterNode::IBootstrapPtr ClusterNodeBootstrap_;
+    TIntrusivePtr<TDataNodeBootstrapMock> DataNodeBootstrapMock_;
     NDataNode::IBootstrapPtr DataNodeBootstrap_;
     IServicePtr DataNodeService_;
     IChannelFactoryPtr ChannelFactory_;
@@ -1065,6 +1149,7 @@ struct TWriteTestCase
     int BlockCount = 40;
     int BlockSize = 1_KB;
     bool UseProbePutBlocks = false;
+    bool EnableProbePutBlocksFairShare = false;
     bool PreallocateDiskSpace = false;
     bool UseDirectIo = false;
 };
@@ -1085,6 +1170,11 @@ std::vector<TWriteTestCase> GenerateWriteTestParams()
         result.push_back(writeTestCase);
     }
 
+    result.push_back(TWriteTestCase{
+        .UseProbePutBlocks = true,
+        .EnableProbePutBlocksFairShare = true,
+    });
+
     return result;
 }
 
@@ -1099,11 +1189,11 @@ public:
         : TDataNodeTest(
             TDataNodeTest::TDataNodeTestParams {
                 .EnableHugePageManager = GetParam().UseDirectIo,
-                // TODO(depression): Enable after Direct IO issues get fixed
-                .UseDirectIOForWrites = NIO::EDirectIOPolicy::Never,
+                .UseDirectIOForWrites = NIO::EDirectIOPolicy::OnDemand,
                 .ReadThreadCount = 4,
                 .WriteThreadCount = 4,
                 .UseProbePutBlocks = GetParam().UseProbePutBlocks,
+                .EnableProbePutBlocksFairShare = GetParam().EnableProbePutBlocksFairShare,
                 .PreallocateDiskSpace = GetParam().PreallocateDiskSpace,
             })
     { }
@@ -1213,8 +1303,8 @@ public:
         auto rootSlotWindowSize = rootBucket->SlotWindowSize.load();
         if (rootRequestWindowSize <= 0 || rootSlotWindowSize <= 0) {
             return TError("Root windows are not filled yet")
-                << TErrorAttribute("request_window_size", rootRequestWindowSize)
-                << TErrorAttribute("slot_window_size", rootSlotWindowSize);
+                .With("request_window_size", rootRequestWindowSize)
+                .With("slot_window_size", rootSlotWindowSize);
         }
 
         constexpr double WeightTolerance = 0.05;
@@ -1429,6 +1519,227 @@ INSTANTIATE_TEST_SUITE_P(
     )
 );
 
+////////////////////////////////////////////////////////////////////////////////
+
+class TProbePutBlocksFairShareTest
+    : public TDataNodeTest
+{
+public:
+    struct TWindowCounters
+    {
+        i64 SlotWindowSize = 0;
+        i64 RequestWindowSize = 0;
+        i64 SlotWindowLogCount = 0;
+        i64 RequestWindowLogCount = 0;
+    };
+
+    explicit TProbePutBlocksFairShareTest(i64 writeMemoryLimit = 128_MB)
+        : TDataNodeTest(TDataNodeTestParams{
+            .IOEngineType = NIO::EIOEngineType::FairShareHierarchical,
+            .ReadThreadCount = 4,
+            .WriteThreadCount = 4,
+            .WriteMemoryLimit = writeMemoryLimit,
+            .UseProbePutBlocks = true,
+            .EnableProbePutBlocksFairShare = true,
+            .FairShareWorkloadCategoryWeights = {
+                {EWorkloadCategory::UserBatch, 1},
+                {EWorkloadCategory::UserInteractive, 2},
+                {EWorkloadCategory::UserRealtime, 4}
+            },
+            .DelayBeforePerformPutBlocks = TDuration::Zero(),
+        })
+    { }
+
+    void SetUp() override
+    {
+        TDataNodeTest::SetUp();
+
+        auto schedulerConfig = GetDataNodeBootstrap()
+            ->GetDynamicConfigManager()
+            ->GetConfig()
+            ->FairShareHierarchicalScheduler;
+        schedulerConfig->WindowSize = TDuration::Minutes(1);
+        GetFairShareHierarchicalScheduler()->Reconfigure(schedulerConfig);
+    }
+
+    TWindowCounters GetWindowCounters(EWorkloadCategory category) const
+    {
+        auto bucket = GetFairShareHierarchicalScheduler()->GetBucket({ToString(category)});
+        if (!bucket) {
+            return {};
+        }
+
+        return {
+            .SlotWindowSize = bucket->SlotWindowSize.load(),
+            .RequestWindowSize = bucket->RequestWindowSize.load(),
+            .SlotWindowLogCount = bucket->SlotWindowLogCount.load(),
+            .RequestWindowLogCount = bucket->RequestWindowLogCount.load(),
+        };
+    }
+
+    void ProbeAndExpectApproval(const TSessionId& sessionId, i64 cumulativeBlockSize)
+    {
+        auto response = WaitFor(ProbePutBlocks(sessionId, cumulativeBlockSize))
+            .ValueOrThrow();
+        const auto approvedCumulativeBlockSize = response->probe_put_blocks_state().approved_cumulative_block_size();
+        EXPECT_EQ(cumulativeBlockSize, approvedCumulativeBlockSize);
+    }
+
+    TSessionId StartProbingSession(EWorkloadCategory category)
+    {
+        TSessionId sessionId(MakeRandomId(EObjectType::Chunk, TCellTag(0xf003)), GenericMediumIndex);
+        WaitFor(StartChunk(
+            sessionId,
+            /*useProbePutBlocks*/ true,
+            /*preallocateDiskSpace*/ false,
+            /*useDirectIo*/ false,
+            TWorkloadDescriptor(category)))
+            .ThrowOnError();
+        return sessionId;
+    }
+
+    const TFairShareHierarchicalSchedulerPtr<std::string>& GetFairShareHierarchicalScheduler() const
+    {
+        return GetDataNodeBootstrap()->GetFairShareHierarchicalScheduler();
+    }
+
+    TSessionId SubmitProbeRequests(
+        i64 blockSize,
+        int requestCount,
+        EWorkloadCategory category)
+    {
+        auto sessionId = StartProbingSession(category);
+
+        for (int i = 0; i < requestCount; i++) {
+            const i64 cumulativeSize = (i + 1) * blockSize;
+            WaitFor(ProbePutBlocks(sessionId, cumulativeSize))
+                .ThrowOnError();
+        }
+        return sessionId;
+    }
+};
+
+class TProbePutBlocksPriorityTest : public TProbePutBlocksFairShareTest
+{
+public:
+    TProbePutBlocksPriorityTest() : TProbePutBlocksFairShareTest(1_MB) {}
+};
+
+TEST_F(TProbePutBlocksPriorityTest,
+    WorkloadFairShareTest)
+{
+    const auto& locations = GetDataNodeBootstrap()->GetChunkStore()->Locations();
+    ASSERT_EQ(locations.size(), 1u);
+    const TStoreLocationPtr& location = locations.front();
+
+    const i64 writeMemoryLimit = location->GetWriteMemoryLimit();
+    ASSERT_GT(writeMemoryLimit, 0);
+
+    const auto blockerSession =
+        StartProbingSession(EWorkloadCategory::SystemMerge);
+
+    ProbeAndExpectApproval(blockerSession, writeMemoryLimit);
+
+    constexpr int ProbeRequestCount = 512;
+    ASSERT_GE(writeMemoryLimit, ProbeRequestCount);
+
+    const auto batchSession = SubmitProbeRequests(writeMemoryLimit / ProbeRequestCount, ProbeRequestCount, EWorkloadCategory::UserBatch);
+    const auto realtimeSession = SubmitProbeRequests(writeMemoryLimit / ProbeRequestCount, ProbeRequestCount, EWorkloadCategory::UserRealtime);
+
+    // Both suppliers now have a backlog up to writeMemoryLimit.
+    WaitFor(CancelChunk(blockerSession, /*waitForCancelation=*/ true))
+        .ThrowOnError();
+
+    const double batchWeight = static_cast<double>(
+        location->GetFairShareWorkloadCategoryWeight(
+            EWorkloadCategory::UserBatch));
+
+    const double realtimeWeight = static_cast<double>(
+        location->GetFairShareWorkloadCategoryWeight(
+            EWorkloadCategory::UserRealtime));
+
+    ASSERT_GT(batchWeight, 0.0);
+    ASSERT_GT(realtimeWeight, 0.0);
+
+
+    i64 batchWindowSize = GetWindowCounters(EWorkloadCategory::UserBatch).SlotWindowSize;
+    i64 realtimeWindowSize = GetWindowCounters(EWorkloadCategory::UserRealtime).SlotWindowSize;
+
+    EXPECT_GT(batchWindowSize, 0);
+    EXPECT_GT(realtimeWindowSize, 0);
+    const double expectedRatio = batchWeight / realtimeWeight;
+    const double actualRatio = static_cast<double>(batchWindowSize) / static_cast<double>(realtimeWindowSize);
+
+    EXPECT_NEAR(actualRatio, expectedRatio, 0.01)
+        << "Fair-share ratio was not observed"
+        << "; batchWindowSize=" << batchWindowSize
+        << "; realtimeWindowSize=" << realtimeWindowSize
+        << "; actualRatio=" << actualRatio
+        << "; expectedRatio=" << expectedRatio;
+
+    WaitFor(CancelChunk(batchSession)).ThrowOnError();
+    WaitFor(CancelChunk(realtimeSession)).ThrowOnError();
+}
+
+TEST_F(TProbePutBlocksFairShareTest, ProbeDoesNotChangeIOEngineRequestAccounting)
+{
+    constexpr auto RegularCategory = EWorkloadCategory::SystemReplication;
+    constexpr auto ProbeCategory = EWorkloadCategory::UserBatch;
+    constexpr int BlockCount = 4;
+    constexpr int BlockSize = 1_MB;
+
+    TRandomGenerator generator(42);
+    auto blocks = CreateBlocks(BlockCount, BlockSize, generator);
+    auto cumulativeBlockSize = CalculateCummulativeBlockSize(blocks);
+    TSessionId regularSessionId(MakeRandomId(EObjectType::Chunk, TCellTag(0xf003)), GenericMediumIndex);
+    WaitFor(StartChunk(regularSessionId, /*useProbePutBlocks*/ false, /*preallocateDiskSpace*/ false, /*useDirectIo*/ false, TWorkloadDescriptor(RegularCategory))).ThrowOnError();
+    WaitFor(PutBlocks(regularSessionId, blocks, 0, cumulativeBlockSize))
+        .ThrowOnError();
+    WaitFor(FlushBlocks(regularSessionId, BlockCount - 1))
+        .ThrowOnError();
+    auto regularCounters = GetWindowCounters(RegularCategory);
+    TSessionId probeSessionId(MakeRandomId(EObjectType::Chunk, TCellTag(0xf003)), GenericMediumIndex);
+    WaitFor(StartChunk(probeSessionId, /*useProbePutBlocks*/ true, /*preallocateDiskSpace*/ false, /*useDirectIo*/ false, TWorkloadDescriptor(ProbeCategory)))
+        .ThrowOnError();
+    ProbeAndExpectApproval(probeSessionId, cumulativeBlockSize);
+    WaitFor(PutBlocks(probeSessionId, blocks, 0, cumulativeBlockSize))
+        .ThrowOnError();
+    WaitFor(FlushBlocks(probeSessionId, BlockCount - 1))
+        .ThrowOnError();
+    auto probeCounters = GetWindowCounters(ProbeCategory);
+
+    EXPECT_EQ(cumulativeBlockSize, regularCounters.SlotWindowSize);
+    EXPECT_EQ(cumulativeBlockSize, probeCounters.SlotWindowSize);
+    EXPECT_EQ(regularCounters.SlotWindowLogCount, probeCounters.SlotWindowLogCount);
+    EXPECT_EQ(regularCounters.RequestWindowSize, probeCounters.RequestWindowSize);
+    EXPECT_EQ(regularCounters.RequestWindowLogCount, probeCounters.RequestWindowLogCount);
+    EXPECT_GT(probeCounters.RequestWindowSize, 0);
+
+    WaitFor(FinishChunk(regularSessionId, BlockCount))
+        .ThrowOnError();
+    WaitFor(FinishChunk(probeSessionId, BlockCount))
+        .ThrowOnError();
+}
+
+TEST_F(TProbePutBlocksFairShareTest, FinishChunkReleasesProbeResources)
+{
+    const auto& locations = GetDataNodeBootstrap()->GetChunkStore()->Locations();
+    ASSERT_EQ(locations.size(), 1u);
+    const auto& location = locations.front();
+
+    ASSERT_EQ(0, location->GetUsedMemory(EIODirection::Write));
+
+    const auto sessionId = StartProbingSession(EWorkloadCategory::UserBatch);
+    ProbeAndExpectApproval(sessionId, location->GetWriteMemoryLimit());
+
+    ASSERT_EQ(location->GetWriteMemoryLimit(), location->GetUsedMemory(EIODirection::Write));
+
+    WaitFor(FinishChunk(sessionId, /*blockCount*/ 0))
+        .ThrowOnError();
+
+    EXPECT_EQ(0, location->GetUsedMemory(EIODirection::Write));
+}
+
 TEST_P(TSkipWriteThrottlingLocationsTest, SkipThrottlingLocationsOnStartChunk)
 {
     const auto& ioWeights = GetParam().IOWeights;
@@ -1558,6 +1869,78 @@ INSTANTIATE_TEST_SUITE_P(
         }
     )
 );
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TMediumAwareBlockCacheTest
+    : public TDataNodeTest
+{
+public:
+    TMediumAwareBlockCacheTest()
+        : TDataNodeTest(TDataNodeTestParams{
+            .BlockCacheCapacity = NodeWideBlockCacheCapacity,
+            .PerLocationBlockCacheCapacity = PerLocationBlockCacheCapacity,
+            .EnableMediumAwareBlockCache = true,
+        })
+    { }
+
+private:
+    static constexpr i64 PerLocationBlockCacheCapacity = 1_MB;
+    static constexpr i64 NodeWideBlockCacheCapacity = 2 * PerLocationBlockCacheCapacity;
+};
+
+TEST_F(TMediumAwareBlockCacheTest, ReadUsesNewMediumCacheAfterLocationMediumChanges)
+{
+    const auto& chunkStore = GetDataNodeBootstrap()->GetChunkStore();
+    const auto& location = chunkStore->Locations().front();
+    UpdateLocationMedium(location, DefaultStoreMediumIndex);
+
+    TSessionId sessionId(MakeRandomId(EObjectType::Chunk, TCellTag(0xf003)), DefaultStoreMediumIndex);
+    auto blocks = FillWithRandomBlocks(
+        sessionId,
+        /*blockCount*/ 1,
+        /*blockSize*/ 4_KB,
+        /*useProbePutBlocks*/ false,
+        /*preallocateDiskSpace*/ false,
+        /*useDirectIo*/ false,
+        /*populateCache*/ true);
+    TBlockId blockId(sessionId.ChunkId, /*blockIndex*/ 0);
+
+    const auto& manager = GetDataNodeBootstrap()->GetMediumAwareBlockCacheManager();
+    auto defaultMediumCache = manager->GetBlockCacheForMedium(DefaultStoreMediumIndex);
+    auto ssdMediumCache = manager->GetBlockCacheForMedium(TestSsdMediumIndex);
+    ASSERT_NE(defaultMediumCache.Get(), ssdMediumCache.Get());
+    EXPECT_TRUE(defaultMediumCache->FindBlock(blockId, EBlockType::CompressedData));
+    EXPECT_FALSE(GetDataNodeBootstrap()->GetBlockCache()->FindBlock(
+        blockId,
+        EBlockType::CompressedData));
+
+    manager->RemoveChunkBlocks(sessionId.ChunkId);
+
+    auto firstResponseOrError = WaitFor(GetBlockSet(
+        sessionId.ChunkId,
+        /*blockIndices*/ {0},
+        /*populateCache*/ true,
+        /*fetchFromCache*/ true,
+        /*fetchFromDisk*/ true));
+    ASSERT_TRUE(firstResponseOrError.IsOK()) << ToString(firstResponseOrError);
+    EXPECT_EQ(BlocksToChecksums(GetRpcAttachedBlocks(firstResponseOrError.Value())), BlocksToChecksums(blocks));
+    EXPECT_TRUE(defaultMediumCache->FindBlock(blockId, EBlockType::CompressedData));
+    EXPECT_FALSE(ssdMediumCache->FindBlock(blockId, EBlockType::CompressedData));
+
+    UpdateLocationMedium(location, TestSsdMediumIndex);
+    ASSERT_EQ(location->GetMediumIndex(), TestSsdMediumIndex);
+
+    auto secondResponseOrError = WaitFor(GetBlockSet(
+        sessionId.ChunkId,
+        /*blockIndices*/ {0},
+        /*populateCache*/ true,
+        /*fetchFromCache*/ true,
+        /*fetchFromDisk*/ true));
+    ASSERT_TRUE(secondResponseOrError.IsOK()) << ToString(secondResponseOrError);
+    EXPECT_EQ(BlocksToChecksums(GetRpcAttachedBlocks(secondResponseOrError.Value())), BlocksToChecksums(blocks));
+    EXPECT_TRUE(ssdMediumCache->FindBlock(blockId, EBlockType::CompressedData));
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -1716,7 +2099,7 @@ TEST_P(TIOWeightTest, IoBasedOnIoWeight)
 
     for (auto& future : futures) {
         TSessionId sessionId(MakeRandomId(EObjectType::Chunk, TCellTag(0xf003)), GenericMediumIndex);
-        future = BIND(&TDataNodeTest::FillWithRandomBlocks, this, sessionId, 1, 1_KB, false, false, false)
+        future = BIND(&TDataNodeTest::FillWithRandomBlocks, this, sessionId, 1, 1_KB, false, false, false, false)
             .AsyncVia(GetActionQueue()->GetInvoker())
             .Run()
             .AsVoid();
@@ -1937,6 +2320,48 @@ TEST_F(TOversizedBlockCacheTest, DoesNotChargeBlockCacheMemory)
     cacheCookie->SetBlock(blocks[0]);
 
     EXPECT_EQ(GetDataNodeBootstrap()->GetNodeMemoryUsageTracker()->GetUsed(EMemoryCategory::BlockCache), 0);
+}
+
+class TConsumerCookieFailSessionTest
+    : public TDataNodeTest
+{
+public:
+    TConsumerCookieFailSessionTest()
+        : TDataNodeTest(
+            TDataNodeTest::TDataNodeTestParams {
+                .BlockCacheCapacity = 16_KB,
+            })
+    { }
+};
+
+TEST_F(TConsumerCookieFailSessionTest, FailedReadSessionDoesNotSetConsumerCookie)
+{
+    constexpr int ExistingBlockIndex = 0;
+    constexpr int MissingBlockIndex = 1;
+
+    TSessionId sessionId(MakeRandomId(EObjectType::Chunk, TCellTag(0xf003)), GenericMediumIndex);
+    auto blocks = FillWithRandomBlocks(sessionId, /*blockCount*/ 1, /*blockSize*/ 4_KB);
+    auto blockId = TBlockId(sessionId.ChunkId, ExistingBlockIndex);
+
+    // Keep the block pending outside the read session. The session must fail on the missing block
+    // without waiting for this block to become available.
+    std::unique_ptr<ICachedBlockCookie> producerCookie =
+        GetDataNodeBootstrap()->GetBlockCache()->GetBlockCookie(
+            blockId,
+            EBlockType::CompressedData);
+    ASSERT_TRUE(producerCookie->IsActive());
+
+    auto failedRspOrError = WaitFor(GetBlockSet(
+        sessionId.ChunkId,
+        /*blockIndices*/ std::vector<int>{ExistingBlockIndex, MissingBlockIndex},
+        /*populateCache*/ true,
+        /*fetchFromCache*/ true,
+        /*fetchFromDisk*/ true,
+        /*workloadDescriptor*/ {},
+        /*requestTimeout*/ TDuration::Seconds(1)));
+    ASSERT_FALSE(failedRspOrError.IsOK());
+
+    producerCookie->SetBlock(blocks[0]);
 }
 
 class TReadBlocksDeadlineTest

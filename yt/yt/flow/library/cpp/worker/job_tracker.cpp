@@ -333,12 +333,14 @@ public:
 
         // Drop too old jobs.
         if (oldExecutionSpec->PipelineSpec->GetVersion() != ExecutionSpec_->PipelineSpec->GetVersion()) {
+            auto predecessorInstanceStates = ResourceManager_->GetResourceInstanceStates();
             DropAllJobs();
             ResourceManager_ = CreateResourceManagerForPipelineSpec(
                 ExecutionSpec_->PipelineSpec->GetValue()->Resources,
                 ExecutionSpec_->DynamicPipelineSpec->GetValue()->Resources,
                 ExecutionSpec_->PipelineSpec->GetValue()->Computations,
-                ExecutionSpec_->ResourceTargetRevisions->GetValue());
+                ExecutionSpec_->ResourceTargetRevisions->GetValue(),
+                predecessorInstanceStates);
         } else {
             for (const auto& jobId : GetKeys(JobIdToRuntimeState_)) {
                 if (!ExecutionSpec_->Layout->Jobs.contains(jobId)) {
@@ -570,17 +572,26 @@ private:
         const THashMap<TResourceId, TResourceSpecPtr>& resources,
         const THashMap<TResourceId, TDynamicResourceSpecPtr>& dynamicResourceSpecs,
         const THashMap<TComputationId, TComputationSpecPtr>& computations,
-        const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions)
+        const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions,
+        const THashMap<TResourceId, TResourceInstanceState>& predecessorInstanceStates = {})
     {
         auto context = New<TResourceManagerContext>();
         context->PipelineAuthenticator = Context_->PipelineAuthenticator;
-        context->Logger = WorkerLogger().WithTag("ResourceManager");
+        context->ClientsCache = Context_->ClientsCache;
+        context->PipelinePath = Context_->PipelinePath;
+        context->FileStorage = Context_->FileStorage;
+        context->Logger = WorkerLogger().WithTag("Manager", "Resource");
         context->Invoker = JobThreadPool_->GetInvoker("ResourceManager");
         context->Profiler = WorkerProfiler();
         context->StatusProfiler = Context_->StatusProfiler->WithPrefix("/resource_manager");
         context->IsController = false;
         context->Computations = computations;
-        return CreateResourceManager(std::move(context), resources, dynamicResourceSpecs, targetRevisions);
+        return CreateResourceManager(
+            std::move(context),
+            resources,
+            dynamicResourceSpecs,
+            targetRevisions,
+            predecessorInstanceStates);
     }
 
     void UpdatePerformanceCounters()
@@ -628,8 +639,11 @@ private:
         auto jobIdString = ToString(jobId);
         auto traceContext = TTraceContext::NewRoot(Format("Job-%v", jobIdString));
         traceContext->SetAllocationTag(JobIdTag, jobIdString);
-        auto loggingTag = Format("JobPropagatingTag: %v/%v", partition->ComputationId, partition->PartitionId);
-        traceContext->SetLoggingTag(loggingTag);
+        traceContext->AddLoggingTagFormat(
+            "JobPropagatingTag",
+            "%v/%v",
+            partition->ComputationId,
+            partition->PartitionId);
 
         auto cpuTimeAccountant = New<TJobCpuTimeAccountant>();
         auto wrapInvoker = [&] (const auto& underlying) {
@@ -638,7 +652,7 @@ private:
                 partition->ComputationId,
                 partition->PartitionId,
                 jobId,
-                loggingTag);
+                traceContext->GetLoggingTags());
             auto codicilInvoker = CreateCodicilGuardedInvoker(tracedInvoker, codicil);
             return codicilInvoker;
         };
@@ -651,6 +665,10 @@ private:
         jobContext->ResourceManager = ResourceManager_;
 
         auto streamLimitUsageStates = BufferStateManager_->RegisterJob(jobId, jobSpec);
+        jobContext->PartitionBufferState = CreatePartitionBufferState(
+            BufferStateManager_,
+            jobId,
+            streamLimitUsageStates.Output);
         jobContext->LoadThroughputThrottler = LoadThroughputThrottler_;
         jobContext->JobStateCache = StateCache_->WithJob(
             jobId,

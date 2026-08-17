@@ -23,6 +23,7 @@ from yt.common import wait, WaitFailed
 
 from . import default_config_parameters
 from .helpers import dump_yson_config, get_yson_config
+from .monitoring_stack import MonitoringStack, MONITORING_STACK_ENABLED
 
 log = logging.getLogger("flow_process")
 
@@ -95,10 +96,38 @@ def _derive_test_name(cls, method) -> str:
 
     # YPath special symbols (https://ytsaurus.tech/docs/en/user-guide/storage/ypath#simple_ypath_lexis) + some extra symbols.
     special_symbols = ["{", "}", "[", "]", "(", ")", "/", "@", "&", "*", ":"]
+    if os.environ.get("YT_FLOW_OS_TEST_MODE") == "1":
+        test_name = f"{cls.__class__.__module__}::{test_name}"
+        special_symbols.append(".")
 
     test_name = test_name.translate(str.maketrans({special_symbol: "_" for special_symbol in special_symbols}))
     test_name = "_".join(part for part in test_name.split("_") if part)
     return test_name
+
+
+_LOCAL_CHAOS_TABLET_CELL_BUNDLE = "test-chaos"
+
+
+def _prepare_local_chaos_cluster(client) -> None:
+    bundle_path = f"//sys/tablet_cell_bundles/{_LOCAL_CHAOS_TABLET_CELL_BUNDLE}"
+    if not client.exists(bundle_path):
+        return
+
+    client.set(
+        "//sys/@config/tablet_manager/enable_clock_cell_tag_validation_on_chaos_replica_mount",
+        True,
+    )
+
+    tablet_cell_ids = client.get(f"{bundle_path}/@tablet_cell_ids")
+    if not tablet_cell_ids:
+        tablet_cell_ids = [
+            client.create(
+                "tablet_cell",
+                attributes={"tablet_cell_bundle": _LOCAL_CHAOS_TABLET_CELL_BUNDLE},
+            )
+        ]
+
+    wait(lambda: all(client.get(f"#{cell_id}/@health") == "good" for cell_id in tablet_cell_ids))
 
 
 def _prepare_proxy_role(role: str, client) -> None:
@@ -240,10 +269,11 @@ class FlowTestBase:
         url_aliasing_config.update(cls.cluster_name_to_url)
         cls.serialized_url_aliasing_config = str(yson.dumps(url_aliasing_config).decode("utf-8"))
 
-        # On a real external cluster we don't have permissions to redefine //sys/rpc_proxy_roles;
-        # the role must be configured by the cluster owner instead.
+        # Apply cluster-wide test settings only to local recipe clusters. On a real external
+        # cluster we may lack permissions and the cluster owner controls both settings.
         if cls.external_yt_config is None:
             for client in cls.cluster_name_to_client.values():
+                _prepare_local_chaos_cluster(client)
                 _prepare_proxy_role(cls.RPC_PROXY_ROLE, client)
 
         cls.rpc_driver_config = {"proxy_role": cls.RPC_PROXY_ROLE}
@@ -311,9 +341,7 @@ class FlowTestBase:
                         f"{ui_address}navigation?path={cls.base_work_yt_path}"
                         f" (proxy: {url})\n"
                     )
-        message += (
-            "    About test framework: yt/yt/flow/library/python/integration_test_base/README.md\n"
-        )
+        message += "    About test framework: yt/yt/flow/library/python/integration_test_base/README.md\n"
         logging.info("%s", message)
         cls.try_print_tty(message)  # Ignore if printing failed.
 
@@ -360,6 +388,15 @@ class FlowTestBase:
             default_config_parameters.fill_runner_test_defaults(config)
         else:
             default_config_parameters.fill_flow_node_test_defaults(config)
+        if os.environ.get("YT_FLOW_OS_TEST_MODE") == "1":
+            config.setdefault("address_resolver", {}).update(
+                {
+                    "enable_ipv4": True,
+                    "enable_ipv6": False,
+                    "localhost_name_override": "127.0.0.1",
+                    "resolve_hostname_into_fqdn": False,
+                }
+            )
 
     def dump_config_to_log_dir(self, config: dict, name: str):
         prepared_path = os.path.join(self.path_to_flow_logs, name)
@@ -401,6 +438,8 @@ class FlowTestBase:
             # (the production defaults are larger and would not be schedulable here).
             "controller": {"count": 1, "cpu_limit": 1, "port_count": 2},
             "worker": {"count": workers_count, "cpu_limit": 1, "port_count": self.VANILLA_WORKER_PORT_COUNT},
+            # Internal builds default to yt_flow_common, which is not provisioned in local YT.
+            "network_project": None,
             "node_config": node_config,
         }
         if secret_env:
@@ -425,16 +464,13 @@ class FlowTestBase:
         problems: bool = False,
         controller_problems_config: Optional[ProblemsConfig] = None,
         worker_problems_config: Optional[ProblemsConfig] = None,
-        companion_problems_config: Optional[ProblemsConfig] = None,
         run_pipeline: bool = True,
         use_vanilla_jobs: bool = False,
         vanilla_secret_env: list[str] | None = None,
         vanilla_runtime_cluster: str | None = None,
         patch_node_config: bool = True,
         additional_env: dict[str, str] | None = None,
-        run_companion_externally: bool = False,
-        companion_binary_path: Optional[str] = None,
-        companion_binary_args: Optional[list[str]] = None,
+        worker_node_config_overrides: list[dict] | None = None,
         leader_wait_timeout: Optional[int] = None,
     ):
         if node_config is None:
@@ -466,8 +502,6 @@ class FlowTestBase:
                 controller_problems_config = ProblemsConfig(interval_seconds=60, problems_max_count=1)
             if worker_problems_config is None:
                 worker_problems_config = ProblemsConfig(interval_seconds=60, problems_max_count=2)
-            if companion_problems_config is None:
-                companion_problems_config = ProblemsConfig(interval_seconds=60, problems_max_count=2)
 
         env = dict(os.environ)
         if additional_env is not None:
@@ -486,19 +520,19 @@ class FlowTestBase:
             start_watcher_thread=start_watcher_thread,
             controller_problems_config=controller_problems_config,
             worker_problems_config=worker_problems_config,
-            companion_problems_config=companion_problems_config,
             run_pipeline=run_pipeline,
             use_vanilla_jobs=use_vanilla_jobs,
-            run_companion_externally=run_companion_externally,
-            companion_binary_path=companion_binary_path,
-            companion_binary_args=companion_binary_args,
-            companion_cluster_url=(
-                self.cluster_name_to_url[self.primary_cluster_name] if run_companion_externally else None
-            ),
-            companion_pipeline_path=self.pipeline_path if run_companion_externally else None,
+            worker_node_config_overrides=worker_node_config_overrides,
             client=self.client,
         ) as federation:
+            monitoring = (
+                MonitoringStack(self.path_to_flow_logs, self.port_manager) if MONITORING_STACK_ENABLED else None
+            )
             try:
+                # Inside the try so that if the stack fails to come up the finally still dumps the
+                # pipeline state (and the docker error surfaces).
+                if monitoring is not None:
+                    monitoring.start(federation)
                 if controllers_count > 0:
                     wait(
                         lambda: self.client.exists(f"{self.pipeline_path}/@leader_controller_address"),
@@ -520,7 +554,18 @@ class FlowTestBase:
                 self._try_dump_flow_view()
                 self._try_dump_description()
                 federation.try_dump_processes_state(debug_hang=debug_hang)
-                while int(yatest.common.get_param("PAUSE_BEFORE_FLOW_PROCESS_FEDERATION_TEARDOWN", 0)):
+                # Pause before teardown so the pipeline stays up for inspection. Requested explicitly
+                # via PAUSE_BEFORE_FLOW_PROCESS_FEDERATION_TEARDOWN, or implicitly whenever the
+                # monitoring stack actually came up (its whole point is to browse the live metrics) --
+                # not when it failed to start. The reaper removes the stack once this process exits, so
+                # no explicit teardown is needed.
+                stack_up = monitoring is not None and monitoring.started
+                pause_before_teardown = stack_up or int(
+                    yatest.common.get_param("PAUSE_BEFORE_FLOW_PROCESS_FEDERATION_TEARDOWN", 0)
+                )
+                if stack_up:
+                    monitoring.notify_hold()
+                while pause_before_teardown:
                     time.sleep(1)
 
     def _try_dump_flow_view(self):
@@ -592,6 +637,20 @@ class FlowTestBase:
                     state, timeout, "\n".join(messages)
                 )
             )
+
+    def ask_key_visitor_to_complete(self, computation_id, stream_id):
+        """Ask a running key visitor to finish sweeping.
+
+        The counterpart of a finite source running out of input: a periodic scanner has no
+        end of its own, so a test that needs the pipeline to reach `completed` says when the
+        sweeping should stop. Returns once the request is applied — wait for the pipeline
+        state separately.
+        """
+        self.client.set_pipeline_dynamic_spec(
+            self.pipeline_path,
+            True,
+            spec_path=f"/computations/{computation_id}/key_visitor_streams/{stream_id}/finite",
+        )
 
     def wait_for_pipeline_error(self, error_substring, timeout=60):
         """Wait until an error containing the given substring appears in the flow view."""

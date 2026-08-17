@@ -351,8 +351,8 @@ void TLayerLocation::Disable(const TError& error, bool persistentDisable)
         auto guard = Guard(SpinLock_);
 
         Alert_ = TError(NExecNode::EErrorCode::LayerLocationDisabled, "Layer location disabled")
-            << TErrorAttribute("path", Config_->Path)
-            << error;
+            .With("path", Config_->Path)
+            .With(error);
 
         if (persistentDisable) {
             // Save the reason in a file and exit.
@@ -438,7 +438,7 @@ i64 TLayerLocation::GetAvailableSpace()
         }
     } catch (const std::exception& ex) {
         auto error = TError("Failed to compute available space")
-            << ex;
+            .With(ex);
         Disable(error);
     }
 
@@ -679,7 +679,7 @@ void TLayerLocation::DoInitialize()
         THROW_ERROR_EXCEPTION(
             "Failed to initialize layer location %v",
             Config_->Path)
-            << ex;
+            .With(ex);
     }
 
     try {
@@ -715,7 +715,7 @@ void TLayerLocation::DoInitialize()
         THROW_ERROR_EXCEPTION(
             "Failed to initialize layer location %v",
             Config_->Path)
-            << ex;
+            .With(ex);
     }
 }
 
@@ -770,7 +770,8 @@ TLayerMeta TLayerLocation::DoImportLayer(const TArtifactKey& artifactKey, const 
     auto dynamicConfig = DynamicConfig_.Acquire();
 
     auto Logger = ExecNodeLogger()
-        .WithTag("Tag: %v, LayerId: %v", tag, layerId);
+        .WithTag("Tag", tag)
+        .WithTag("LayerId", layerId);
 
     LayerImportsInProgress_.fetch_add(1);
 
@@ -832,7 +833,7 @@ TLayerMeta TLayerLocation::DoImportLayer(const TArtifactKey& artifactKey, const 
                 "Layer unpacking failed (ArchivePath: %v)",
                 archivePath);
             THROW_ERROR_EXCEPTION(NExecNode::EErrorCode::LayerUnpackingFailed, "Layer unpacking failed")
-                << ex;
+                .With(ex);
         }
 
         auto config = New<TGetDirectorySizesAsRootConfig>();
@@ -864,8 +865,8 @@ TLayerMeta TLayerLocation::DoImportLayer(const TArtifactKey& artifactKey, const 
         return layerMeta;
     } catch (const std::exception& ex) {
         auto error = TError("Failed to import layer %v", layerId)
-            << TErrorAttribute("layer_path", artifactKey.data_source().path())
-            << ex;
+            .With("layer_path", artifactKey.data_source().path())
+            .With(ex);
 
         auto innerError = TError(ex);
         if (innerError.GetCode() == NExecNode::EErrorCode::LayerUnpackingFailed) {
@@ -895,7 +896,8 @@ void TLayerLocation::DoRemoveLayer(const TLayerId& layerId)
     auto layerMetaPath = GetLayerMetaPath(layerId);
 
     auto Logger = ExecNodeLogger()
-        .WithTag("LayerId: %v, LayerPath: %v", layerId, layerPath);
+        .WithTag("LayerId", layerId)
+        .WithTag("LayerPath", layerPath);
 
     {
         auto guard = Guard(SpinLock_);
@@ -931,7 +933,7 @@ void TLayerLocation::DoRemoveLayer(const TLayerId& layerId)
         auto error = TError(
             "Failed to remove layer %v",
             layerId)
-            << ex;
+            .With(ex);
         Disable(error);
 
         if (config->AbortOnOperationWithLayerFailed) {
@@ -961,10 +963,9 @@ TVolumeMeta TLayerLocation::DoCreateVolume(
     std::string mountPath = NFS::CombinePaths(volumePath, MountSuffix);
 
     auto Logger = ExecNodeLogger()
-        .WithTag("Tag: %v, VolumeType: %v, VolumeId: %v",
-            tag,
-            volumeType,
-            volumeId);
+        .WithTag("Tag", tag)
+        .WithTag("VolumeType", volumeType)
+        .WithTag("VolumeId", volumeId);
 
     try {
         YT_LOG_DEBUG("Creating volume");
@@ -1075,7 +1076,7 @@ TVolumeMeta TLayerLocation::DoCreateVolume(
             "Failed to create %Qlv volume %v",
             volumeType,
             volumeId)
-            << ex;
+            .With(ex);
 
         // Don't disable location in case of InvalidImage or NBD errors.
         switch (static_cast<EPortoErrorCode>(TError(ex).GetCode())) {
@@ -1319,11 +1320,10 @@ void TLayerLocation::DoRemoveVolume(
     auto volumeMetaPath = GetVolumeMetaPath(volumeId, portoPlacePath);
 
     auto Logger = ExecNodeLogger()
-        .WithTag("VolumeId: %v, VolumePath: %v, VolumeMetaPath: %v, PortoPlacePath: %v",
-            volumeId,
-            volumePath,
-            volumeMetaPath,
-            portoPlacePath);
+        .WithTag("VolumeId", volumeId)
+        .WithTag("VolumePath", volumePath)
+        .WithTag("VolumeMetaPath", volumeMetaPath)
+        .WithTag("PortoPlacePath", portoPlacePath);
 
     YT_LOG_DEBUG("Removing volume");
 
@@ -1375,8 +1375,8 @@ void TLayerLocation::DoRemoveVolume(
             auto now = TInstant::Now();
             if (now > deadline) {
                 THROW_ERROR_EXCEPTION("Failed to wait for volume to be removed")
-                    << TErrorAttribute("timeout", timeout)
-                    << TErrorAttribute("volume_path", mountPath);
+                    .With("timeout", timeout)
+                    .With("volume_path", mountPath);
             }
         };
 
@@ -1424,8 +1424,8 @@ void TLayerLocation::DoRemoveVolume(
             "Failed to remove volume");
 
         auto error = TError("Failed to remove volume")
-            << ex
-            << TErrorAttribute("volume_id", volumeId);
+            .With(ex)
+            .With("volume_id", volumeId);
 
         // Don't disable location in case of VolumeNotFound, VolumeNotLinked or NBD errors.
         switch (static_cast<EPortoErrorCode>(TError(ex).GetCode())) {
@@ -1500,7 +1500,7 @@ void TLayerLocation::RemoveLayers(
     auto portoPlace = (!Config_->LocationIsAbsolute && !place.starts_with("//") ? "//" : "") + place;
 
     auto Logger = ExecNodeLogger()
-        .WithTag("Place: %v", portoPlace);
+        .WithTag("Place", portoPlace);
 
     YT_LOG_DEBUG(
         "Removing layers from porto place (Timeout: %v)",
@@ -1564,7 +1564,7 @@ void TLayerLocation::RemoveVolumes(
     auto deadline = startTime + timeout;
 
     auto Logger = ExecNodeLogger()
-        .WithTag("Path: %v", path);
+        .WithTag("Path", path);
 
     YT_LOG_DEBUG(
         "Removing volumes from path (Deadline: %v)",
@@ -1574,8 +1574,8 @@ void TLayerLocation::RemoveVolumes(
         auto now = TInstant::Now();
         if (now > deadline) {
             THROW_ERROR_EXCEPTION("Failed to wait for volumes to be removed")
-                << TErrorAttribute("timeout", timeout)
-                << TErrorAttribute("path", path);
+                .With("timeout", timeout)
+                .With("path", path);
         }
     };
 

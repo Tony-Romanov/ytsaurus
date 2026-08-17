@@ -87,7 +87,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            TabletNodeLogger().WithTag("Cache: ResourceLimits"))
+            TabletNodeLogger().WithTag("Cache", "ResourceLimits"))
         , Bootstrap_(bootstrap)
     { }
 
@@ -156,7 +156,7 @@ private:
         if (!resultOrError.IsOK()) {
             auto wrappedError = TError("Error getting resource limits for account %Qv",
                 key.Account)
-                << resultOrError;
+                .With(resultOrError);
             YT_LOG_WARNING(wrappedError);
             THROW_ERROR wrappedError;
         }
@@ -202,7 +202,7 @@ private:
         if (!resultOrError.IsOK()) {
             auto wrappedError = TError("Error getting resource limits for tablet cell bundle %Qv",
                 key.TabletCellBundle)
-                << resultOrError;
+                .With(resultOrError);
             YT_LOG_WARNING(wrappedError);
             THROW_ERROR wrappedError;
         }

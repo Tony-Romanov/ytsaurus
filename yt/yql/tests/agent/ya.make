@@ -1,5 +1,7 @@
 PY3TEST()
 
+NO_BUILD_IF(SANITIZER_TYPE)
+
 PY_SRCS(
     common.py
 )
@@ -24,6 +26,7 @@ DEPENDS(
     yql/essentials/udfs/common/streaming
     yql/essentials/udfs/common/string
     yql/essentials/udfs/common/yson2
+    yql/essentials/udfs/test/simple
 )
 
 PEERDIR(

@@ -1051,8 +1051,8 @@ public:
 
         if (cell->CellBundle() != area->GetCellBundle()) {
             THROW_ERROR_EXCEPTION("Could not update cell area because it is from another bundle")
-                << TErrorAttribute("cell_id", cell->GetId())
-                << TErrorAttribute("area_id", area->GetId());
+                .With("cell_id", cell->GetId())
+                .With("area_id", area->GetId());
         }
 
         EraseOrCrash(oldArea->Cells(), cell);
@@ -1544,7 +1544,7 @@ private:
         YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
 
         auto cellarType = FromProto<ECellarType>(request->type());
-        auto Logger = CellServerLogger().WithTag("CellarType: %v", cellarType);
+        auto Logger = CellServerLogger().WithTag("CellarType", cellarType);
 
         // Various request helpers.
         auto requestCreateSlot = [&] (const TCellBase* cell) {
@@ -2621,7 +2621,7 @@ private:
                 if (TypeFromId(bundleId) != expectedType) {
                     if (throwOnInvalidId) {
                         THROW_ERROR_EXCEPTION("Invalid %lv cell bundle id", cellarType)
-                            << TErrorAttribute("bundle_id", bundleId);
+                            .With("bundle_id", bundleId);
                     }
                     return nullptr;
                 }

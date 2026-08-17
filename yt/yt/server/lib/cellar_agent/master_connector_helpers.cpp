@@ -83,7 +83,7 @@ void UpdateCellarFromHeartbeatResponse(
     const ICellarPtr& cellar,
     const TRspCellarHeartbeat& response)
 {
-    auto Logger = CellarAgentLogger().WithTag("CellarType: %v", cellarType);
+    auto Logger = CellarAgentLogger().WithTag("CellarType", cellarType);
 
     if (!cellar) {
         YT_LOG_WARNING("Processing heartbeat for non-existing cellar, ignored");
@@ -211,8 +211,8 @@ TError UpdateSolomonTags(
     } else {
         NProfiling::TSolomonRegistry::Get()->SetDynamicTags({});
         return TError("Conflicting profiling tags")
-            << TErrorAttribute("cellar_type", cellarType)
-            << TErrorAttribute("tags", seenTags);
+            .With("cellar_type", cellarType)
+            .With("tags", seenTags);
     }
 
     return {};

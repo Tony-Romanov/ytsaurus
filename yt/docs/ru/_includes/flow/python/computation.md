@@ -18,6 +18,8 @@
 При использовании [компаньона](../../../flow/concepts/glossary.md#companion) выбор `Swift` или `Transform` осуществляется через указание `computation_class_name` в статической [спеке](../../../flow/concepts/glossary.md#spec-and-dynamic-spec):
 - `NYT::NFlow::NCompanion::TTransformCompanionComputation` — для `Transform`.
 - `NYT::NFlow::NCompanion::TSwiftMapCompanionComputation` — для `Swift`.
+- `NYT::NFlow::NCompanion::TTransformOrderedSourceCompanionComputation` — для `Transform`-сорса.
+- `NYT::NFlow::NCompanion::TSwiftOrderedSourceCompanionComputation` — для `Swift`-сорса.
 
 ## Создание Computation {#computation}
 
@@ -56,9 +58,11 @@
 
 ## SourceComputation {#sourcecomputation}
 
-`SourceComputation` — вершина в графе [пайплайна](../../../flow/concepts/glossary.md#pipeline), осуществляющая чтение данных из внешних источников. Подробнее про [Source Computation](../../../flow/concepts/computation.md#tswiftorderedsourcecomputation).
+`SourceComputation` — вершина в графе [пайплайна](../../../flow/concepts/glossary.md#pipeline), осуществляющая чтение данных из внешних источников. На стороне воркера ей соответствует [TSwiftOrderedSourceComputation](../../../flow/concepts/computation.md#tswiftorderedsourcecomputation) или [TTransformOrderedSourceComputation](../../../flow/concepts/computation.md#ttransformorderedsourcecomputation).
 
 В Python `SourceComputation` создаётся через передачу `source=True` в `Pipeline.add()`. Фильтрация [сообщений](../../../flow/concepts/glossary.md#message) выполняется внутри Process Function через флаг [distribute](../../../flow/python/distribute.md).
+
+В статической спеке для детерминированной обработки без пользовательского стейта указывают `TSwiftOrderedSourceCompanionComputation`. Если SourceComputation использует внутренний стейт или недетерминированную логику, указывают `TTransformOrderedSourceCompanionComputation`: воркер материализует выход и фиксирует его вместе со стейтом и смещением источника. Ключ внутреннего стейта в таком компьютейшене — ключ партиции источника.
 
 ### Параметры
 
@@ -77,7 +81,7 @@ pipeline.add("reader", MyParsingFunction(), source=True)
 
 ### Взаимодействие с Worker {#companion-info}
 
-При инициализации [Worker](../../../flow/concepts/glossary.md#worker) запрашивает у Python-компаньона информацию о зарегистрированных объектах `Computation` и `SourceComputation`. Каждое входное сообщение `TSwiftOrderedSourceCompanionComputation` отправляет в Python-компаньон, который применяет к нему `ProcessFunction` и возвращает результат. Worker выполняет один запрос к компаньону на каждое сообщение.
+При инициализации [Worker](../../../flow/concepts/glossary.md#worker) запрашивает у Python-компаньона информацию о зарегистрированных объектах `Computation` и `SourceComputation`. Source-компьютейшен на стороне воркера отправляет входные сообщения в Python-компаньон, который применяет к ним `ProcessFunction` и возвращает результат.
 
 ## Process Function {#process-function}
 
@@ -286,7 +290,6 @@ def on_message(self, message, output, ctx):
 "CompanionManager" = {
     "resource_class_name" = "NYT::NFlow::NCompanion::TCompanionManager";
     "parameters" = {
-        "run_process" = %true;
         "entrypoint" = {
             "executable" = "./py_companion";
         };
@@ -298,7 +301,7 @@ def on_message(self, message, output, ctx):
 Параметр `resource_class_name` указывает на класс ресурса, который будет осуществлять запуск компаньона.
 В случае Python-компаньона `resource_class_name` всегда должен быть `NYT::NFlow::NCompanion::TCompanionManager`.
 
-Процесс компаньона описывается параметром `entrypoint` (`executable`, `args`, `env`); при `run_process = %false` Flow ожидает, что компаньон запущен снаружи (так делают, например, интеграционные тесты). При [запуске пайплайна с хоста](../../../flow/python/getting-started.md#launch) через `pipeline.run()` заполнять `entrypoint` вручную не нужно: Python-бинарь сам прописывает `entrypoint = {"executable" = "./py_companion"}` и `run_process = %true`, а `flow_server` доставляет бинарь в джобу под этим именем.
+Процесс компаньона описывается параметром `entrypoint` (`executable`, `args`, `env`); воркер сам запускает компаньон и следит за его жизненным циклом. При [запуске пайплайна с хоста](../../../flow/python/getting-started.md#launch) через `pipeline.run()` заполнять `entrypoint` вручную не нужно: Python-бинарь сам прописывает `entrypoint = {"executable" = "./py_companion"}`, а `flow_server` доставляет бинарь в джобу под этим именем.
 
 Ключевое отличие от Java-конфигурации: для Java существует отдельный класс ресурса `NYT::NFlow::NCompanion::TJavaCompanionManager` с параметрами `jdk_bin_path`, `classpath` и `main_class`, тогда как Python-компаньон использует общий `TCompanionManager` с параметром `entrypoint`.
 

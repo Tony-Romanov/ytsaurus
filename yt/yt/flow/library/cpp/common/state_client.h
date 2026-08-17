@@ -140,6 +140,15 @@ public:
     TConstStateAccessor<T> GetState(const TKey& key) const;
     TConstStateAccessor<T> GetState(const TInputMessageConstPtr& message) const;
     TConstStateAccessor<T> GetState(const TInputTimerConstPtr& timer) const;
+
+    //! Resolves the joined-state lookup key using the provider's key schema override.
+    TKey ResolveKey(const TInputMessageConstPtr& message) const;
+    TKey ResolveKey(const TInputTimerConstPtr& timer) const;
+
+    //! The lookup keys |inputContext| implies for this joiner; #PreloadKeyStates() loads exactly
+    //! these. For visitor-driven joiners the framework preloads visit keys only.
+    THashSet<TKey> ExtractKeys(const IInputContextPtr& inputContext) const;
+
     TFuture<void> PreloadKeyStates(const THashSet<TKey>& keys) const;
     TFuture<void> PreloadKeyStates(const IInputContextPtr& inputContext) const;
     NTableClient::TTableSchemaPtr GetKeySchema() const;

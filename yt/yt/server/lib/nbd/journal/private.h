@@ -6,7 +6,9 @@
 
 #include <library/cpp/yt/logging/logger.h>
 
-#include <library/cpp/yt/misc/global.h>
+#include <library/cpp/yt/misc/enum.h>
+
+#include <library/cpp/yt/misc/leaky_global.h>
 
 #include <util/system/types.h>
 
@@ -14,7 +16,7 @@ namespace NYT::NNbd::NJournal {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "Nbd");
+YT_DEFINE_LEAKY_GLOBAL(const NLogging::TLogger, Logger, "Nbd");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -65,6 +67,9 @@ static_assert(ReservedBits + ChunkIndexBits + RecordIndexBits + BlockIndexBits =
 
 // Capacity limits implied by the id layout above.
 
+//! Exclusive upper bound on a device's block count.
+constexpr i64 MaxBlocksPerDevice = 1LL << 30;
+
 //! Total number of chunks a store may ever allocate; exceeding it is fatal.
 constexpr i64 MaxChunksPerDevice = 1LL << NStoredBlockIdLayout::ChunkIndexBits;
 
@@ -73,6 +78,15 @@ constexpr i64 MaxRecordsPerChunk = 1LL << NStoredBlockIdLayout::RecordIndexBits;
 
 //! Number of blocks that can be coalesced into a single record.
 constexpr i64 MaxBlocksPerRecord = 1LL << NStoredBlockIdLayout::BlockIndexBits;
+
+//! The sealing lifecycle of a store-owned chunk.
+DEFINE_ENUM(EChunkSealState,
+    (None)     // writable, or restored from an already-sealed snapshot
+    (Waiting)  // abandoned; a maintenance tick starts the next seal attempt once the backoff elapses
+    (Running)  // a seal attempt is in progress
+    (Done)     // sealed
+    (Failed)   // abandoned: the chunk object is gone from the master, so no attempt can succeed
+);
 
 DECLARE_REFCOUNTED_STRUCT(IBlockStore)
 
@@ -85,6 +99,9 @@ using TDirtyBlockPtr = TIntrusivePtr<TDirtyBlock>;
 DECLARE_REFCOUNTED_STRUCT(IDirtyBlockPool)
 DECLARE_REFCOUNTED_STRUCT(IBlockMap)
 DECLARE_REFCOUNTED_STRUCT(IBlockFlusher)
+DECLARE_REFCOUNTED_STRUCT(IBlockCompactor)
+DECLARE_REFCOUNTED_STRUCT(ISnapshotReader)
+DECLARE_REFCOUNTED_STRUCT(ISnapshotWriter)
 
 ////////////////////////////////////////////////////////////////////////////////
 

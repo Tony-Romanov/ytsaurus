@@ -468,6 +468,20 @@ private:
             THROW_ERROR_EXCEPTION(
                 "\"annotate_new_nodes\"/\"annotate_new_proxies\"/ cannot be used together with \"has_instance_allocator_service\"");
         }
+
+        // Validate that zones have different spare bundle names.
+        {
+            THashMap<std::string, std::string> spareBundleNames;
+            for (const auto& [zoneName, zoneInfo] : inputState.Zones) {
+                auto [it, inserted] = spareBundleNames.emplace(zoneInfo->SpareBundleName, zoneName);
+                if (!inserted) {
+                    THROW_ERROR_EXCEPTION("Spare bundle name %Qv is used by multiple zones: %Qv, %Qv",
+                        it->first,
+                        it->second,
+                        zoneName);
+                }
+            }
+        }
     }
 
     void DoScanTabletBundles(bool dryRun, bool ignoreGlobalDisabledSwitch)
@@ -997,7 +1011,7 @@ private:
             sensors->ReleasingSpareNodes.Update(std::ssize(bundleState->SpareNodeReleasements));
         }
 
-        for (const auto& [bundleName, dataCenterNodes] : input.BundleNodes) {
+        for (const auto& [bundleName, dataCenterNodes] : input.NodesAllocatedForBundle) {
             auto sensors = GetBundleSensors(bundleName);
 
             THashMap<std::string, int> assignedNodesByDC;
@@ -1047,7 +1061,7 @@ private:
             }
         }
 
-        for (const auto& [bundleName, dataCenterProxies] : input.BundleProxies) {
+        for (const auto& [bundleName, dataCenterProxies] : input.ProxiesAllocatedForBundle) {
             int offlineProxyCount = 0;
 
             for (const auto& [_, proxies] : dataCenterProxies) {
@@ -1504,16 +1518,16 @@ private:
 
         if (entryList->Attributes().Get("incomplete", false)) {
             THROW_ERROR_EXCEPTION("Cypress list received incomplete results")
-                << TErrorAttribute("path", path);
+                .With("path", path);
         }
 
         TListResult<TEntryInfo> result;
         for (const auto& entry : entryList->GetChildren()) {
             if (entry->GetType() != ENodeType::String) {
                 THROW_ERROR_EXCEPTION("Unexpected entry type")
-                    << TErrorAttribute("parent_path", path)
-                    << TErrorAttribute("expected_type", ENodeType::String)
-                    << TErrorAttribute("actual_type", entry->GetType());
+                    .With("parent_path", path)
+                    .With("expected_type", ENodeType::String)
+                    .With("actual_type", entry->GetType());
             }
             const auto& name = entry->AsString()->GetValue();
 
@@ -1546,7 +1560,7 @@ private:
 
         if (entryMap->Attributes().Get("incomplete", false)) {
             THROW_ERROR_EXCEPTION("Cypress get received incomplete results")
-                << TErrorAttribute("path", path);
+                .With("path", path);
         }
 
         TIndexedEntries<TEntryInfo> result;

@@ -69,7 +69,6 @@ using namespace NYson;
 using NChunkClient::NProto::TChunkMeta;
 using NChunkClient::NProto::TChunkSpec;
 using NChunkClient::NProto::TMiscExt;
-
 using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -421,9 +420,9 @@ TStoreBase::TStoreBase(
     , ColumnLockCount_(Tablet_->GetColumnLockCount())
     , LockIndexToName_(Tablet_->LockIndexToName())
     , ColumnIndexToLockIndex_(Tablet_->ColumnIndexToLockIndex())
-    , Logger(TabletNodeLogger().WithTag("StoreId: %v, TabletId: %v",
-        StoreId_,
-        TabletId_))
+    , Logger(TabletNodeLogger()
+        .WithTag("StoreId", StoreId_)
+        .WithTag("TabletId", TabletId_))
 {
     UpdateTabletDynamicMemoryUsage(+1);
 }
@@ -985,12 +984,12 @@ NErasure::ECodec TChunkStoreBase::GetErasureCodecId() const
 
 TTimestamp TChunkStoreBase::GetMinTimestamp() const
 {
-    return OverrideTimestamp_ != NullTimestamp ? OverrideTimestamp_ : MiscExt_.min_timestamp();
+    return OverrideTimestamp_ != NullTimestamp ? OverrideTimestamp_ : FromProto<NTransactionClient::TTimestamp>(MiscExt_.min_timestamp());
 }
 
 TTimestamp TChunkStoreBase::GetMaxTimestamp() const
 {
-    return OverrideTimestamp_ != NullTimestamp ? OverrideTimestamp_ : MiscExt_.max_timestamp();
+    return OverrideTimestamp_ != NullTimestamp ? OverrideTimestamp_ : FromProto<NTransactionClient::TTimestamp>(MiscExt_.max_timestamp());
 }
 
 bool TChunkStoreBase::IsStripedErasure() const
@@ -1365,10 +1364,10 @@ TChunkStatePtr TChunkStoreBase::FindPreloadedChunkState() const
         THROW_ERROR_EXCEPTION(
             NTabletClient::EErrorCode::ChunkIsNotPreloaded,
             "Chunk data is not preloaded yet")
-            << TErrorAttribute("tablet_id", TabletId_)
-            << TErrorAttribute("table_path", TablePath_)
-            << TErrorAttribute("store_id", StoreId_)
-            << TErrorAttribute("chunk_id", ChunkId_);
+            .With("tablet_id", TabletId_)
+            .With("table_path", TablePath_)
+            .With("store_id", StoreId_)
+            .With("chunk_id", ChunkId_);
     }
 
     YT_VERIFY(ChunkState_);

@@ -29,21 +29,21 @@ TCellManager::TCellManager(
     , AlienCellPeerChannelFactory_(std::move(alienChannelFactory))
     , SelfId_(selfId)
     , VotingPeerCount_(Config_->CountVotingPeers())
-    , QuorumPeerCount_(VotingPeerCount_ / 2 + 1)
+    , QuorumPeerCount_(Config_->QuorumPeerCount.value_or(VotingPeerCount_ / 2 + 1))
     , TotalPeerCount_(Config_->Peers.size())
-    , Logger(ElectionLogger().WithTag("CellId: %v, SelfPeerId: %v",
-        Config_->CellId,
-        selfId))
+    , Logger(ElectionLogger()
+        .WithTag("CellId", Config_->CellId)
+        .WithTag("SelfPeerId", selfId))
 {
     PeerChannels_.resize(TotalPeerCount_);
     for (int id = 0; id < TotalPeerCount_; ++id) {
         PeerChannels_[id] = CreatePeerChannel(id, Config_->Peers[id]);
     }
 
-    YT_LOG_INFO("Cell initialized (SelfId: %v, Peers: %v, VotingPeers: %v)",
-        SelfId_,
-        Config_->Peers,
-        VotingPeerCount_);
+    YT_TLOG_INFO("Cell initialized")
+        .With("SelfId", SelfId_)
+        .With("Peers", Config_->Peers)
+        .With("VotingPeers", VotingPeerCount_);
 }
 
 TCellId TCellManager::GetCellId() const

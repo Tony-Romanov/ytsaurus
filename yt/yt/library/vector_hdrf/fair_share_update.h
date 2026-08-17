@@ -69,8 +69,6 @@ struct TSchedulableAttributes
     TResourceVector StrongGuaranteeShare;
     TEnumIndexedArray<EStrongGuaranteeTier, TResourceVector> StrongGuaranteeShareByTier;
     TResourceVector ProposedIntegralShare;
-    // TODO(eshcherbin): Remove this attribute.
-    TResourceVector PromisedFairShare;
     TResourceVector EstimatedGuaranteeShare;
 
     TResourceVolume VolumeOverflow;
@@ -424,7 +422,7 @@ public:
         const TRootElementPtr& rootElement,
         // TODO(ignat): split context on input and output parts.
         TFairShareUpdateContext* context,
-        const std::optional<std::string>& loggingTag = {});
+        const std::optional<NLogging::TLoggingTagList>& loggingTags = {});
 
     void Run();
 

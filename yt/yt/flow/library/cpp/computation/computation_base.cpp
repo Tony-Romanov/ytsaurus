@@ -108,7 +108,7 @@ TComputationBase::TComputationBase(
         ToString(Context_->Job->JobId),
         ToFactoryThrottlers(DynamicContext_->Throttlers),
         Context_->StatusProfiler->WithPrefix("/throttlers"),
-        Logger.WithTag("ThrottlerFactory"),
+        Logger.WithTag("Factory", "Throttler"),
         Context_->Profiler.WithPrefix("/throttlers")))
 {
     YT_VERIFY(Parameters_);
@@ -378,7 +378,8 @@ void TComputationBase::SubscribeOnReconfigure(NYT::TCallback<void()> callback, I
 bool TComputationBase::UpdateTraverse(
     TSystemTimestamp reportTime,
     TSystemTimestamp systemWatermark,
-    const THashMap<TStreamId, TInflightStreamTraverseDataPtr>& inflights)
+    const THashMap<TStreamId, TInflightStreamTraverseDataPtr>& inflights,
+    i64 iterationCycle)
 {
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(GetContext()->SerializedInvoker);
 
@@ -389,6 +390,7 @@ bool TComputationBase::UpdateTraverse(
 
     auto traverseData = New<TNodeTraverseData>();
     traverseData->ReportTime = reportTime;
+    traverseData->IterationCycle = iterationCycle;
 
     // Deep copy because traverseData->Streams will be mutated.
     for (const auto& [streamId, streamTraverseData] : GetInputTraverse()) {
@@ -419,13 +421,14 @@ bool TComputationBase::UpdateTraverse(
         }
 
         auto parentStream = MergeStreamTraverseData(input, EInflightMerge::None);
-        // Parent system watermark is ignored due to new messages system timestamp independent from parent messages.
-        parentStream->SystemWatermark = systemWatermark;
+        if (!GetSpec()->InputStreamIds.contains(streamId)) {
+            // Computation-created messages have system timestamps independent from their parents.
+            parentStream->SystemWatermark = systemWatermark;
+        }
 
         traverseData->Streams[streamId] = ApplyInflightTraverseData(
             parentStream,
-            GetOrCrash(inflights, streamId),
-            systemWatermark);
+            GetOrCrash(inflights, streamId));
     }
 
     bool isFinished = true;
@@ -607,6 +610,8 @@ void TUniversalComputationDynamicPartitionSpec::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("blocked_output_streams", &TThis::BlockedOutputStreams)
         .Default();
+    registrar.Parameter("availability_group_unavailable", &TThis::AvailabilityGroupUnavailable)
+        .Default(false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -718,6 +723,7 @@ TUniversalComputationBase::TUniversalComputationBase(
                 auto dynamicSourceContext = New<TDynamicSourceContext>();
                 dynamicSourceContext->DynamicSourceSpec = GetPatchedDynamicSourceSpec(GetDynamicSpec(), *ActiveSourceStreamId_);
                 dynamicSourceContext->DynamicPartitionSpec = GetDynamicPartitionSpec()->ActiveSource;
+                dynamicSourceContext->AvailabilityGroupUnavailable = GetDynamicPartitionSpec()->AvailabilityGroupUnavailable;
                 ActiveSource_->Reconfigure(dynamicSourceContext);
             }
         }),
@@ -858,7 +864,11 @@ bool TUniversalComputationBase::UpdateStatus(
 
     NTracing::TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("Accounting"));
 
-    bool isFinished = UpdateTraverse(reportTime, systemWatermark, inflights);
+    const bool isFinished = UpdateTraverse(
+        reportTime,
+        systemWatermark,
+        inflights,
+        RunIteration_);
 
     auto inputLimits = GetExtraInputLimits();
 
@@ -926,7 +936,7 @@ THashMap<TStreamId, TKeyVisitorPtr> TUniversalComputationBase::CreateKeyVisitors
         context->KeyVisitorStates = stateTable;
         context->TimeProvider = GetTimeProvider();
         context->SerializedInvoker = GetContext()->SerializedInvoker;
-        context->Logger = Logger.WithTag("KeyVisitorStreamId: %v", streamId);
+        context->Logger = Logger.WithTag("KeyVisitorStreamId", streamId);
         context->Profiler = GetContext()->Profiler.WithPrefix("/key_visitor_streams").WithTag("stream_id", streamId.Underlying());
         context->StatusProfiler = GetContext()->StatusProfiler->WithPrefix(Format("/key_visitor/%v", streamId));
 
@@ -1003,7 +1013,7 @@ ISourcePtr TUniversalComputationBase::CreateActiveSource()
         auto [streamId, sourceKey] = SplitUniversalPartitionKey(*GetContext()->Partition->SourceKey);
         auto context = New<TSourceContext>();
         static_cast<TComputationContextBase&>(*context) = *GetContext();
-        context->Logger = context->Logger.WithTag("SourceStreamId: %v", streamId.Underlying());
+        context->Logger = context->Logger.WithTag("SourceStreamId", streamId);
         context->Profiler = context->Profiler.WithPrefix("/source_streams").WithTag("stream_id", streamId.Underlying());
         context->StatusProfiler = context->StatusProfiler->WithPrefix(Format("/sources/%v", streamId));
         context->SourceStreamId = streamId;
@@ -1013,6 +1023,7 @@ ISourcePtr TUniversalComputationBase::CreateActiveSource()
         auto dynamicSourceContext = New<TDynamicSourceContext>();
         dynamicSourceContext->DynamicSourceSpec = GetPatchedDynamicSourceSpec(GetDynamicSpec(), *ActiveSourceStreamId_);
         dynamicSourceContext->DynamicPartitionSpec = GetDynamicPartitionSpec()->ActiveSource;
+        dynamicSourceContext->AvailabilityGroupUnavailable = GetDynamicPartitionSpec()->AvailabilityGroupUnavailable;
         return TRegistry::Get()->CreateSource(context, dynamicSourceContext);
     }
     return nullptr;
@@ -1084,6 +1095,7 @@ ITimerStorePtr TUniversalComputationBase::CreateTimerStore()
 IOutputStorePtr TUniversalComputationBase::CreateOutputStore()
 {
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(GetContext()->SerializedInvoker);
+    YT_VERIFY(GetContext()->PartitionBufferState);
 
     auto createTableContext = [&] (TStringBuf tableName) {
         auto tableContext = New<NTables::TContext>();
@@ -1103,7 +1115,7 @@ IOutputStorePtr TUniversalComputationBase::CreateOutputStore()
         context.OutputStreamIds = GetSpec()->OutputStreamIds;
         context.WatermarkPercentileSpec = GetSpec()->WatermarkStrategy->WatermarkPercentile;
         context.StreamSpecStorage = GetContext()->StreamSpecStorage;
-        context.StreamLimitUsageStates = GetContext()->OutputStreamLimitUsageStates;
+        context.StreamLimitUsageStates = GetContext()->PartitionBufferState->GetOutputStreamLimitUsageStates();
     };
 
     auto context = New<TCompactOutputStoreContext>();
@@ -1172,7 +1184,8 @@ TSystemTimestamp TUniversalComputationBase::GetEpochWatermark(const TStreamId& s
     return GetWatermark(streamId, timeType);
 }
 
-THashMap<TStreamId, TInflightStreamTraverseDataPtr> TUniversalComputationBase::BuildInflights() const
+THashMap<TStreamId, TInflightStreamTraverseDataPtr> TUniversalComputationBase::BuildInflights(
+    const IComputationRunContextPtr& context) const
 {
     const auto emptyStream = New<TInflightStreamTraverseData>();
     emptyStream->Empty = true;
@@ -1236,6 +1249,18 @@ THashMap<TStreamId, TInflightStreamTraverseDataPtr> TUniversalComputationBase::B
             inflights[streamId] = CloneYsonStruct(emptyStream);
         }
     }
+
+    if (!GetSpec()->InputStreamIds.empty()) {
+        const auto inputInflightMetrics = WaitFor(context->GetInputInflightMetrics())
+            .ValueOrThrow();
+        for (const auto& streamId : GetSpec()->InputStreamIds) {
+            auto inflight = New<TInflightStreamTraverseData>();
+            inflight->InflightMetrics = GetOrCrash(inputInflightMetrics, streamId);
+            inflight->Empty = inflight->InflightMetrics->Count == 0;
+            inflights[streamId] = std::move(inflight);
+        }
+    }
+
     return inflights;
 }
 
@@ -1402,9 +1427,15 @@ TUniversalComputationBase::TRunIterationGuard TUniversalComputationBase::StartRu
     }));
     // Apply pending state before any computation in this iteration.
     ApplyPendingStates();
+    // Drop the previous epoch's number: a loop that mints none must not leak a stale one
+    // into user code through IRuntimeContext.
+    EpochUniqueSeqNo_.reset();
 
     if (TimerStore_) {
         TimerStore_->UpdateWatermarkState(GetWatermarkState());
+    }
+    for (const auto& [sinkId, key, sink] : GetAllSinks()) {
+        sink->UpdateWatermarkState(GetWatermarkState());
     }
     if (InputStore_) {
         InputStore_->AdvanceSystemWatermark(MergeStreamTraverseData(GetValues(GetInputTraverse()), EInflightMerge::None)->SystemWatermark);
@@ -1497,6 +1528,7 @@ void TUniversalComputationBase::Commit(IComputationRunContextPtr context, IRetry
         for (const auto& [sinkId, key, sink] : GetAllSinks()) {
             sink->Sync(transaction);
         }
+        RefreshBufferWarmupState();
         StateManager_->Sync(transaction);
     }
     {
@@ -1506,9 +1538,16 @@ void TUniversalComputationBase::Commit(IComputationRunContextPtr context, IRetry
     {
         TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("PostCommit"));
         ObserveEpochEventLags(TInstant::Now());
+        OutputStore_->Commit();
         context->Commit();
         if (ActiveSource_) {
             ActiveSource_->Commit();
+        }
+        if (TimerStore_) {
+            TimerStore_->Commit();
+        }
+        for (const auto& [_, visitor] : KeyVisitors_) {
+            visitor->Commit();
         }
         for (const auto& [sinkId, key, sink] : GetAllSinks()) {
             sink->Commit();
@@ -1553,13 +1592,34 @@ TUniversalComputationBase::TCheckOutputLimitsResult TUniversalComputationBase::C
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(GetContext()->SerializedInvoker);
 
     NTracing::TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("Accounting"));
+    YT_VERIFY(GetContext()->PartitionBufferState);
 
     std::vector<TBlockedTimeAccountant::TBlockedLimit> blockedLimits;
+
+    if (ActiveSource_) {
+        // The per-stream split of the backlog is unknown, so split the rate
+        // evenly: a stream may get less than its real share, but the side total
+        // the fair-share pool trims against stays equal to the source's rate
+        // instead of N copies of it. Reset to zero when the source cannot
+        // report, otherwise a stale high rate would keep feeding demand.
+        auto backlogRate = ActiveSource_->EstimateBacklogRate();
+        const auto& outputStates = GetContext()->PartitionBufferState->GetOutputStreamLimitUsageStates();
+        const double streamCount = std::max<double>(std::ssize(outputStates), 1.0);
+        for (const auto& [streamId, state] : outputStates) {
+            if (backlogRate) {
+                state->SetOfferedRawRate(
+                    backlogRate->BytesPerSecond / streamCount,
+                    backlogRate->MessagesPerSecond / streamCount);
+            } else {
+                state->SetOfferedRawRate(0, 0);
+            }
+        }
+    }
 
     TCheckOutputLimitsResult result;
     THashSet<TStreamId> allowedOutputStreams(GetSpec()->OutputStreamIds.size());
     const auto outputStoreCountAndByteSize = OutputStore_->GetCountAndByteSizes();
-    const auto streamsAllowedByLimits = GetStreamsWithinLimits(GetContext()->OutputStreamLimitUsageStates);
+    const auto streamsAllowedByLimits = GetStreamsWithinLimits(GetContext()->PartitionBufferState->GetOutputStreamLimitUsageStates());
     for (const auto& streamId : GetSpec()->OutputStreamIds) {
         if (dynamicPartitionSpec && dynamicPartitionSpec->BlockedOutputStreams.contains(streamId)) {
             result.BlockedByController = true;
@@ -1645,7 +1705,20 @@ void TUniversalComputationBase::ValidateTimerStoreLimits(const TDynamicComputati
 ITimeProvider::TGlobalUniqueSeqNo TUniversalComputationBase::GenerateGlobalUniqueSeqNo()
 {
     NTracing::TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("GenerateGlobalUniqueSeqNo"));
-    return WaitFor(GetTimeProvider()->GenerateGlobalUniqueSeqNo()).ValueOrThrow();
+    auto result = WaitFor(GetTimeProvider()->GenerateGlobalUniqueSeqNo()).ValueOrThrow();
+
+    // Publish right where the number is minted, so no epoch loop can forget to.
+    YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(GetContext()->SerializedInvoker);
+    EpochUniqueSeqNo_ = result.UniqueSeqNo;
+
+    return result;
+}
+
+std::optional<TUniqueSeqNo> TUniversalComputationBase::GetEpochUniqueSeqNo() const
+{
+    YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(GetContext()->SerializedInvoker);
+
+    return EpochUniqueSeqNo_;
 }
 
 void TUniversalComputationBase::InitOutputStoreDistribution(const IComputationRunContextPtr& context)
@@ -1684,6 +1757,67 @@ void TUniversalComputationBase::InitOutputStoreDistribution(const IComputationRu
     FinishRunIteration();
 }
 
+void TUniversalComputationBase::InitBufferWarmupState()
+{
+    // Skip the whole warmup path (state-provider creation + its blocking read)
+    // unless the v2 strategy is on, so v1 partitions behave exactly as before.
+    // A job started under v1 therefore has no warmup plumbing until it restarts,
+    // even if v2 is enabled at runtime — it just cold-starts then.
+    if (!GetContext()->PartitionBufferState || !GetContext()->PartitionBufferState->IsWarmupEnabled()) {
+        return;
+    }
+    // A default-constructed instant would open the refresh gate for the very
+    // first commit; the first refresh must wait a full period so the manager
+    // has ticked at least once.
+    LastWarmupRefreshInstant_ = TInstant::Now();
+    // The warmup is a heuristic cache: a corrupt or unreadable state must not
+    // block the partition, it just means a cold start.
+    try {
+        BufferWarmupState_ = WaitFor(StateManager_->CreatePartitionMutableStateProvider(
+            "__buffer_warmup",
+            [] () -> IStateHolderPtr {
+                return New<TYsonSerializableStateHolder<TPartitionBufferWarmup>>();
+            }))
+            .ValueOrThrow();
+        auto holder = BufferWarmupState_->GetState();
+        if (!holder->IsEmpty()) {
+            const auto& warmup = dynamic_cast<TYsonSerializableStateHolder<TPartitionBufferWarmup>&>(*holder).Get();
+            LastWrittenWarmup_ = warmup;
+            GetContext()->PartitionBufferState->SeedWarmup(warmup);
+        }
+    } catch (const std::exception& ex) {
+        YT_LOG_WARNING(ex, "Failed to recover the buffer warmup state; starting cold");
+        BufferWarmupState_ = nullptr;
+    }
+}
+
+void TUniversalComputationBase::RefreshBufferWarmupState()
+{
+    // The v2 check also protects a temporarily disabled strategy: with v2 off the
+    // manager reports an empty warmup, and persisting that would erase the
+    // converged state the next enable wants to seed from.
+    if (!BufferWarmupState_ || !GetContext()->PartitionBufferState->IsWarmupEnabled()) {
+        return;
+    }
+    // The warmup drifts slowly; polling it (under the buffer manager's global
+    // lock) on every commit of a fast job is waste.
+    auto now = TInstant::Now();
+    if (now - LastWarmupRefreshInstant_ < GetContext()->PartitionBufferState->GetWarmupRefreshPeriod()) {
+        return;
+    }
+    LastWarmupRefreshInstant_ = now;
+    // Persist even a collapsed (all-zero) warmup: WarmupDiffers gates cold start
+    // (empty vs empty is no diff), but a stream whose traffic fell to zero must
+    // overwrite its stale-high snapshot so a restart does not seed over-allocation.
+    auto warmup = GetContext()->PartitionBufferState->GetWarmup();
+    if (!WarmupDiffers(LastWrittenWarmup_, warmup)) {
+        return;
+    }
+    auto holder = BufferWarmupState_->GetState();
+    dynamic_cast<TYsonSerializableStateHolder<TPartitionBufferWarmup>&>(*holder).Get() = warmup;
+    LastWrittenWarmup_ = std::move(warmup);
+}
+
 void TUniversalComputationBase::Run(const IComputationRunContextPtr& context)
 {
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(GetContext()->SerializedInvoker);
@@ -1692,6 +1826,7 @@ void TUniversalComputationBase::Run(const IComputationRunContextPtr& context)
     auto initTraceContextGuard = TTraceContextGuard(Tracer_->CreateInitTraceContext());
 
     DoPrepare(context);
+    InitBufferWarmupState();
 
     if (GetPartitionState() == EPartitionState::Executing) {
         DoExecute(context, std::move(initTraceContextGuard));
@@ -1715,7 +1850,7 @@ void TUniversalComputationBase::DoInterrupt(const IComputationRunContextPtr& con
     {
         auto iterGuard = StartRunIteration(context);
         const auto [now, uniqueSeqNo] = GenerateGlobalUniqueSeqNo();
-        isFinished = UpdateStatus(/*reportTime*/ now, /*systemWatermark*/ now, BuildInflights());
+        isFinished = UpdateStatus(/*reportTime*/ now, /*systemWatermark*/ now, BuildInflights(context));
         FinishRunIteration();
     }
 
@@ -1731,7 +1866,7 @@ void TUniversalComputationBase::DoInterrupt(const IComputationRunContextPtr& con
         auto tx = PrepareTransaction(context);
         Commit(context, tx);
 
-        isFinished = UpdateStatus(/*reportTime*/ now, /*systemWatermark*/ now, BuildInflights());
+        isFinished = UpdateStatus(/*reportTime*/ now, /*systemWatermark*/ now, BuildInflights(context));
         FinishRunIteration();
         TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("Distribute.InterruptedPartitionOutputMessages"));
         TDelayedExecutor::WaitForDuration(dynamicSpec->EmptyBatchBackoff);
@@ -1742,10 +1877,44 @@ void TUniversalComputationBase::DoInterrupt(const IComputationRunContextPtr& con
     YT_TLOG_INFO("Completed DoInterrupt");
 }
 
+bool TUniversalComputationBase::HasPersistedKeyedOutput() const
+{
+    return false;
+}
+
 void TUniversalComputationBase::DoComplete(const IComputationRunContextPtr& context, NTracing::TTraceContextGuard&& initTraceContextGuard)
 {
     YT_TLOG_INFO("Started DoComplete");
-    initTraceContextGuard.Release();
+
+    if (HasPersistedKeyedOutput()) {
+        bool isFinished = true;
+        {
+            auto iterGuard = StartRunIteration(context);
+            const auto [now, uniqueSeqNo] = GenerateGlobalUniqueSeqNo();
+            isFinished = UpdateStatus(/*reportTime*/ now, /*systemWatermark*/ now, BuildInflights(context));
+            FinishRunIteration();
+        }
+
+        initTraceContextGuard.Release();
+
+        while (!isFinished) {
+            auto iterGuard = StartRunIteration(context);
+            auto dynamicSpec = GetDynamicSpec();
+
+            const auto [now, uniqueSeqNo] = GenerateGlobalUniqueSeqNo();
+
+            auto tx = PrepareTransaction(context);
+            Commit(context, tx);
+
+            isFinished = UpdateStatus(/*reportTime*/ now, /*systemWatermark*/ now, BuildInflights(context));
+            FinishRunIteration();
+            TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("Distribute.CompletingPartitionOutputMessages"));
+            TDelayedExecutor::WaitForDuration(dynamicSpec->EmptyBatchBackoff);
+        }
+    } else {
+        initTraceContextGuard.Release();
+    }
+
     DoCleanup(context, /*eraseOwnedState*/ true);
     YT_TLOG_INFO("Completed DoComplete");
 }
@@ -1828,13 +1997,16 @@ ISinkPtr TUniversalComputationBase::GetOrCreateSink(const TSinkId& sinkId, const
 
     auto context = New<TSinkContext>();
     static_cast<TComputationContextBase&>(*context) = *GetContext();
+    context->SinkId = sinkId;
     context->Profiler = context->Profiler.WithPrefix("/sink").WithTag("sink_id", sinkId.Underlying());
     context->StatusProfiler = context->StatusProfiler->WithPrefix(Format("/sinks/%v", sinkId));
-    context->Logger = context->Logger.WithTag("SinkId: %v", sinkId.Underlying());
+    context->Logger = context->Logger.WithTag("SinkId", sinkId);
+    context->SinkId = sinkId;
     context->SinkSpec = GetOrCrash(GetSpec()->Sinks, sinkId);
     auto dynamicSinkContext = New<TDynamicSinkContext>();
     dynamicSinkContext->DynamicSinkSpec = GetOrDefault(dynamicSpec->Sinks, sinkId, New<TDynamicSinkSpec>());
     auto sink = TRegistry::Get()->CreateSink(context, dynamicSinkContext);
+    sink->UpdateWatermarkState(GetWatermarkState());
 
     const auto stateName = Format("sinks/%v", sinkId);
     const auto initContext = StateManager_->CreateContext();

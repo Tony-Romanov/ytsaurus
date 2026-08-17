@@ -174,9 +174,9 @@ public:
             TraceGuard_.emplace(transaction->GetTraceContext());
             SequoiaGuard_.emplace(bootstrap, transaction->GetId(), transaction->SequoiaWriteSet());
             MessageTagGuard_.emplace(
-                Format("SequoiaTransactionId: %v, Phase: %v",
-                    transaction->GetId(),
-                    [&] {
+                NLogging::TLoggingTagList()
+                    .With("SequoiaTransactionId", transaction->GetId())
+                    .With("Phase", [&] {
                         auto state = transaction->GetPersistentState();
                         if (state == ETransactionState::Aborted) {
                             return "Abort";
@@ -185,7 +185,7 @@ public:
                         } else {
                             return "Prepare";
                         }
-                    } ()));
+                    }()));
         }
 
         bool needSequoiaRevision = false;
@@ -220,7 +220,7 @@ public:
             if (transaction->GetPersistentState() == ETransactionState::Committed) {
                 YT_ASSERT(timestamp);
                 if (enableSequoiaRevision) {
-                    SequoiaRevisionGuard_.emplace(TSequoiaRevisionCommit{TRevision(*timestamp)});
+                    SequoiaRevisionGuard_.emplace(TSequoiaRevisionCommit{TRevision(timestamp->Underlying())});
                 } else {
                     SequoiaRevisionGuard_.emplace(TSequoiaRevisionDisabled{});
                 }
@@ -240,7 +240,7 @@ public:
                                 modificationType,
                                 *latePrepare);
                         },
-                        TRevision(*timestamp),
+                        TRevision(timestamp->Underlying()),
                     });
                 } else {
                     SequoiaRevisionGuard_.emplace(TSequoiaRevisionDisabled{});
@@ -774,7 +774,7 @@ public:
             THROW_ERROR_EXCEPTION(
                 NTransactionClient::EErrorCode::UploadTransactionCannotHaveNested,
                 "Failed to start a transaction nested in an upload transaction")
-                << TErrorAttribute("upload_transaction_id", parent->GetId());
+                .With("upload_transaction_id", parent->GetId());
         }
     }
 
@@ -791,9 +791,9 @@ public:
             THROW_ERROR_EXCEPTION(
                 NTransactionClient::EErrorCode::ForeignParentTransaction,
                 "Parent transaction is foreign")
-                << TErrorAttribute("parent_transaction_id", parent->GetId())
-                << TErrorAttribute("parent_transaction_cell_tag", CellTagFromId(parent->GetId()))
-                << TErrorAttribute("expected_cell_tag", thisCellTag);
+                .With("parent_transaction_id", parent->GetId())
+                .With("parent_transaction_cell_tag", CellTagFromId(parent->GetId()))
+                .With("expected_cell_tag", thisCellTag);
         }
 
         for (auto prerequisiteTransaction : prerequisiteTransactions) {
@@ -801,9 +801,9 @@ public:
                 THROW_ERROR_EXCEPTION(
                     NTransactionClient::EErrorCode::ForeignPrerequisiteTransaction,
                     "Prerequisite transaction is foreign")
-                    << TErrorAttribute("prerequisite_transaction_id", prerequisiteTransaction->GetId())
-                    << TErrorAttribute("prerequisite_transaction_cell_tag", CellTagFromId(prerequisiteTransaction->GetId()))
-                    << TErrorAttribute("expected_cell_tag", thisCellTag);
+                    .With("prerequisite_transaction_id", prerequisiteTransaction->GetId())
+                    .With("prerequisite_transaction_cell_tag", CellTagFromId(prerequisiteTransaction->GetId()))
+                    .With("expected_cell_tag", thisCellTag);
             }
         }
     }
@@ -874,7 +874,7 @@ public:
                 THROW_ERROR_EXCEPTION(
                     NTransactionClient::EErrorCode::TransactionDepthLimitReached,
                     "Transaction depth limit reached")
-                    << TErrorAttribute("limit", dynamicConfig->MaxTransactionDepth);
+                    .With("limit", dynamicConfig->MaxTransactionDepth);
             }
         }
 
@@ -1166,7 +1166,7 @@ public:
         if (replicateCommitViaHive && !transaction->ReplicatedToCellTags().empty()) {
             NProto::TReqCommitTransaction request;
             ToProto(request.mutable_transaction_id(), transactionId);
-            request.set_commit_timestamp(options.CommitTimestamp);
+            request.set_commit_timestamp(ToProto(options.CommitTimestamp));
             request.set_native_commit_mutation_revision(ToProto(mutationRevision));
             request.set_native_commit_sequoia_revision(ToProto(sequoiaRevision));
             multicellManager->PostToMasters(request, transaction->ReplicatedToCellTags());
@@ -1175,7 +1175,7 @@ public:
         if (!transaction->ExternalizedToCellTags().empty()) {
             NProto::TReqCommitTransaction request;
             ToProto(request.mutable_transaction_id(), MakeExternalizedTransactionId(transactionId, multicellManager->GetCellTag()));
-            request.set_commit_timestamp(options.CommitTimestamp);
+            request.set_commit_timestamp(ToProto(options.CommitTimestamp));
             request.set_native_commit_mutation_revision(ToProto(mutationRevision));
             request.set_native_commit_sequoia_revision(ToProto(sequoiaRevision));
             multicellManager->PostToMasters(request, transaction->ExternalizedToCellTags());
@@ -1916,9 +1916,9 @@ public:
                             NObjectClient::EErrorCode::PrerequisiteCheckFailed,
                             "Prerequisite check failed: lease not found for prerequisite transaction %v",
                             prerequisiteTransactionId)
-                            << TErrorAttribute("prerequisite_transaction_id", prerequisiteTransactionId)
-                            << TErrorAttribute("sequoia_transaction_id", transaction->GetId())
-                            << TErrorAttribute("master_cell_id", Bootstrap_->GetCellId());
+                            .With("prerequisite_transaction_id", prerequisiteTransactionId)
+                            .With("sequoia_transaction_id", transaction->GetId())
+                            .With("master_cell_id", Bootstrap_->GetCellId());
                     }
                 } else {
                     GetAndValidatePrerequisiteTransaction(prerequisiteTransactionId);
@@ -1931,9 +1931,9 @@ public:
             // Attempting to reference an inactive lease results in a generic error that needs wrapping.
             THROW_ERROR_EXCEPTION(NObjectClient::EErrorCode::PrerequisiteCheckFailed,
                 "Prerequisite check failed")
-                << TErrorAttribute("sequoia_transaction_id", transaction->GetId())
-                << TErrorAttribute("master_cell_id", Bootstrap_->GetCellId())
-                << ex;
+                .With("sequoia_transaction_id", transaction->GetId())
+                .With("master_cell_id", Bootstrap_->GetCellId())
+                .With(ex);
         }
 
         TTransactionContextGuard guard(Bootstrap_, transaction, options.PrepareTimestamp, /*latePrepare*/ options.LatePrepare);
@@ -1947,9 +1947,9 @@ public:
                     "Prepare action for Sequoia transaction %v failed on master participant %v",
                     transaction->GetId(),
                     Bootstrap_->GetCellId())
-                    << TErrorAttribute("sequoia_transaction_id", transaction->GetId())
-                    << TErrorAttribute("master_cell_id", Bootstrap_->GetCellId())
-                    << ex;
+                    .With("sequoia_transaction_id", transaction->GetId())
+                    .With("master_cell_id", Bootstrap_->GetCellId())
+                    .With(ex);
             }
         } else {
             RunPrepareTransactionActions(transaction, options);
@@ -2096,7 +2096,7 @@ public:
                     "(SystemTransactionId: %v)",
                     transactionId);
                 THROW_ERROR_EXCEPTION("System transactions cannot be prerequisites for Cypress ones")
-                    << TErrorAttribute("system_transaction_id", transactionId);
+                    .With("system_transaction_id", transactionId);
             } else {
                 onCypressTransaction(transactionId);
             }
@@ -2109,7 +2109,7 @@ public:
                     "(SystemTransactionId: %v)",
                     parentId);
                 THROW_ERROR_EXCEPTION("System transactions cannot be parent for Cypress ones")
-                    << TErrorAttribute("system_transaction_id", parentId);
+                    .With("system_transaction_id", parentId);
             } else {
                 onCypressTransaction(parentId);
             }
@@ -2126,8 +2126,8 @@ public:
             THROW_ERROR_EXCEPTION(
                 "Cypress transaction cannot depend on both mirrored and non-mirrored "
                 "transactions at the same time")
-                << TErrorAttribute("mirrored_transaction_id", mirroredSample)
-                << TErrorAttribute("non_mirrored_transaction_id", nonMirroredSample);
+                .With("mirrored_transaction_id", mirroredSample)
+                .With("non_mirrored_transaction_id", nonMirroredSample);
         }
 
         return nonMirroredSample;
@@ -2169,8 +2169,8 @@ public:
         {
             THROW_ERROR_EXCEPTION(NTransactionClient::EErrorCode::NeedLockDynamicTablesBeforeCommit,
                 "Lock dynamic tables before commit and pass \"dynamic_tables_locked\" flag")
-                << TErrorAttribute("transaction_id", transaction->GetId())
-                << TErrorAttribute("lockable_dynamic_tables", ConvertToYsonString(bulkInsertState.LockableDynamicTables(), EYsonFormat::Text));
+                .With("transaction_id", transaction->GetId())
+                .With("lockable_dynamic_tables", ConvertToYsonString(bulkInsertState.LockableDynamicTables(), EYsonFormat::Text));
         }
     }
 
@@ -2284,9 +2284,9 @@ public:
         bool force2PC = request.force_2pc();
         if (force2PC || !participantCellIds.empty()) {
             THROW_ERROR_EXCEPTION("Cypress transactions cannot be committed via 2PC")
-                << TErrorAttribute("transaction_id", transactionId)
-                << TErrorAttribute("force_2pc", force2PC)
-                << TErrorAttribute("participant_cell_ids", participantCellIds);
+                .With("transaction_id", transactionId)
+                .With("force_2pc", force2PC)
+                .With("participant_cell_ids", participantCellIds);
         }
 
         ThrowIfDynamicTablesNotLocked(transaction, request.dynamic_tables_locked());
@@ -2345,7 +2345,7 @@ public:
     {
         if (!prepareError.IsOK()) {
             auto error = TError("Failed to get ready for transaction commit")
-                << prepareError;
+                .With(prepareError);
             return MakeFuture<TSharedRefArray>(error);
         }
 
@@ -2375,7 +2375,7 @@ public:
     {
         if (!timestampOrError.IsOK()) {
             auto error = TError("Failed to generate commit timestamp")
-                << timestampOrError;
+                .With(timestampOrError);
             return MakeFuture<TSharedRefArray>(TError(timestampOrError));
         }
 
@@ -2855,8 +2855,8 @@ private:
         auto* parent = parentId ? FindTransaction(parentId) : nullptr;
         if (parentId && !parent) {
             THROW_ERROR_EXCEPTION("Failed to start foreign transaction: parent transaction not found")
-                << TErrorAttribute("transaction_id", hintId)
-                << TErrorAttribute("parent_transaction_id", parentId);
+                .With("transaction_id", hintId)
+                .With("parent_transaction_id", parentId);
         }
 
         const auto& securityManager = Bootstrap_->GetSecurityManager();
@@ -2940,7 +2940,7 @@ private:
     void HydraPrepareTransactionCommit(NProto::TReqPrepareTransactionCommit* request)
     {
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
-        auto prepareTimestamp = request->prepare_timestamp();
+        auto prepareTimestamp = FromProto<NTransactionClient::TTimestamp>(request->prepare_timestamp());
         auto identity = NRpc::ParseAuthenticationIdentityFromProto(*request);
         auto expectedPrepareSignature = request->has_expected_prepare_signature()
             ? FromProto<NTransactionClient::TTransactionSignature>(request->expected_prepare_signature())
@@ -2971,7 +2971,7 @@ private:
     void HydraCommitTransaction(NProto::TReqCommitTransaction* request)
     {
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
-        auto commitTimestamp = request->commit_timestamp();
+        auto commitTimestamp = FromProto<NTransactionClient::TTimestamp>(request->commit_timestamp());
         auto nativeCommitMutationRevision = FromProto<NHydra::TRevision>(request->native_commit_mutation_revision());
 
         // COMPAT(kvk1920): SequoiaRevision.
@@ -3028,7 +3028,7 @@ private:
             TTransactionPrepareOptions prepareOptions{
                 .Persistent = true,
                 .LatePrepare = true, // Technically true.
-                .PrepareTimestamp = request->commit_timestamp(),
+                .PrepareTimestamp = FromProto<NTransactionClient::TTimestamp>(request->commit_timestamp()),
                 .PrepareTimestampClusterTag = Bootstrap_->GetPrimaryCellTag(),
                 .PrerequisiteTransactionIds = prerequisiteTransactionIds,
             };
@@ -3055,7 +3055,7 @@ private:
         auto* transaction = GetTransaction(FromProto<TTransactionId>(request->transaction_id()));
 
         TTransactionCommitOptions commitOptions{
-            .CommitTimestamp = request->commit_timestamp(),
+            .CommitTimestamp = FromProto<NTransactionClient::TTimestamp>(request->commit_timestamp()),
             .CommitTimestampClusterTag = Bootstrap_->GetPrimaryCellTag(),
         };
         CommitTransaction(transaction, commitOptions);
@@ -3106,7 +3106,7 @@ private:
             PrepareAndCommitCypressTransaction(
                 transaction,
                 prerequisiteTransactionIds,
-                request->commit_timestamp());
+                FromProto<NTransactionClient::TTimestamp>(request->commit_timestamp()));
         } catch (const std::exception& ex) {
             YT_LOG_DEBUG(ex, "Failed to commit transaction, aborting (TransactionId: %v)",
                 transactionId);
@@ -3365,9 +3365,9 @@ private:
         if (!cellLeaseTransactionIds) {
             THROW_ERROR_EXCEPTION(NRpc::EErrorCode::Unavailable,
                 "Requested to issue leases for missing cell")
-                << TErrorAttribute("transaction_ids", transactionIds)
-                << TErrorAttribute("cell_id", cellId)
-                << TErrorAttribute("cell_type", cellType);
+                .With("transaction_ids", transactionIds)
+                .With("cell_id", cellId)
+                .With("cell_type", cellType);
         }
 
         for (auto transactionId : transactionIds) {
@@ -3377,12 +3377,12 @@ private:
             }
             if (!transaction->IsCypressTransaction()) {
                 THROW_ERROR_EXCEPTION("Leases cannot be issued for non-Cypress transactions")
-                    << TErrorAttribute("transaction_id", transaction->GetId());
+                    .With("transaction_id", transaction->GetId());
             }
             if (transaction->GetTransactionLeasesState() != ETransactionLeasesState::Active) {
                 THROW_ERROR_EXCEPTION("Transaction is revoking leases")
-                    << TErrorAttribute("transaction_id", transaction->GetId())
-                    << TErrorAttribute("transaction_leases_state", transaction->GetTransactionLeasesState());
+                    .With("transaction_id", transaction->GetId())
+                    .With("transaction_leases_state", transaction->GetTransactionLeasesState());
             }
 
             if (RegisterTransactionLease(transaction, cellId, cellLeaseTransactionIds)) {
@@ -3412,9 +3412,9 @@ private:
             for (auto tableId : tableIds) {
                 if (bulkInsertState.HasConflict(tableId)) {
                     THROW_ERROR_EXCEPTION("Duplicate lockable dynamic table")
-                        << TErrorAttribute("transaction_id", transactionId)
-                        << TErrorAttribute("topmost_transaction_id", transaction->GetTopmostTransaction()->GetId())
-                        << TErrorAttribute("table_id", tableId);
+                        .With("transaction_id", transactionId)
+                        .With("topmost_transaction_id", transaction->GetTopmostTransaction()->GetId())
+                        .With("table_id", tableId);
                 }
             }
         }
@@ -3538,9 +3538,9 @@ private:
                     auto* cellLeaseTransactionIds = FindCellLeaseTransactionIds(cellId);
                     if (!cellLeaseTransactionIds) {
                         THROW_ERROR_EXCEPTION("Requested to revoke leases from missing cell")
-                            << TErrorAttribute("transaction_id", transaction->GetId())
-                            << TErrorAttribute("cell_id", cellId)
-                            << TErrorAttribute("cell_type", cellType);
+                            .With("transaction_id", transaction->GetId())
+                            .With("cell_id", cellId)
+                            .With("cell_type", cellType);
                     }
                     UnregisterTransactionLease(transaction, cellId, cellLeaseTransactionIds);
                 }
@@ -4702,8 +4702,8 @@ private:
         THROW_ERROR_EXCEPTION(
             NTransactionClient::EErrorCode::TransactionSuccessorHasLeases,
             "Transaction successor has leases issued")
-            << TErrorAttribute("transaction_id", transaction->GetId())
-            << TErrorAttribute("successor_transaction_lease_count", transaction->GetSuccessorTransactionLeaseCount());
+            .With("transaction_id", transaction->GetId())
+            .With("successor_transaction_lease_count", transaction->GetSuccessorTransactionLeaseCount());
     }
 
     std::unique_ptr<NHydra::TMutation> CreateStartCypressTransactionMutation(
@@ -4742,7 +4742,7 @@ private:
                 "Cannot %v mirrored transaction via TransactionSupervisor.%vTransaction",
                 commit ? "commit" : "abort",
                 commit ? "Commit" : "Abort")
-                << TErrorAttribute("transaction_id", transactionId);
+                .With("transaction_id", transactionId);
         }
     }
 

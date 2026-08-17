@@ -2,10 +2,14 @@
 
 #include "input_buffer.h"
 
+#include <yt/yt/flow/library/cpp/buffers/offered_rate_estimator.h>
+
 #include <yt/yt/flow/library/cpp/common/flow_view.h>
 #include <yt/yt/flow/library/cpp/common/message.h>
 #include <yt/yt/flow/library/cpp/common/message_batcher.h>
 #include <yt/yt/flow/library/cpp/common/spec.h>
+
+#include <yt/yt/flow/library/cpp/misc/counter.h>
 
 #include <yt/yt/core/misc/collection_helpers.h>
 
@@ -82,16 +86,24 @@ public:
         i64 LastRecalculatedLimitBytes = -1;
 
         TMessagesPriorityQueue Messages;
+        i64 ReadyByteSize = 0;
+
+        TSimpleEmaCounter OfferedMessagesRate{};
+        TSimpleEmaCounter OfferedBytesRate{};
 
         NProfiling::TCounter PersistedMessagesCounter;
         NProfiling::TCounter PersistedBytesCounter;
+        TSimpleEmaCounter PersistedMessagesRate{};
+        TSimpleEmaCounter PersistedBytesRate{};
 
         i64 NotPersistedMessageCount = 0;
+        i64 NotPersistedByteSize = 0;
         NProfiling::TGauge NotPersistedMessageGauge;
 
         TStreamUsage Usage;
 
         NFlow::TStreamLimitUsageStatePtr LimitUsageState;
+        NFlow::TOfferedRateEstimatorPtr OfferedRateEstimator = New<NFlow::TOfferedRateEstimator>();
     };
 
 public:
@@ -99,11 +111,14 @@ public:
     TInputBuffer(
         TJobId jobId,
         NFlow::TStreamLimitUsageStateMap streamLimitUsageStates,
+        NFlow::TEpochCycleTrackerPtr epochCycleTracker,
+        THashMap<TStreamId, NFlow::TOfferedRateEstimatorPtr> offeredRateEstimators,
         TComputationSpecPtr computationSpec,
         TComputationId computationId,
         TDynamicComputationSpecPtr dynamicSpec,
         IInvokerPtr finalizerPoolInvoker,
-        NProfiling::TProfiler profiler);
+        NProfiling::TProfiler profiler,
+        std::function<TInstant()> timeProvider);
 
     ~TInputBuffer() noexcept override;
 
@@ -117,6 +132,8 @@ public:
     void AddConnectionOffer(TGuid connectionId, TConnectionOffer offer) override;
     TFuture<THashMap<TStreamId, i64>> GetConnectionLimits(TGuid connectionId) override;
     void MarkPersisted(std::deque<TMessageId> messageIds) override;
+    void MarkDeduplicated(std::deque<TMessageId> messageIds) override;
+    TFuture<THashMap<TStreamId, TInflightMetricsPtr>> GetInflightMetrics() override;
 
     TFuture<std::vector<TInputMessageConstPtr>> GetInputBatch(const THashSet<TStreamId>& allowedStreams) override;
 
@@ -165,6 +182,14 @@ private:
     // Instant until which the next fetch must be delayed after a non-full batch.
     std::atomic<TInstant> NotFullBatchDeadline_ = TInstant::Zero();
 
+    const NFlow::TEpochCycleTrackerPtr EpochCycleTracker_;
+    //! Injected clock for status sampling (tests drive it with mock time); the batch-delay
+    //! scheduling stays on the wall clock, which #TDelayedExecutor requires.
+    const std::function<TInstant()> TimeProvider_;
+    // Drain-cycle sampling: a cycle spans consecutive non-empty batch extractions,
+    // idle waits included (see the rationale in ExtractBatch).
+    std::optional<TInstant> PrevBatchInstant_;
+
     TMessageTransferingInfoPtr MessageTransferingInfo_;
 
     NProfiling::TEventTimer MessageProcessingTimer_;
@@ -178,7 +203,11 @@ private:
         TInstant now);
     void DoAddConnectionOffer(TGuid connectionId, TConnectionOffer offer);
     THashMap<TStreamId, i64> DoGetConnectionLimits(TGuid connectionId);
-    void DoMarkPersisted(std::deque<TMessageId> messageIds, TInstant now);
+    void DoAcknowledge(
+        std::deque<TMessageId> messageIds,
+        bool reportProcessed,
+        TInstant now);
+    THashMap<TStreamId, TInflightMetricsPtr> DoGetInflightMetrics() const;
     TFuture<std::vector<TInputMessageConstPtr>> PublishPendingFetch(THashSet<TStreamId> allowedStreams);
     void FulfillPendingFetch();
     void TryFulfillPendingFetchCheckpoint();

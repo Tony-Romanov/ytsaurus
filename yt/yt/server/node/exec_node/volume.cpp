@@ -192,10 +192,9 @@ TFuture<void> TSimpleTmpfsVolume::Remove()
     const auto& volumePath = Path_;
 
     auto Logger = ExecNodeLogger()
-        .WithTag("VolumeType: %v, VolumeId: %v, VolumePath: %v",
-            volumeType,
-            volumeId,
-            volumePath);
+        .WithTag("VolumeType", volumeType)
+        .WithTag("VolumeId", volumeId)
+        .WithTag("VolumePath", volumePath);
 
     RemoveFuture_ = BIND(
         [
@@ -223,7 +222,7 @@ TFuture<void> TSimpleTmpfsVolume::Remove()
                     "Failed to remove volume");
 
                 THROW_ERROR_EXCEPTION("Failed to remove volume")
-                    << ex;
+                    .With(ex);
             }
         })
         .AsyncVia(Invoker_)

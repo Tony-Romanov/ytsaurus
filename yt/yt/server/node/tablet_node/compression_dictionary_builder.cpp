@@ -101,9 +101,9 @@ public:
         , StoreWeights_(std::move(storeWeights))
         , SemaphoreGuard_(std::move(semaphoreGuard))
         , Logger(TabletNodeLogger()
-            .WithTag("Policy: %v", Policy_)
-            .WithTag("CellId: %v", Slot_->GetCellId())
-            .WithTag("%v", tablet->GetLoggingTag()))
+            .WithTag("Policy", Policy_)
+            .WithTag("CellId", Slot_->GetCellId())
+            .WithTags(tablet->GetLoggingTags()))
     {
         YT_VERIFY(!StoreIds_.empty());
         YT_VERIFY(StoreIds_.size() == StoreWeights_.size());
@@ -121,8 +121,7 @@ public:
                 EMemoryCategory::TabletBackground),
         };
 
-        Logger.AddTag("ReadSessionId: %v",
-            chunkReadOptions.ReadSessionId);
+        Logger.AddTag("ReadSessionId", chunkReadOptions.ReadSessionId);
 
         auto traceContext = TTraceContext::NewRoot("CompressionDictionaryBuilder");
         TTraceContextGuard traceContextGuard(traceContext);
@@ -230,8 +229,8 @@ public:
             failed = true;
 
             auto error = TError(ex)
-                << TErrorAttribute("tablet_id", TabletId_)
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::DictionaryBuilding);
+                .With("tablet_id", TabletId_)
+                .With("background_activity", ETabletBackgroundActivity::DictionaryBuilding);
             tabletSnapshot->TabletRuntimeData->Errors
                 .BackgroundErrors[ETabletBackgroundActivity::DictionaryBuilding].Store(error);
 
@@ -318,8 +317,7 @@ private:
             transactionOptions))
             .ValueOrThrow();
 
-        Logger.AddTag("TransactionId: %v",
-            transaction->GetId());
+        Logger.AddTag("TransactionId", transaction->GetId());
 
         YT_LOG_DEBUG("Compression dictionary building transaction created (TransactionId: %v)",
             transaction->GetId());
@@ -764,9 +762,9 @@ private:
                     storage));
             } catch (const std::exception& ex) {
                 auto error = TError("Trained compression dictionary cannot be digested; skipping it")
-                    << TErrorAttribute("column_id", columnId)
-                    << TErrorAttribute("dictionary_size", columnInfo.Dictionary.Size())
-                    << TError(ex);
+                    .With("column_id", columnId)
+                    .With("dictionary_size", columnInfo.Dictionary.Size())
+                    .With(TError(ex));
                 YT_LOG_ALERT(error);
                 continue;
             }
@@ -1091,7 +1089,7 @@ private:
         YT_LOG_DEBUG_IF(mountConfig->EnableLsmVerboseLogging,
             "Added compression dictionary build request "
             "(%v, Policy: %v, StoreCount: %v)",
-            tablet->GetLoggingTag(),
+            tablet->GetLoggingTags(),
             policy,
             request.StoreIds.size());
     }
@@ -1126,7 +1124,7 @@ private:
 
         YT_LOG_DEBUG("Compression dictionary builder started new task "
             "(%v, Policy: %v, DictionaryRebuildBackoffTime: %v, StoreCount: %v)",
-            tablet->GetLoggingTag(),
+            tablet->GetLoggingTags(),
             request.Policy,
             request.DictionaryRebuildBackoffTime,
             request.StoreIds.size());

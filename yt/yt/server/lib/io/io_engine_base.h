@@ -127,13 +127,12 @@ struct TIOEngineSensors final
     TEnumIndexedArray<EWorkloadCategory, TRequestSensors> WriteSensors;
     TEnumIndexedArray<EWorkloadCategory, TRequestSensors> SyncSensors;
     TEnumIndexedArray<EWorkloadCategory, TRequestSensors> DataSyncSensors;
+    TEnumIndexedArray<EWorkloadCategory, TInflightCounter> InflightReadRequestSensors;
+    TEnumIndexedArray<EWorkloadCategory, TInflightCounter> InflightWriteRequestSensors;
     TRequestSensors IOSubmitSensors;
 
     std::atomic<i64> TotalReadBytesCounter = 0;
     std::atomic<i64> TotalWrittenBytesCounter = 0;
-
-    TEnumIndexedArray<EWorkloadCategory, TInflightCounter> InflightReadRequestSensors;
-    TEnumIndexedArray<EWorkloadCategory, TInflightCounter> InflightWriteRequestSensors;
 
     void RegisterWrittenBytes(i64 count, EWorkloadCategory category);
     void RegisterReadBytes(i64 count, EWorkloadCategory category);
@@ -237,9 +236,19 @@ protected:
     void DoResize(const TResizeRequest& request);
     void AddWriteWaitTimeSample(TDuration duration);
     void AddReadWaitTimeSample(TDuration duration);
+
+    //! Rounds \p size up to a multiple of \p directIoBlockSize.
     TSharedMutableRef AllocateWriteBlob(
         i64 size,
         i64 directIoBlockSize);
+
+    //! Returns \p buffers as-is if they already satisfy the direct IO alignment
+    //! requirements; otherwise copies them into a single blob zero-padded up to
+    //! a multiple of \p directIoBlockSize.
+    std::vector<TSharedRef> PrepareDirectIOWriteBuffers(
+        const std::vector<TSharedRef>& buffers,
+        i64 directIoBlockSize);
+
     TSharedMutableRef AllocateHugeBlob();
     void Reconfigure(const NYTree::INodePtr& node) override;
 
@@ -297,7 +306,7 @@ public:
 private:
     TIntrusivePtr<TIOEngineBase> Engine_;
     EIOEngineRequestType RequestType_;
-    EWorkloadCategory Category_;
+    EWorkloadCategory Category_ = EWorkloadCategory::Idle;
 
     void MoveFrom(TRequestCounterGuard&& other);
 };

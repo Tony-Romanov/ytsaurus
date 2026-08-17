@@ -1,8 +1,10 @@
 #include <yt/yt/core/test_framework/framework.h>
 
 #include <yt/yt/flow/library/cpp/misc/debug_build_warning.h>
+#include <yt/yt/flow/library/cpp/misc/node_address_provider.h>
 #include <yt/yt/flow/library/cpp/misc/node_info.h>
 #include <yt/yt/flow/library/cpp/misc/proto/node_info.pb.h>
+#include <yt/yt/flow/library/cpp/misc/testing/env_guard.h>
 #include <yt/yt/flow/library/cpp/runner/config.h>
 #include <yt/yt/flow/library/cpp/runner/node_info.h>
 
@@ -37,37 +39,30 @@ void ConfigureAddressResolver(const TFlowNodeConfigPtr& config)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-//! RAII helper to set/unset environment variables for vanilla job resolver tests.
-class TEnvGuard
+using NTesting::TEnvGuard;
+
+////////////////////////////////////////////////////////////////////////////////
+
+//! RAII helper to install a node address provider for the duration of a test.
+class TNodeAddressProviderGuard
 {
 public:
-    TEnvGuard(const std::string& name, const std::string& value)
-        : Name_(name)
+    explicit TNodeAddressProviderGuard(TNodeAddressProvider provider)
+        : Old_(GetNodeAddressProvider())
     {
-        const char* old = std::getenv(name.c_str());
-        if (old) {
-            OldValue_ = old;
-            HadOldValue_ = true;
-        }
-        ::setenv(name.c_str(), value.c_str(), /*overwrite*/ 1);
+        SetNodeAddressProvider(std::move(provider));
     }
 
-    ~TEnvGuard()
+    ~TNodeAddressProviderGuard()
     {
-        if (HadOldValue_) {
-            ::setenv(Name_.c_str(), OldValue_.c_str(), /*overwrite*/ 1);
-        } else {
-            ::unsetenv(Name_.c_str());
-        }
+        SetNodeAddressProvider(std::move(Old_));
     }
 
-    TEnvGuard(const TEnvGuard&) = delete;
-    TEnvGuard& operator=(const TEnvGuard&) = delete;
+    TNodeAddressProviderGuard(const TNodeAddressProviderGuard&) = delete;
+    TNodeAddressProviderGuard& operator=(const TNodeAddressProviderGuard&) = delete;
 
 private:
-    std::string Name_;
-    std::string OldValue_;
-    bool HadOldValue_ = false;
+    TNodeAddressProvider Old_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -86,7 +81,7 @@ TEST(TGetNodeInfoTest, DualStackRejected)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "Exactly one of enable_ipv4 or enable_ipv6 must be set");
+        "Exactly one of \"enable_ipv4\" and \"enable_ipv6\" must be set");
 }
 
 TEST(TGetNodeInfoTest, NoStackRejected)
@@ -103,7 +98,7 @@ TEST(TGetNodeInfoTest, NoStackRejected)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "Exactly one of enable_ipv4 or enable_ipv6 must be set");
+        "Exactly one of \"enable_ipv4\" and \"enable_ipv6\" must be set");
 }
 
 TEST(TGetNodeInfoTest, IPv4OnlyWithLocalhostOverride)
@@ -201,7 +196,7 @@ TEST(TGetNodeInfoTest, IPv6ConfigWithIPv4OverrideMismatch)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "not IPv6 address");
+        "non-IPv6 address");
 }
 
 TEST(TGetNodeInfoTest, IPv4ConfigWithIPv6OverrideMismatch)
@@ -221,7 +216,7 @@ TEST(TGetNodeInfoTest, IPv4ConfigWithIPv6OverrideMismatch)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "not IPv4 address");
+        "non-IPv4 address");
 }
 
 TEST(TGetNodeInfoTest, VanillaJobIPv4AddressWithIPv4Config)
@@ -306,7 +301,7 @@ TEST(TGetNodeInfoTest, VanillaJobIPv4AddressWithIPv6ConfigMismatch)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "YT_IP_ADDRESS_DEFAULT is not an IPv6 address");
+        "is not an IPv6 address but \"enable_ipv6\" is set");
 }
 
 TEST(TGetNodeInfoTest, VanillaJobIPv6AddressWithIPv4ConfigMismatch)
@@ -331,7 +326,123 @@ TEST(TGetNodeInfoTest, VanillaJobIPv6AddressWithIPv4ConfigMismatch)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "YT_IP_ADDRESS_DEFAULT is not an IPv4 address");
+        "is not an IPv4 address but \"enable_ipv4\" is set");
+}
+
+TEST(TGetNodeInfoTest, DeployIPFromEnvironmentProvider)
+{
+    TEnvGuard fqdnGuard("DEPLOY_POD_PERSISTENT_FQDN", "pod-1.invalid");
+    TEnvGuard boxGuard("DEPLOY_BOX_ID", "box");
+    TNodeAddressProviderGuard providerGuard([] {
+        return std::optional<std::string>("::1");
+    });
+
+    auto config = MakeConfig(TString(R"({
+        cluster_url = "test-cluster";
+        path = "//home/test";
+        rpc_port = 9999;
+        monitoring_port = 8888;
+        address_resolver = {
+            enable_ipv4 = %false;
+            enable_ipv6 = %true;
+            resolve_hostname_into_fqdn = %false;
+        };
+    })"));
+
+    ConfigureAddressResolver(config);
+
+    // The node IP comes from the provider without DNS; the ssh hint's box IP
+    // resolve attempt fails non-fatally ("box.pod-1.invalid" never resolves,
+    // RFC 6761) and falls back to the box FQDN.
+    auto nodeInfo = GetNodeInfo(config, Logger);
+
+    EXPECT_EQ(nodeInfo->Name, "box.pod-1.invalid");
+    EXPECT_EQ(nodeInfo->RemoteShellCommand, "ssh nobody@box.pod-1.invalid");
+    EXPECT_THAT(nodeInfo->RpcAddress, testing::HasSubstr("::1"));
+    EXPECT_THAT(nodeInfo->RpcAddress, testing::HasSubstr("9999"));
+    EXPECT_THAT(nodeInfo->MonitoringAddress, testing::HasSubstr("::1"));
+    EXPECT_THAT(nodeInfo->MonitoringAddress, testing::HasSubstr("8888"));
+}
+
+TEST(TGetNodeInfoTest, DeployMalformedEnvironmentAddressFallsBackToDns)
+{
+    TEnvGuard fqdnGuard("DEPLOY_POD_PERSISTENT_FQDN", "pod-1.invalid");
+    TEnvGuard boxGuard("DEPLOY_BOX_ID", "box");
+    TNodeAddressProviderGuard providerGuard([] {
+        return std::optional<std::string>("not-an-ip");
+    });
+
+    auto config = MakeConfig(TString(R"({
+        cluster_url = "test-cluster";
+        path = "//home/test";
+        address_resolver = {
+            enable_ipv4 = %false;
+            enable_ipv6 = %true;
+            resolve_hostname_into_fqdn = %false;
+        };
+    })"));
+
+    ConfigureAddressResolver(config);
+
+    // The malformed provider address is ignored and the resolver falls back
+    // to DNS; "box.pod-1.invalid" never resolves (RFC 6761).
+    EXPECT_THROW_WITH_SUBSTRING(
+        GetNodeInfo(config, Logger),
+        "Unable to resolve local address from fqdn");
+}
+
+TEST(TGetNodeInfoTest, DeployWrongStackEnvironmentAddressFallsBackToDns)
+{
+    TEnvGuard fqdnGuard("DEPLOY_POD_PERSISTENT_FQDN", "pod-1.invalid");
+    TEnvGuard boxGuard("DEPLOY_BOX_ID", "box");
+    TNodeAddressProviderGuard providerGuard([] {
+        return std::optional<std::string>("::1");
+    });
+
+    auto config = MakeConfig(TString(R"({
+        cluster_url = "test-cluster";
+        path = "//home/test";
+        address_resolver = {
+            enable_ipv4 = %true;
+            enable_ipv6 = %false;
+            resolve_hostname_into_fqdn = %false;
+        };
+    })"));
+
+    ConfigureAddressResolver(config);
+
+    // The IPv6 provider address does not match the IPv4-only config, so the
+    // resolver falls back to DNS, which never resolves "box.pod-1.invalid".
+    EXPECT_THROW_WITH_SUBSTRING(
+        GetNodeInfo(config, Logger),
+        "Unable to resolve local address from fqdn");
+}
+
+TEST(TGetNodeInfoTest, DeployNonLocalEnvironmentAddressFallsBackToDns)
+{
+    TEnvGuard fqdnGuard("DEPLOY_POD_PERSISTENT_FQDN", "pod-1.invalid");
+    TEnvGuard boxGuard("DEPLOY_BOX_ID", "box");
+    TNodeAddressProviderGuard providerGuard([] {
+        return std::optional<std::string>("2a02:6b8::1:1");
+    });
+
+    auto config = MakeConfig(TString(R"({
+        cluster_url = "test-cluster";
+        path = "//home/test";
+        address_resolver = {
+            enable_ipv4 = %false;
+            enable_ipv6 = %true;
+            resolve_hostname_into_fqdn = %false;
+        };
+    })"));
+
+    ConfigureAddressResolver(config);
+
+    // The provider address is not assigned to any local interface, so the
+    // resolver falls back to DNS, which never resolves "box.pod-1.invalid".
+    EXPECT_THROW_WITH_SUBSTRING(
+        GetNodeInfo(config, Logger),
+        "Unable to resolve local address from fqdn");
 }
 
 TEST(TGetNodeInfoTest, DefaultConfigUsesIPv6)
@@ -356,6 +467,69 @@ TEST(TGetNodeInfoTest, DefaultConfigUsesIPv6)
     EXPECT_THAT(nodeInfo->RpcAddress, testing::HasSubstr("4321"));
 }
 
+TEST(TTryExtractDeploySnapshotIdTest, SnapshotWorkloadStart)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {1, "freezer", {"freezer"}, "/porto%noop-pipeline-snap-worker-57/pod_agent_workload_flow-main_sn_C9CB3595F9_start"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::optional<std::string>("C9CB3595F9"));
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, ClassicWorkloadStart)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {1, "freezer", {"freezer"}, "/porto%noop-pipeline-worker-1/pod_agent_workload_flow-main_start"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::nullopt);
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, CgroupV2SingleLine)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {0, "", {}, "/porto%pod-1/pod_agent_workload_flow-main_sn_ABCDEF_start"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::optional<std::string>("ABCDEF"));
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, LastSnapshotInfixWins)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {1, "freezer", {"freezer"}, "/porto%pod-1/pod_agent_workload_user_sn_123_sn_456_start"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::optional<std::string>("456"));
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, LowercaseIdRejected)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {1, "freezer", {"freezer"}, "/porto%pod-1/pod_agent_workload_flow-main_sn_c9cb_start"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::nullopt);
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, EmptyIdRejected)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {1, "freezer", {"freezer"}, "/porto%pod-1/pod_agent_workload_flow-main_sn__start"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::nullopt);
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, NonStartContainersIgnored)
+{
+    std::vector<TProcessCgroup> cgroups{
+        {1, "freezer", {"freezer"}, "/porto%pod-1/pod_agent_workload_flow-main_sn_C9CB3595F9_readiness"},
+    };
+    EXPECT_EQ(TryExtractDeploySnapshotId(cgroups), std::nullopt);
+}
+
+TEST(TTryExtractDeploySnapshotIdTest, EmptyCgroups)
+{
+    EXPECT_EQ(TryExtractDeploySnapshotId({}), std::nullopt);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 TEST(TGetNodeInfoTest, DefaultConfigRejectsIPv4Address)
 {
     auto config = MakeConfig(TString(R"({
@@ -371,7 +545,7 @@ TEST(TGetNodeInfoTest, DefaultConfigRejectsIPv4Address)
 
     EXPECT_THROW_WITH_SUBSTRING(
         GetNodeInfo(config, Logger),
-        "not IPv6 address");
+        "non-IPv6 address");
 }
 
 ////////////////////////////////////////////////////////////////////////////////

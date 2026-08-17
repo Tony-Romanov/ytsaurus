@@ -101,6 +101,104 @@ constinit const auto Logger = TabletNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
+namespace {
+
+TTabletRedirectionHint BuildRedirectionHint(
+    const NLogging::TLogger& Logger,
+    const ICellDirectoryPtr& cellDirectory,
+    TRevision mountRevision,
+    TRevision siblingMountRevision,
+    TTabletCellId siblingCellId,
+    const NLogging::TLoggingTagList& loggingTags)
+{
+    TTabletRedirectionHint hint;
+    hint.SmoothMovementRedirectionHint.OldMountRevision = mountRevision;
+    hint.SmoothMovementRedirectionHint.NewMountRevision = siblingMountRevision;
+    hint.SmoothMovementRedirectionHint.CellId = siblingCellId;
+
+    if (auto cellDescriptor = cellDirectory->FindDescriptorByCellId(siblingCellId)) {
+        hint.SmoothMovementRedirectionHint.CellDescriptor = ConvertToNode(cellDescriptor);
+    } else {
+        YT_LOG_DEBUG("Sibling servant cell descriptor is missing in cell directory (%v)",
+            loggingTags);
+    }
+
+    return hint;
+}
+
+TError ValidateServantIsActive(
+    const ICellDirectoryPtr& cellDirectory,
+    const TRuntimeSmoothMovementData& smoothMovementData,
+    TTabletId tabletId,
+    TRevision mountRevision,
+    const NLogging::TLoggingTagList& loggingTags,
+    bool waitForActivation = true,
+    std::optional<TDuration> timeout = std::nullopt)
+{
+    if (smoothMovementData.IsActiveServant.load()) {
+        return {};
+    }
+
+    auto error = TError(
+        NTabletClient::EErrorCode::TabletServantIsNotActive,
+        "Tablet servant is not active")
+        .With("tablet_id", tabletId);
+
+    auto siblingCellId = smoothMovementData.SiblingServantCellId.Load();
+    auto siblingMountRevision = smoothMovementData.SiblingServantMountRevision.load();
+
+    if (!siblingCellId || !siblingMountRevision) {
+        // This may happen if movement finishes concurrently with the request.
+        if (smoothMovementData.IsActiveServant.load()) {
+            return {};
+        } else {
+            return error;
+        }
+    }
+
+    if (smoothMovementData.Role.load() == ESmoothMovementRole::Source) {
+        return error
+            .With("redirection_hint", BuildRedirectionHint(
+                Logger(),
+                cellDirectory,
+                mountRevision,
+                siblingMountRevision,
+                siblingCellId,
+                loggingTags));
+    } else if (smoothMovementData.TargetActivationFuture) {
+        if (!waitForActivation) {
+            return error;
+        }
+
+        YT_LOG_DEBUG("Started waiting for target servant activation future (%v)",
+            loggingTags);
+        if (auto activationError = WaitFor(smoothMovementData.TargetActivationFuture.WithTimeout(timeout));
+            !activationError.IsOK())
+        {
+            return activationError;
+        }
+        YT_LOG_DEBUG("Finished waiting for target servant activation future (%v)",
+            loggingTags);
+
+        // NB: Violation of this condition is not critical and will not cause any
+        // anomalies, although it should be examined.
+        YT_LOG_ALERT_UNLESS(
+            smoothMovementData.IsActiveServant.load() || timeout,
+            "Tablet servant is not active after waiting for the servant activation future to complete (%v)",
+                loggingTags);
+    }
+
+    if (!smoothMovementData.IsActiveServant.load()) {
+        return error;
+    }
+
+    return {};
+}
+
+} // namespace
+
+////////////////////////////////////////////////////////////////////////////////
+
 TPreloadStatistics& TPreloadStatistics::operator+=(const TPreloadStatistics& other)
 {
     PendingStoreCount += other.PendingStoreCount;
@@ -138,9 +236,9 @@ void ValidateTabletMounted(TTablet* tablet)
             "Tablet %v is not in %Qlv state",
             tablet->GetId(),
             ETabletState::Mounted)
-            << TErrorAttribute("tablet_id", tablet->GetId())
-            << TErrorAttribute("table_path", tablet->GetTablePath())
-            << TErrorAttribute("is_tablet_unmounted", tablet->GetState() == ETabletState::Unmounted);
+            .With("tablet_id", tablet->GetId())
+            .With("table_path", tablet->GetTablePath())
+            .With("is_tablet_unmounted", tablet->GetState() == ETabletState::Unmounted);
     }
 }
 
@@ -176,11 +274,11 @@ void ValidateTrimmedRowCountPrecedesTimestamp(const TTablet* tablet, i64 trimmed
             trimmedRowCount > storeStartingRowIndex + storeIt->second->GetRowCount())
         {
             THROW_ERROR_EXCEPTION("Could not trim tablet since trimmed row count is greater than current row count")
-                << TErrorAttribute("tablet_id", tablet->GetId())
-                << TErrorAttribute("trimmed_row_count", trimmedRowCount)
-                << TErrorAttribute("timestamp", timestamp)
-                << TErrorAttribute("last_store_starting_row_index", storeStartingRowIndex)
-                << TErrorAttribute("last_store_row_count", storeIt->second->GetRowCount());
+                .With("tablet_id", tablet->GetId())
+                .With("trimmed_row_count", trimmedRowCount)
+                .With("timestamp", timestamp)
+                .With("last_store_starting_row_index", storeStartingRowIndex)
+                .With("last_store_row_count", storeIt->second->GetRowCount());
         }
     }
 
@@ -193,8 +291,8 @@ void ValidateTrimmedRowCountPrecedesTimestamp(const TTablet* tablet, i64 trimmed
             if (trimmedRowCount != storeStartingRowIndex) {
                 THROW_ERROR_EXCEPTION(
                     "Could not fully trim tablet since trimmed row count is greater than current row count")
-                    << TErrorAttribute("trimmed_row_count", trimmedRowCount)
-                    << TErrorAttribute("store_starting_row_index", storeStartingRowIndex);
+                    .With("trimmed_row_count", trimmedRowCount)
+                    .With("store_starting_row_index", storeStartingRowIndex);
             }
 
             // The only remaining store is empty and it's a full trim.
@@ -216,12 +314,12 @@ void ValidateTrimmedRowCountPrecedesTimestamp(const TTablet* tablet, i64 trimmed
         (trimmedRowCount > store->GetStartingRowIndex() && timestamp < store->GetMaxTimestamp()))
     {
         THROW_ERROR_EXCEPTION("Could not trim tablet since some replicas may not be replicated up to this point")
-            << TErrorAttribute("tablet_id", tablet->GetId())
-            << TErrorAttribute("trimmed_row_count", trimmedRowCount)
-            << TErrorAttribute("store_starting_row_index", store->GetStartingRowIndex())
-            << TErrorAttribute("timestamp", timestamp)
-            << TErrorAttribute("store_max_timestamp", store->GetMaxTimestamp())
-            << TErrorAttribute("store_min_timestamp", store->GetMinTimestamp());
+            .With("tablet_id", tablet->GetId())
+            .With("trimmed_row_count", trimmedRowCount)
+            .With("store_starting_row_index", store->GetStartingRowIndex())
+            .With("timestamp", timestamp)
+            .With("store_max_timestamp", store->GetMaxTimestamp())
+            .With("store_min_timestamp", store->GetMinTimestamp());
     }
 }
 
@@ -230,7 +328,7 @@ void ValidateTrimmedRowCountPrecedesTimestamp(const TTablet* tablet, i64 trimmed
 void TRuntimeTableReplicaData::Populate(TTableReplicaStatistics* statistics) const
 {
     statistics->set_committed_replication_row_index(CommittedReplicationRowIndex.load());
-    statistics->set_current_replication_timestamp(CurrentReplicationTimestamp.load());
+    statistics->set_current_replication_timestamp(ToProto(CurrentReplicationTimestamp.load()));
 }
 
 void TRuntimeTableReplicaData::MergeFrom(const TTableReplicaStatistics& statistics)
@@ -238,7 +336,7 @@ void TRuntimeTableReplicaData::MergeFrom(const TTableReplicaStatistics& statisti
     CommittedReplicationRowIndex = statistics.committed_replication_row_index();
     CurrentReplicationRowIndex = CommittedReplicationRowIndex.load();
 
-    CurrentReplicationTimestamp = statistics.current_replication_timestamp();
+    CurrentReplicationTimestamp = FromProto<TTimestamp>(statistics.current_replication_timestamp());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -371,8 +469,8 @@ IDynamicStorePtr TTabletSnapshot::GetDynamicStoreOrThrow(TDynamicStoreId storeId
             NTabletClient::EErrorCode::NoSuchDynamicStore,
             "No such dynamic store %v",
             storeId)
-            << TErrorAttribute("store_id", storeId)
-            << TErrorAttribute("tablet_id", TabletId);
+            .With("store_id", storeId)
+            .With("tablet_id", TabletId);
 
     }
     return dynamicStore;
@@ -402,73 +500,19 @@ void TTabletSnapshot::ValidateMountRevision(NHydra::TRevision mountRevision)
             TabletId,
             MountRevision,
             mountRevision)
-            << TErrorAttribute("tablet_id", TabletId);
+            .With("tablet_id", TabletId);
     }
 }
 
-TError TTabletSnapshot::ValidateServantIsActive(const ICellDirectoryPtr& cellDirectory)
+TError TTabletSnapshot::ValidateServantIsActive(const ICellDirectoryPtr& cellDirectory, bool waitForActivation)
 {
-    const auto& smoothMovementData = TabletRuntimeData->SmoothMovementData;
-
-    if (!smoothMovementData.IsActiveServant.load()) {
-        auto error = TError(
-            NTabletClient::EErrorCode::TabletServantIsNotActive,
-            "Tablet servant is not active")
-            << TErrorAttribute("tablet_id", TabletId);
-
-        auto siblingCellId = smoothMovementData.SiblingServantCellId.Load();
-        auto siblingMountRevision = smoothMovementData.SiblingServantMountRevision.load();
-
-        if (!siblingCellId || !siblingMountRevision) {
-            // This may happen if movement finishes concurrently with the request.
-            if (smoothMovementData.IsActiveServant.load()) {
-                return {};
-            } else {
-                return error;
-            }
-        }
-
-        if (smoothMovementData.Role.load() == ESmoothMovementRole::Source) {
-            TTabletRedirectionHint hint;
-            hint.SmoothMovementRedirectionHint.OldMountRevision = MountRevision;
-            hint.SmoothMovementRedirectionHint.NewMountRevision = siblingMountRevision;
-            hint.SmoothMovementRedirectionHint.CellId = siblingCellId;
-
-            auto cellDescriptor = cellDirectory->FindDescriptorByCellId(siblingCellId);
-            if (cellDescriptor) {
-                hint.SmoothMovementRedirectionHint.CellDescriptor = ConvertToNode(cellDescriptor);
-            } else {
-                YT_LOG_DEBUG("Sibling servant cell descriptor is missing in cell directory (%v)",
-                    LoggingTag);
-            }
-
-            return error
-                << TErrorAttribute("redirection_hint", hint);
-        } else if (smoothMovementData.TargetActivationFuture) {
-            YT_LOG_DEBUG("Started waiting for target servant activation future (%v)",
-                LoggingTag);
-            if (auto activationError = WaitFor(smoothMovementData.TargetActivationFuture);
-                !activationError.IsOK())
-            {
-                return activationError;
-            }
-            YT_LOG_DEBUG("Finished waiting for target servant activation future (%v)",
-                LoggingTag);
-
-            // NB: Violation of this condition is not critical and will not cause any
-            // read anomalies though should be examined.
-            YT_LOG_ALERT_UNLESS(
-                smoothMovementData.IsActiveServant.load(),
-                "Tablet servant is not active after waiting for servant activation future is completed (%v)",
-                    LoggingTag);
-        }
-
-        if (!smoothMovementData.IsActiveServant.load()) {
-            return error;
-        }
-    }
-
-    return {};
+    return ::NYT::NTabletNode::ValidateServantIsActive(
+        cellDirectory,
+        TabletRuntimeData->SmoothMovementData,
+        TabletId,
+        MountRevision,
+        LoggingTags,
+        waitForActivation);
 }
 
 void TTabletSnapshot::MaybeReplyWithReshardRedirectionHint()
@@ -483,8 +527,8 @@ void TTabletSnapshot::MaybeReplyWithReshardRedirectionHint()
     THROW_ERROR_EXCEPTION(
         NTabletClient::EErrorCode::TabletResharded,
         "Tablet was resharded")
-        << TErrorAttribute("tablet_id", TabletId)
-        << TErrorAttribute("redirection_hint", hint);
+        .With("tablet_id", TabletId)
+        .With("redirection_hint", hint);
 }
 
 void TTabletSnapshot::WaitOnLocks(TTimestamp timestamp) const
@@ -779,7 +823,7 @@ void FromProto(TIdGenerator* idGenerator, const NProto::TIdGenerator& protoIdGen
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void TSmoothMovementData::ValidateWriteToTablet(TTabletId tabletId) const
+bool TSmoothMovementData::IsWriteToTabletAllowed() const
 {
     if (Role_ == ESmoothMovementRole::Source) {
         switch (Stage_) {
@@ -787,7 +831,7 @@ void TSmoothMovementData::ValidateWriteToTablet(TTabletId tabletId) const
             case ESmoothMovementStage::TargetAllocated:
             case ESmoothMovementStage::TargetActivated:
             case ESmoothMovementStage::ServantSwitchRequested:
-                return;
+                return true;
 
             default:
                 break;
@@ -795,22 +839,16 @@ void TSmoothMovementData::ValidateWriteToTablet(TTabletId tabletId) const
     } else if (Role_ == ESmoothMovementRole::Target) {
         switch (Stage_) {
             case ESmoothMovementStage::ServantSwitched:
-                return;
+                return true;
 
             default:
                 break;
         }
     } else {
-        return;
+        return true;
     }
 
-    THROW_ERROR_EXCEPTION(
-        NTabletClient::EErrorCode::ReadOnlySmoothMovementStage,
-        "Cannot write into tablet since it is a "
-        "smooth movement %lv in stage %Qlv",
-        Role_,
-        Stage_)
-        << TErrorAttribute("tablet_id", tabletId);
+    return false;
 }
 
 bool TSmoothMovementData::IsTabletStoresUpdateAllowed(bool isCommonFlush) const
@@ -848,6 +886,30 @@ bool TSmoothMovementData::ShouldForwardMutation() const
         }
     } else {
         return false;
+    }
+}
+
+bool TSmoothMovementData::IsInWaitingForLocksStage() const
+{
+    if (Role_ == ESmoothMovementRole::Source) {
+        switch (Stage_) {
+            case ESmoothMovementStage::WaitingForLocksBeforeActivation:
+            case ESmoothMovementStage::WaitingForLocksBeforeSwitch:
+                return true;
+
+            default:
+                return false;
+        }
+    } else {
+        return false;
+    }
+}
+
+void TSmoothMovementData::InitializeLockBarrierFuture()
+{
+    if (IsInWaitingForLocksStage()) {
+        LockBarrierPromise_ = NewPromise<void>();
+        LockBarrierFuture_ = LockBarrierPromise_.ToFuture().ToUncancelable();
     }
 }
 
@@ -898,7 +960,7 @@ TTablet::TTablet(
     , Context_(context)
     , LockManager_(New<TLockManager>())
     , HunkLockManager_(CreateHunkLockManager(this, Context_))
-    , Logger(TabletNodeLogger().WithTag("TabletId: %v", Id_))
+    , Logger(TabletNodeLogger().WithTag("TabletId", Id_))
     , Settings_(TTableSettings::CreateNew())
 {
     LookupHeavyHitters_.RowCount = New<TRowHeavyHitters>(Settings_.MountConfig->LookupHeavyHitters);
@@ -948,7 +1010,7 @@ TTablet::TTablet(
     , IdGenerator_(idGenerator)
     , LockManager_(New<TLockManager>())
     , HunkLockManager_(CreateHunkLockManager(this, Context_))
-    , Logger(TabletNodeLogger().WithTag("TabletId: %v", Id_))
+    , Logger(TabletNodeLogger().WithTag("TabletId", Id_))
     , Settings_(std::move(settings))
     , Eden_(std::make_unique<TPartition>(
         this,
@@ -1346,6 +1408,8 @@ void TTablet::Load(TLoadContext& context)
 
         if (SmoothMovementData_.GetRole() == ESmoothMovementRole::Target) {
             InitializeTargetServantActivationFuture();
+        } else {
+            SmoothMovementData_.InitializeLockBarrierFuture();
         }
     }
 }
@@ -2120,6 +2184,7 @@ void TTablet::StartEpoch(const ITabletSlotPtr& slot)
     TabletWriteManager_->StartEpoch();
 
     InitializeTargetServantActivationFuture();
+    SmoothMovementData().InitializeLockBarrierFuture();
 
     SmoothMovementData().SetLastStageChangeTime(TInstant::Now());
 }
@@ -2150,6 +2215,10 @@ void TTablet::StopEpoch()
     if (auto& promise = SmoothMovementData_.TargetActivationPromise()) {
         promise.TrySet(TError("Tablet epoch canceled"));
     }
+
+    if (auto& promise = SmoothMovementData_.LockBarrierPromise()) {
+        promise.TrySet(TError("Tablet epoch canceled"));
+    }
 }
 
 IInvokerPtr TTablet::GetEpochAutomatonInvoker(EAutomatonThreadQueue queue) const
@@ -2172,7 +2241,7 @@ TTabletSnapshotPtr TTablet::BuildSnapshot(
     }
 
     snapshot->TabletId = Id_;
-    snapshot->LoggingTag = LoggingTag_;
+    snapshot->LoggingTags = LoggingTags_;
     snapshot->MountRevision = MountRevision_;
     snapshot->TablePath = TablePath_;
     snapshot->TableId = TableId_;
@@ -2370,10 +2439,10 @@ void TTablet::Initialize()
         New<TThroughputThrottlerConfig>(),
         Logger);
 
-    LoggingTag_ = Format("TabletId: %v, TableId: %v, TablePath: %v",
-        Id_,
-        TableId_,
-        TablePath_);
+    LoggingTags_ = NLogging::TLoggingTagList()
+        .With("TabletId", Id_)
+        .With("TableId", TableId_)
+        .With("TablePath", TablePath_);
 }
 
 void TTablet::ReconfigureRowCache(const ITabletSlotPtr& slot)
@@ -2570,9 +2639,9 @@ void TTablet::ReconfigureChunkFragmentReader(const ITabletSlotPtr& slot)
     ChunkFragmentReader_ = slot->CreateChunkFragmentReader(this);
 }
 
-const std::string& TTablet::GetLoggingTag() const
+const NLogging::TLoggingTagList& TTablet::GetLoggingTags() const
 {
-    return LoggingTag_;
+    return LoggingTags_;
 }
 
 std::optional<std::string> TTablet::GetPoolTagByMemoryCategory(EMemoryCategory category) const
@@ -2616,8 +2685,52 @@ void TTablet::ValidateMountRevision(NHydra::TRevision mountRevision)
             Id_,
             MountRevision_,
             mountRevision)
-            << TErrorAttribute("tablet_id", Id_);
+            .With("tablet_id", Id_);
     }
+}
+
+TError TTablet::ValidateServantIsWritable(
+    const ICellDirectoryPtr& cellDirectory,
+    bool retryable)
+{
+    const auto& movementData = SmoothMovementData_;
+    if (movementData.IsWriteToTabletAllowed()) {
+        return {};
+    }
+
+    auto role = movementData.GetRole();
+    auto stage = movementData.GetStage();
+
+    auto error = TError(
+        NTabletClient::EErrorCode::ReadOnlySmoothMovementStage,
+        "Cannot write into tablet since it is a "
+        "smooth movement %lv in stage %Qlv",
+        role,
+        stage)
+        .With("tablet_id", Id_);
+
+    bool retryInplace =
+        (role == ESmoothMovementRole::Source && stage == ESmoothMovementStage::WaitingForLocksBeforeActivation) ||
+        (role == ESmoothMovementRole::Target && stage == ESmoothMovementStage::ServantSwitchRequested);
+
+    if (retryInplace) {
+        error <<= TErrorAttribute("retry_inplace", retryInplace);
+        error <<= TErrorAttribute("retryable", retryable);
+    } else if (!retryable) {
+        error <<= TErrorAttribute("retryable", retryable);
+    }
+
+    if (role == ESmoothMovementRole::Source && !retryInplace) {
+        error <<= TErrorAttribute("redirection_hint", BuildRedirectionHint(
+            Logger,
+            cellDirectory,
+            MountRevision_,
+            movementData.GetSiblingMountRevision(),
+            movementData.GetSiblingCellId(),
+            LoggingTags_));
+    }
+
+    return error;
 }
 
 TRevision TTablet::GetActiveServantMountRevision() const
@@ -2776,7 +2889,7 @@ void TTablet::AdvanceTransientConflictHorizonTimestamp(TTimestamp timestamp, std
         YT_LOG_DEBUG("Mount revision mismatch during advancement of the transient conflict horizon timestamp, "
             "skipping update (%v, ExpectedMountRevision: %v, CurrentMountRevision: %v, "
             "CurrentPersistentConflictHorizonTimestamp: %v, CurrentTransientConflictHorizonTimestamp: %v, AdvancingTimestamp: %v)",
-            GetLoggingTag(),
+            GetLoggingTags(),
             *expectedMountRevision,
             MountRevision_,
             PersistentConflictHorizonTimestamp_,
@@ -2793,7 +2906,7 @@ void TTablet::AdvanceTransientConflictHorizonTimestamp(TTimestamp timestamp, std
     YT_LOG_FATAL_IF(timestamp > PersistentConflictHorizonTimestamp_,
         "Advancing TransientConflictHorizonTimestamp would cause it to exceed TransientConflictHorizonTimestamp "
         "(%v, NextTransientConflictHorizonTimestamp: %v, CurrentTransientConflictHorizonTimestamp: %v, PersistentConflictHorizonTimestamp: %v)",
-        GetLoggingTag(),
+        GetLoggingTags(),
         timestamp,
         TransientConflictHorizonTimestamp_,
         PersistentConflictHorizonTimestamp_);
@@ -2839,9 +2952,9 @@ void TTablet::PopulateReplicateTabletContentRequest(NProto::TReqReplicateTabletC
 
     auto* replicatableContent = request->mutable_replicatable_content();
     replicatableContent->set_trimmed_row_count(GetTrimmedRowCount());
-    replicatableContent->set_retained_timestamp(RetainedTimestamp_);
+    replicatableContent->set_retained_timestamp(ToProto(RetainedTimestamp_));
     if (IsPhysicallySorted()) {
-        replicatableContent->set_conflict_horizon_timestamp(PersistentConflictHorizonTimestamp_);
+        replicatableContent->set_conflict_horizon_timestamp(ToProto(PersistentConflictHorizonTimestamp_));
     }
 
     replicatableContent->set_cumulative_data_weight(CumulativeDataWeight_);
@@ -2854,8 +2967,8 @@ void TTablet::PopulateReplicateTabletContentRequest(NProto::TReqReplicateTabletC
             ReservedDynamicStoreIdCount_[reason]);
     }
 
-    request->set_last_commit_timestamp(GetLastCommitTimestamp());
-    request->set_last_write_timestamp(GetLastWriteTimestamp());
+    request->set_last_commit_timestamp(ToProto(GetLastCommitTimestamp()));
+    request->set_last_write_timestamp(ToProto(GetLastWriteTimestamp()));
 
     if (auto replicationProgress = RuntimeData()->ReplicationProgress.Acquire()) {
         ToProto(
@@ -2937,10 +3050,10 @@ void TTablet::LoadReplicatedContent(const NProto::TReqReplicateTabletContent* re
 
     const auto& replicatableContent = request->replicatable_content();
     SetTrimmedRowCount(replicatableContent.trimmed_row_count());
-    RetainedTimestamp_ = replicatableContent.retained_timestamp();
+    RetainedTimestamp_ = FromProto<TTimestamp>(replicatableContent.retained_timestamp());
 
     if (replicatableContent.has_conflict_horizon_timestamp()) {
-        PersistentConflictHorizonTimestamp_ = replicatableContent.conflict_horizon_timestamp();
+        PersistentConflictHorizonTimestamp_ = FromProto<TTimestamp>(replicatableContent.conflict_horizon_timestamp());
         TransientConflictHorizonTimestamp_ = PersistentConflictHorizonTimestamp_;
     }
 
@@ -2965,21 +3078,21 @@ void TTablet::LoadReplicatedContent(const NProto::TReqReplicateTabletContent* re
             YT_LOG_ALERT("Replicated content concains nonzero reserved "
                 "dynamic store count with unknown reason "
                 "(%v, Reason: %v, Count: %v)",
-                GetLoggingTag(),
+                GetLoggingTags(),
                 reason,
                 count);
         }
     }
 
-    RuntimeData_->LastCommitTimestamp = request->last_commit_timestamp();
-    RuntimeData_->LastWriteTimestamp = request->last_write_timestamp();
+    RuntimeData_->LastCommitTimestamp = FromProto<TTimestamp>(request->last_commit_timestamp());
+    RuntimeData_->LastWriteTimestamp = FromProto<TTimestamp>(request->last_write_timestamp());
 
     if (replicatableContent.has_replication_progress()) {
         auto progress = FromProto<TReplicationProgress>(replicatableContent.replication_progress());
         auto replicationCardId = GetReplicationCardId();
 
         YT_LOG_DEBUG("Tablet bound for chaos replication (%v, ReplicationCardId: %v, ReplicationProgress: %v)",
-            GetLoggingTag(),
+            GetLoggingTags(),
             replicationCardId,
             progress);
 
@@ -3011,7 +3124,7 @@ i64 TTablet::Unlock(ETabletLockType lockType)
     YT_LOG_FATAL_IF(TabletLockCount_[lockType] <= 0 || TotalTabletLockCount_ <= 0,
         "Attempted to unlock tablet with nonpositive lock count "
         "(%v, LockType: %lv, TotalTabletLockCount: %v, LockCountPerType: %v)",
-        GetLoggingTag(),
+        GetLoggingTags(),
         lockType,
         TotalTabletLockCount_,
         MakeFormattableView(
@@ -3072,7 +3185,7 @@ void TTablet::PushDynamicStoreIdToPool(
     DynamicStoreIdPool_.push_back(storeId);
 
     YT_LOG_DEBUG("Dynamic store id added to pool (%v, StoreId: %v, Reason: %lv)",
-        LoggingTag_,
+        LoggingTags_,
         storeId,
         reservationReason);
 
@@ -3093,7 +3206,7 @@ void TTablet::ReleaseReservedDynamicStoreId(
     EDynamicStoreIdReservationReason reason)
 {
     YT_LOG_DEBUG("Reserved dynamic store id released from pool (%v, Reason: %lv)",
-        LoggingTag_,
+        LoggingTags_,
         reason);
 
     YT_VERIFY(ReservedDynamicStoreIdCount_[reason] > 0);
@@ -3257,7 +3370,7 @@ void TTablet::RecomputeCommittedReplicationRowIndices()
 void TTablet::CheckedSetBackupStage(EBackupStage previous, EBackupStage next)
 {
     YT_LOG_DEBUG("Tablet backup stage changed (%v, BackupStage: %v -> %v)",
-        GetLoggingTag(),
+        GetLoggingTags(),
         previous,
         next);
     YT_VERIFY(GetBackupStage() == previous);
@@ -3752,6 +3865,55 @@ bool IsInFreezeWorkflow(ETabletState state)
     return
         state >= ETabletState::FreezeFirst &&
         state <= ETabletState::FreezeLast;
+}
+
+void WaitUntilServantIsWritable(
+    TTablet* tablet,
+    const NHiveClient::ICellDirectoryPtr& cellDirectory,
+    TDuration waitForLockBarrierTimeout)
+{
+    const auto& movementData = tablet->SmoothMovementData();
+    YT_VERIFY(!movementData.IsWriteToTabletAllowed());
+
+    // NB: Build the error with the redirection hint before waiting since
+    // the tablet may be destroyed in the meantime.
+    auto error = tablet->ValidateServantIsWritable(cellDirectory, /*retryable*/ true);
+    if (!tablet->SmoothMovementData().IsInWaitingForLocksStage()) {
+        THROW_ERROR(error);
+    }
+
+    auto loggingTags = tablet->GetLoggingTags();
+    auto stage = movementData.GetStage();
+    if (!movementData.LockBarrierFuture()) {
+        YT_LOG_ALERT("Lock barrier future is not initialized on source servant (%v, Stage: %v)",
+            loggingTags,
+            stage);
+        THROW_ERROR(error);
+    }
+
+    if (!movementData.LockBarrierFuture().IsSet()) {
+        YT_LOG_DEBUG("Started waiting for source servant lock barrier future (%v, Timeout: %v)",
+            loggingTags,
+            waitForLockBarrierTimeout);
+
+        // To prevent UAF since the tablet may be destroyed during the wait.
+        tablet = nullptr;
+
+        auto stageChangedError = WaitFor(movementData.LockBarrierFuture()
+            .WithTimeout(waitForLockBarrierTimeout));
+        if (stageChangedError.IsOK()) {
+            YT_LOG_DEBUG("Finished waiting for source servant lock barrier future (%v)",
+                loggingTags);
+            return;
+        }
+
+        YT_LOG_DEBUG(stageChangedError,
+            "Failed to wait for source servant lock barrier future (%v, Timeout: %v)",
+            loggingTags,
+            waitForLockBarrierTimeout);
+    }
+
+    THROW_ERROR(error);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -565,7 +565,7 @@ std::vector<std::string> TOperation::GetJobShellOwners(const std::string& jobShe
 TFuture<void> TOperation::AbortCommonTransactions()
 {
     YT_VERIFY(Transactions_);
-    const auto Logger = SchedulerLogger().WithTag("OperationId: %v", GetId());
+    const auto Logger = SchedulerLogger().WithTag("OperationId", GetId());
     std::vector<TFuture<void>> asyncResults;
     THashSet<ITransactionPtr> abortedTransactions;
     auto scheduleAbort = [&] (const ITransactionPtr& transaction, std::string transactionType) {
@@ -695,7 +695,7 @@ void ParseSpec(
         preprocessedSpec->Spec = ConvertTo<TOperationSpecBasePtr>(specNode);
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION("Error parsing operation spec")
-            << ex;
+            .With(ex);
     }
 
     if (operationType == EOperationType::Vanilla) {
@@ -740,7 +740,7 @@ IMapNodePtr ConvertSpecStringToNode(
         specNode = ConvertToNode(specString, treeSizeLimit)->AsMap();
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION("Error parsing operation spec string")
-            << ex;
+            .With(ex);
     }
 
     return specNode;
@@ -755,7 +755,7 @@ TBriefVanillaTaskSpecMap GetBriefVanillaTaskSpecs(const IMapNodePtr& specNode)
         vanillaOperationSpec = ConvertTo<TVanillaOperationSpecPtr>(specNode);
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION("Error parsing vanilla operation spec")
-            << ex;
+            .With(ex);
     }
 
     THashMap<std::string, TBriefVanillaTaskSpec> briefVanillaTaskSpecs;

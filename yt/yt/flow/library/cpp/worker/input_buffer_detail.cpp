@@ -1,5 +1,8 @@
 #include "input_buffer_detail.h"
 
+#include <yt/yt/flow/library/cpp/buffers/epoch_cycle_tracker.h>
+#include <yt/yt/flow/library/cpp/buffers/offered_rate_estimator.h>
+
 #include <yt/yt/flow/library/cpp/misc/prefetch.h>
 
 #include <yt/yt/core/concurrency/delayed_executor.h>
@@ -151,11 +154,14 @@ void TInputBuffer::TConnectionState::Acquire(i64 inflatedSize)
 TInputBuffer::TInputBuffer(
     TJobId jobId,
     NFlow::TStreamLimitUsageStateMap streamLimitUsageStates,
+    NFlow::TEpochCycleTrackerPtr epochCycleTracker,
+    THashMap<TStreamId, NFlow::TOfferedRateEstimatorPtr> offeredRateEstimators,
     TComputationSpecPtr computationSpec,
     TComputationId computationId,
     TDynamicComputationSpecPtr dynamicSpec,
     IInvokerPtr finalizerPoolInvoker,
-    NProfiling::TProfiler profiler)
+    NProfiling::TProfiler profiler,
+    std::function<TInstant()> timeProvider)
     : JobId_(jobId)
     , OrderingSpec_(computationSpec->InputOrdering)
     , ComputationId_(std::move(computationId))
@@ -163,19 +169,31 @@ TInputBuffer::TInputBuffer(
     , SerializedInvoker_(CreateSerializedInvoker(finalizerPoolInvoker, "InputBuffer"))
     , BatchLimiter_(dynamicSpec->MaxRowsPerBatch, dynamicSpec->MaxBytesPerBatch)
     , BatchDuration_(dynamicSpec->BatchDuration)
+    , EpochCycleTracker_(std::move(epochCycleTracker))
+    , TimeProvider_(std::move(timeProvider))
     , MessageProcessingTimer_(profiler.Timer("/message_processing_time"))
 {
+    const auto now = TimeProvider_();
     for (const auto& streamId : computationSpec->InputStreamIds) {
         auto streamProfiler = profiler
             .WithPrefix("/input_streams")
             .WithTag("stream_id", streamId.Underlying());
         auto& streamState = StreamStates_[streamId];
+        streamState.OfferedMessagesRate.Update(0, now);
+        streamState.OfferedBytesRate.Update(0, now);
+        streamState.PersistedMessagesRate.Update(0, now);
+        streamState.PersistedBytesRate.Update(0, now);
         streamState.PersistedMessagesCounter = streamProfiler.Counter("/persisted_count");
         streamState.PersistedBytesCounter = streamProfiler.Counter("/persisted_bytes");
         streamState.NotPersistedMessageGauge = streamProfiler.Gauge("/input_buffer_not_persisted_message_count");
         auto it = streamLimitUsageStates.find(streamId);
         YT_VERIFY(it != streamLimitUsageStates.end());
         streamState.LimitUsageState = std::move(it->second);
+        if (auto estimatorIt = offeredRateEstimators.find(streamId);
+            estimatorIt != offeredRateEstimators.end() && estimatorIt->second)
+        {
+            streamState.OfferedRateEstimator = std::move(estimatorIt->second);
+        }
     }
 }
 
@@ -217,7 +235,7 @@ TFuture<std::vector<EMessageDeliveryState>> TInputBuffer::AddMessages(
     std::vector<TInputMessageConstPtr> messages,
     TOnProcessedCallback onProcessed)
 {
-    auto now = TInstant::Now();
+    auto now = TimeProvider_();
     return BIND(&TInputBuffer::DoAddMessages, MakeStrong(this), connectionId, Passed(std::move(messages)), Passed(std::move(onProcessed)), now)
         .AsyncVia(SerializedInvoker_)
         .Run();
@@ -233,6 +251,16 @@ std::vector<EMessageDeliveryState> TInputBuffer::DoAddMessages(
     std::vector<EMessageDeliveryState> deliveryStates;
     deliveryStates.reserve(messages.size());
     THashSet<TStreamId> congestionDeclinedStreams;
+
+    struct TAcceptedStreamCounters
+    {
+        i64 InflatedBytes = 0;
+        i64 MaxAlignmentTimestamp = 0;
+        i64 OfferedCount = 0;
+        i64 OfferedBytes = 0;
+    };
+
+    THashMap<TStreamId, TAcceptedStreamCounters> acceptedByStream;
 
     MakePrefetcher()
         .Add([] (const TInputMessageConstPtr& message) {
@@ -271,6 +299,12 @@ std::vector<EMessageDeliveryState> TInputBuffer::DoAddMessages(
             streamState.Usage.CumulativeByteIn += message->ByteSize;
             ++streamState.Usage.CumulativeCountIn;
 
+            auto& accepted = acceptedByStream[message->StreamId];
+            accepted.InflatedBytes += InflatedByteSize(message->ByteSize);
+            accepted.MaxAlignmentTimestamp = std::max<i64>(
+                accepted.MaxAlignmentTimestamp,
+                message->AlignmentTimestamp.Underlying());
+
             messageStateIt = EmplaceOrCrash(
                 MessageStatesMap_,
                 message->MessageId,
@@ -287,14 +321,27 @@ std::vector<EMessageDeliveryState> TInputBuffer::DoAddMessages(
                 .SeqNo = NextSeqNo_++,
                 .Message = std::move(message),
             });
+            ++accepted.OfferedCount;
+            accepted.OfferedBytes += messageStateIt->second.ByteSize;
+            streamState.ReadyByteSize += messageStateIt->second.ByteSize;
 
             ++streamState.NotPersistedMessageCount;
+            streamState.NotPersistedByteSize += messageStateIt->second.ByteSize;
             streamState.NotPersistedMessageGauge.Update(streamState.NotPersistedMessageCount);
 
             deliveryStates.push_back(EMessageDeliveryState::Accepted);
         });
 
     YT_VERIFY(deliveryStates.size() == messages.size());
+
+    for (const auto& [streamId, accepted] : acceptedByStream) {
+        auto& streamState = GetOrCrash(StreamStates_, streamId);
+        streamState.OfferedRateEstimator->RecordAccepted(
+            accepted.InflatedBytes,
+            accepted.MaxAlignmentTimestamp);
+        streamState.OfferedMessagesRate.Inc(accepted.OfferedCount, now);
+        streamState.OfferedBytesRate.Inc(accepted.OfferedBytes, now);
+    }
 
     FulfillPendingFetch();
 
@@ -365,9 +412,26 @@ THashMap<TStreamId, i64> TInputBuffer::DoGetConnectionLimits(TGuid connectionId)
 
 void TInputBuffer::MarkPersisted(std::deque<TMessageId> messageIds)
 {
-    auto now = TInstant::Now();
+    auto now = TimeProvider_();
     SerializedInvoker_->Invoke(
-        BIND(&TInputBuffer::DoMarkPersisted, MakeStrong(this), Passed(std::move(messageIds)), now));
+        BIND(
+            &TInputBuffer::DoAcknowledge,
+            MakeStrong(this),
+            Passed(std::move(messageIds)),
+            /*reportProcessed*/ true,
+            now));
+}
+
+void TInputBuffer::MarkDeduplicated(std::deque<TMessageId> messageIds)
+{
+    auto now = TimeProvider_();
+    SerializedInvoker_->Invoke(
+        BIND(
+            &TInputBuffer::DoAcknowledge,
+            MakeStrong(this),
+            Passed(std::move(messageIds)),
+            /*reportProcessed*/ false,
+            now));
 }
 
 namespace {
@@ -382,7 +446,10 @@ struct TOnProcessedCallbackHash
 
 } // namespace
 
-void TInputBuffer::DoMarkPersisted(std::deque<TMessageId> messageIds, TInstant now)
+void TInputBuffer::DoAcknowledge(
+    std::deque<TMessageId> messageIds,
+    bool reportProcessed,
+    TInstant now)
 {
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(SerializedInvoker_);
     absl::flat_hash_map<
@@ -406,13 +473,17 @@ void TInputBuffer::DoMarkPersisted(std::deque<TMessageId> messageIds, TInstant n
             for (auto& callback : messageState.Subscribers) {
                 messageIdsByCallback.try_emplace(std::move(callback)).first->second.push_back(messageId);
             }
-            MessageProcessingTimer_.Record(now - messageState.RegisterTime);
-
             auto& streamState = GetOrCrash(StreamStates_, messageState.StreamId);
-            streamState.PersistedMessagesCounter.Increment(1);
-            streamState.PersistedBytesCounter.Increment(messageState.ByteSize);
+            if (reportProcessed) {
+                MessageProcessingTimer_.Record(now - messageState.RegisterTime);
+                streamState.PersistedMessagesCounter.Increment(1);
+                streamState.PersistedBytesCounter.Increment(messageState.ByteSize);
+                streamState.PersistedMessagesRate.Inc(1, now);
+                streamState.PersistedBytesRate.Inc(messageState.ByteSize, now);
+            }
 
             --streamState.NotPersistedMessageCount;
+            streamState.NotPersistedByteSize -= messageState.ByteSize;
             streamState.NotPersistedMessageGauge.Update(streamState.NotPersistedMessageCount);
 
             MessageStatesMap_.erase(it);
@@ -423,6 +494,35 @@ void TInputBuffer::DoMarkPersisted(std::deque<TMessageId> messageIds, TInstant n
             callback(jobId, std::move(callbackMessageIds));
         }
     }));
+}
+
+TFuture<THashMap<TStreamId, TInflightMetricsPtr>> TInputBuffer::GetInflightMetrics()
+{
+    return BIND(&TInputBuffer::DoGetInflightMetrics, MakeStrong(this))
+        .AsyncVia(SerializedInvoker_)
+        .Run();
+}
+
+THashMap<TStreamId, TInflightMetricsPtr> TInputBuffer::DoGetInflightMetrics() const
+{
+    YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(SerializedInvoker_);
+
+    const auto now = TimeProvider_();
+    THashMap<TStreamId, TInflightMetricsPtr> result;
+    for (const auto& [streamId, streamState] : StreamStates_) {
+        auto metrics = New<TInflightMetrics>();
+        metrics->Count = streamState.NotPersistedMessageCount;
+        metrics->ByteSize = streamState.NotPersistedByteSize;
+        metrics->ReadyCount = std::ssize(streamState.Messages);
+        metrics->ReadyByteSize = streamState.ReadyByteSize;
+        metrics->OfferedCountPerSec = streamState.OfferedMessagesRate.GetRate(now);
+        metrics->OfferedBytesPerSec = streamState.OfferedBytesRate.GetRate(now);
+
+        metrics->ProcessedCountPerSec = streamState.PersistedMessagesRate.GetRate(now);
+        metrics->ProcessedBytesPerSec = streamState.PersistedBytesRate.GetRate(now);
+        result.emplace(streamId, std::move(metrics));
+    }
+    return result;
 }
 
 double TInputBuffer::ComputeStreamBias(TStreamId streamId, const TInputMessageConstPtr& frontMessage) const
@@ -520,6 +620,7 @@ std::vector<TInputMessageConstPtr> TInputBuffer::ExtractBatch(const THashSet<TSt
             auto& streamState = GetOrCrash(StreamStates_, orderedMessage.Message->StreamId);
             streamState.Usage.CumulativeByteOut += orderedMessage.Message->ByteSize;
             ++streamState.Usage.CumulativeCountOut;
+            streamState.ReadyByteSize -= orderedMessage.Message->ByteSize;
             batch.push_back(std::move(orderedMessage.Message));
         });
 
@@ -540,12 +641,40 @@ std::vector<TInputMessageConstPtr> TInputBuffer::ExtractBatch(const THashSet<TSt
         streamState.LimitUsageState->Update(streamState.Usage);
     }
 
+    if (!batch.empty()) {
+        // The epoch estimate only raises the BDP floor (gain_epochs × demand ×
+        // epoch), boxed below by the used peak and above by max_duration, so its
+        // precision does not matter: record every inter-extraction interval,
+        // including an idle wait, rather than gate on leftover backlog. The gate
+        // used to silence latency-bound jobs that drain their whole buffer.
+        auto extractionInstant = TimeProvider_();
+        if (EpochCycleTracker_ && PrevBatchInstant_) {
+            EpochCycleTracker_->RecordCycle(extractionInstant - *PrevBatchInstant_);
+        }
+        PrevBatchInstant_ = extractionInstant;
+    }
+
     return batch;
 }
 
 void TInputBuffer::RecalculateStreamLimits(TStreamState& streamState, bool collectStaleConnections)
 {
     using THeapElement = std::pair<TConnectionState*, i64>; // (it, currentBucketIndex).
+
+    // The announced backlog plus the accepted history estimate the producer's
+    // rate over its own alignment timestamps — an instant demand signal
+    // independent of both the issued limit (a limit-based measurement can never
+    // see demand above the limit) and the processing clock.
+    {
+        TCompactVector<std::pair<i64, i64>, 16> pendingBuckets;
+        for (const auto& [connectionId, connectionState] : streamState.ConnectionStates) {
+            for (const auto& [minOrderTimestamp, inflatedByteSize] : connectionState.Offer) {
+                pendingBuckets.emplace_back(minOrderTimestamp.Underlying(), inflatedByteSize);
+            }
+        }
+        streamState.LimitUsageState->SetOfferedInflatedBytesPerSecond(
+            streamState.OfferedRateEstimator->EstimateRate(pendingBuckets));
+    }
 
     constexpr i64 lastEpochStoreCount = 5; // TODO: something better? Configurable?
 

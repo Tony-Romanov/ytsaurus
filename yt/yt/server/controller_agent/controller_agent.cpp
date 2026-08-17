@@ -1088,7 +1088,7 @@ public:
                 alert = TError(
                     "Limit of monitored user jobs per controller agent reached, "
                     "some jobs may be not monitored")
-                    << TErrorAttribute(
+                    .With(
                         "limit_per_controller_agent",
                         Config_->UserJobMonitoring->MaxMonitoredUserJobsPerAgent);
             }
@@ -1108,7 +1108,7 @@ public:
                 alert = TError(
                     "Limit of monitored user gangs jobs per controller agent reached, "
                     "some jobs may be not monitored")
-                    << TErrorAttribute(
+                    .With(
                         "limit_per_controller_agent",
                         Config_->UserJobMonitoring->MaxMonitoredGangsJobsPerAgent);
             }
@@ -1448,42 +1448,42 @@ private:
             IncarnationId_);
 
         OperationEventsOutbox_ = New<TMessageQueueOutbox<TAgentToSchedulerOperationEvent>>(
-            ControllerAgentLogger().WithTag(
-                "Kind: AgentToSchedulerOperations, IncarnationId: %v",
-                IncarnationId_),
+            ControllerAgentLogger()
+                .WithTag("Kind", "AgentToSchedulerOperations")
+                .WithTag("IncarnationId", IncarnationId_),
             ControllerAgentProfiler().WithTag("queue", "operation_events"),
             CancelableControlInvoker_);
         ScheduleAllocationResponsesOutbox_ = New<TMessageQueueOutbox<TAgentToSchedulerScheduleAllocationResponse>>(
-            ControllerAgentLogger().WithTag(
-                "Kind: AgentToSchedulerScheduleAllocationResponses, IncarnationId: %v",
-                IncarnationId_),
+            ControllerAgentLogger()
+                .WithTag("Kind", "AgentToSchedulerScheduleAllocationResponses")
+                .WithTag("IncarnationId", IncarnationId_),
             ControllerAgentProfiler().WithTag("queue", "schedule_job_responses"),
             Bootstrap_->GetControlInvoker(),
             /*supportTracing*/ true);
 
         RunningAllocationStatisticsUpdatesOutbox_ = New<TMessageQueueOutbox<TAgentToSchedulerRunningAllocationStatistics>>(
-            ControllerAgentLogger().WithTag(
-                "Kind: AgentToSchedulerRunningAllocationStatistics, IncarnationId: %v",
-                IncarnationId_),
+            ControllerAgentLogger()
+                .WithTag("Kind", "AgentToSchedulerRunningAllocationStatistics")
+                .WithTag("IncarnationId", IncarnationId_),
             ControllerAgentProfiler().WithTag("queue", "running_allocation_statistics"),
             Bootstrap_->GetControlInvoker());
 
         AllocationEventsInbox_ = std::make_shared<TMessageQueueInbox>(
-            ControllerAgentLogger().WithTag(
-                "Kind: SchedulerToAgentAllocationEvents, IncarnationId: %v",
-                IncarnationId_),
+            ControllerAgentLogger()
+                .WithTag("Kind", "SchedulerToAgentAllocationEvents")
+                .WithTag("IncarnationId", IncarnationId_),
             ControllerAgentProfiler().WithTag("queue", "job_events"),
             JobEventsInvoker_);
         OperationEventsInbox_ = std::make_unique<TMessageQueueInbox>(
-            ControllerAgentLogger().WithTag(
-                "Kind: SchedulerToAgentOperations, IncarnationId: %v",
-                IncarnationId_),
+            ControllerAgentLogger()
+                .WithTag("Kind", "SchedulerToAgentOperations")
+                .WithTag("IncarnationId", IncarnationId_),
             ControllerAgentProfiler().WithTag("queue", "operation_events"),
             CancelableControlInvoker_);
         ScheduleAllocationRequestsInbox_ = std::make_unique<TMessageQueueInbox>(
-            ControllerAgentLogger().WithTag(
-                "Kind: SchedulerToAgentScheduleAllocationRequests, IncarnationId: %v",
-                IncarnationId_),
+            ControllerAgentLogger()
+                .WithTag("Kind", "SchedulerToAgentScheduleAllocationRequests")
+                .WithTag("IncarnationId", IncarnationId_),
             ControllerAgentProfiler().WithTag("queue", "schedule_job_requests"),
             Bootstrap_->GetControlInvoker());
 

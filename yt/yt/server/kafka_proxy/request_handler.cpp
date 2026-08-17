@@ -92,6 +92,11 @@ static const std::string PlainSaslMechanism = "PLAIN";
 
 struct TMethodCounters
 {
+    TCounter RequestCount;
+    TCounter FailedRequestCount;
+    TEventTimer RequestTime;
+    TEnumIndexedArray<NKafka::EErrorCode, TCounter> ErrorCodeToCounter;
+
     TMethodCounters() = default;
 
     explicit TMethodCounters(const TProfiler& profiler)
@@ -122,11 +127,6 @@ struct TMethodCounters
             ErrorCodeToCounter[code].Increment();
         }
     }
-
-    TCounter RequestCount;
-    TCounter FailedRequestCount;
-    TEventTimer RequestTime;
-    TEnumIndexedArray<NKafka::EErrorCode, TCounter> ErrorCodeToCounter;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -192,7 +192,7 @@ public:
             auto response = DoSaslAuthenticate(
                 connectionState,
                 TReqSaslAuthenticate{.AuthBytes = request.ToString()},
-                Logger.WithTag("RequestType: %v", ERequestType::SaslAuthenticate));
+                Logger.WithTag("RequestType", ERequestType::SaslAuthenticate));
 
             if (!response.ErrorMessage) {
                 response.ErrorMessage = "Authentication failed";
@@ -317,9 +317,9 @@ private:
             typedRequest.Deserialize(requestReader, requestHeader.ApiVersion);
 
             auto Logger = logger
-                .WithTag("RequestType: %v", typedRequest.RequestType)
-                .WithTag("CorrelationId: %v", requestHeader.CorrelationId)
-                .WithTag("ClientId: %v", requestHeader.ClientId);
+                .WithTag("RequestType", typedRequest.RequestType)
+                .WithTag("CorrelationId", requestHeader.CorrelationId)
+                .WithTag("ClientId", requestHeader.ClientId);
 
             metrics.OnStart();
             TWallTimer timer;
@@ -469,17 +469,6 @@ private:
                 .MinVersion = 2,
                 .MaxVersion = 4,
             },
-            // TODO(nadya73): Support it later.
-            // TRspApiKey{
-            //     .ApiKey = static_cast<int>(ERequestType::UpdateMetadata),
-            //     .MinVersion = 0,
-            //     .MaxVersion = 0,
-            // },
-            // TRspApiKey{
-            //     .ApiKey = static_cast<int>(ERequestType::DescribeGroups),
-            //     .MinVersion = 0,
-            //     .MaxVersion = 0,
-            // },
         };
 
         return response;
@@ -575,7 +564,7 @@ private:
         auto authResultOrError = WaitFor(authenticator->Authenticate(TTokenCredentials{.Token = std::move(token)}));
         if (!authResultOrError.IsOK()) {
             auto error = TError("Failed to authenticate user")
-                << authResultOrError;
+                .With(authResultOrError);
             YT_LOG_DEBUG(error);
             fillError(ToString(error));
             return response;
@@ -806,6 +795,7 @@ private:
         auto fillResponse = [&](NKafka::EErrorCode errorCode = NKafka::EErrorCode::UnknownServerError) {
             for (const auto& topic : request.Topics) {
                 auto& topicResponse = response.Topics.emplace_back();
+                topicResponse.Name = topic.Name;
                 topicResponse.Partitions.reserve(topic.Partitions.size());
                 for (const auto& partition : topic.Partitions) {
                     auto& partitionResponse = topicResponse.Partitions.emplace_back();
@@ -845,7 +835,6 @@ private:
                     } else {
                         fillResponse();
                     }
-                    fillResponse();
                     return response;
                 }
             }

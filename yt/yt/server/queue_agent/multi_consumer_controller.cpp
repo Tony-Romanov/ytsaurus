@@ -1,11 +1,11 @@
 #include "multi_consumer_controller.h"
 
-#include "snapshot.h"
 #include "config.h"
 #include "helpers.h"
-#include "pass_profiler.h"
 #include "multi_consumer_profile_manager.h"
 #include "object.h"
+#include "pass_profiler.h"
+#include "snapshot.h"
 #include "snapshot_representation.h"
 
 #include <yt/yt/server/lib/alert_manager/alert_manager.h>
@@ -65,13 +65,15 @@ public:
         const TQueueControllerDynamicConfigPtr& dynamicConfig,
         const TProfiler& profiler,
         TQueueAgentClientDirectoryPtr clientDirectory,
+        const IObjectStore* store,
         IInvokerPtr invoker,
         TMultiConsumerNameTablePtr multiConsumerTable)
         : Path_(row->Path)
         , MultiConsumerTable_(std::move(multiConsumerTable))
         , ClientDirectory_(std::move(clientDirectory))
+        , ObjectStore_(store)
         , Invoker_(std::move(invoker))
-        , Logger(MultiConsumerControllerLogger().WithTag("MultiConsumer: %v", Path_))
+        , Logger(MultiConsumerControllerLogger().WithTag("MultiConsumer", Path_))
         , PassExecutor_(New<TPeriodicExecutor>(
             Invoker_,
             BIND(&TMultiConsumerController::Pass, MakeWeak(this)),
@@ -171,13 +173,19 @@ public:
         YT_LOG_DEBUG("Building multi consumer controller orchid (PassIndex: %v, TotalConsumersCount: %v)",
             snapshot->PassIndex, snapshot->QueueConsumerNames.size());
 
+        auto consumerOrchids = GetConsumerOrchids(snapshot->QueueConsumerNames);
+
         BuildYsonFluently(consumer)
             .BeginMap()
                 .Item("pass_index").Value(snapshot->PassIndex)
                 .Item("pass_instant").Value(snapshot->PassInstant)
                 .Item("row").Value(snapshot->Row)
                 .Item("replicated_table_mapping_row").Value(snapshot->ReplicatedTableMappingRow)
-                .Item("status").Do(std::bind_front(BuildMultiConsumerStatusYson, snapshot, AlertManager_.Acquire()))
+                .Item("status").Do(std::bind_front(BuildMultiConsumerStatusYson, snapshot, consumerOrchids, AlertManager_.Acquire()))
+                .Item("partitions")
+                    .BeginMap()
+                        .Item("consumers").DoMapFor(consumerOrchids, std::bind_front(BuildChildOrErrorYson, "partitions"))
+                    .EndMap()
             .EndMap();
     }
 
@@ -191,6 +199,7 @@ private:
 
     const TMultiConsumerNameTablePtr MultiConsumerTable_;
     const TQueueAgentClientDirectoryPtr ClientDirectory_;
+    const IObjectStore* const ObjectStore_;
     const IInvokerPtr Invoker_;
 
     using TMultiConsumerSnapshotAtomicPtr = TAtomicIntrusivePtr<TMultiConsumerSnapshot>;
@@ -253,7 +262,7 @@ private:
 
         if (auto error = WaitFor(AllSucceeded(std::vector{snapshotFuture.AsVoid(), consumerNamesInStateFuture.AsVoid()})); !error.IsOK()) {
             THROW_ERROR_EXCEPTION("Failed to build snapshot or fetch consumer names in state")
-                << error;
+                .With(error);
         }
         auto snapshot = snapshotFuture.GetOrCrash().Value();
         Snapshot_.Store(snapshot);
@@ -266,7 +275,7 @@ private:
         }
         if (!snapshot->Error.IsOK()) {
             THROW_ERROR_EXCEPTION("Multi consumer controller has snapshot error")
-                << snapshot->Error;
+                .With(snapshot->Error);
         }
 
         auto consumerNamesInState = consumerNamesInStateFuture.GetOrCrash().Value();
@@ -290,7 +299,7 @@ private:
         if (auto error = WaitFor(SyncConsumerNamesInState(namesToWrite, namesToDelete));
                 !error.IsOK()) {
             THROW_ERROR_EXCEPTION("Error while synchronizing multi_consumer_names table")
-                << error;
+                .With(error);
         }
 
         ProfileManager_.Acquire()->Profile(previousSnapshot, snapshot);
@@ -320,7 +329,7 @@ private:
             }
 
             snapshot->Error = TError("Multi consumer is banned by \"queue_agent_banned\" attribute")
-                << TErrorAttribute("banned_since", snapshot->BannedSince);
+                .With("banned_since", snapshot->BannedSince);
 
             return MakeFuture(snapshot);
         }
@@ -339,7 +348,7 @@ private:
                     snapshot->QueueConsumerNames = consumerNamesOrError.Value();
                 } else {
                     snapshot->Error = TError("Error while selecting from user table")
-                        << consumerNamesOrError;
+                        .With(consumerNamesOrError);
                 }
                 return snapshot;
             }));
@@ -410,6 +419,35 @@ private:
         }
         return AllSucceeded(futures);
     }
+
+    THashMap<std::string, TErrorOr<IMapNodePtr>> GetConsumerOrchids(const THashSet<std::string>& queueConsumerNames) const
+    {
+        auto consumerService = ObjectStore_->GetObjectService(EObjectKind::Consumer);
+        std::vector<TFuture<TYsonString>> consumerFutures;
+        for (const auto& name : queueConsumerNames) {
+            TNamedConsumerReference namedRef(
+                Path_.GetPath(),
+                *MakeConsumerAttributes(Path_.GetCluster().value(), name));
+
+            consumerFutures.push_back(AsyncYPathGet(
+                consumerService,
+                Format("/%v", ToYPathLiteral(ToString(namedRef)))));
+        }
+
+        auto consumerStatuses = WaitForFast(AllSet(consumerFutures))
+            .ValueOrThrow();
+
+        THashMap<std::string, TErrorOr<IMapNodePtr>> result;
+        result.reserve(queueConsumerNames.size());
+        for (const auto& [name, ysonStatusOrError] : Zip(queueConsumerNames, consumerStatuses)) {
+            if (ysonStatusOrError.IsOK()) {
+                result[name] = ConvertToNode(ysonStatusOrError.Value())->AsMap();
+            } else {
+                result[name] = TError(ysonStatusOrError);
+            }
+        }
+        return result;
+    }
 };
 
 } // namespace
@@ -421,6 +459,7 @@ bool UpdateMultiConsumerController(
     IObjectControllerPtr& controller,
     TConsumerTableRowConstPtr row,
     const std::optional<NQueueClient::TReplicatedTableMappingTableRow>& replicatedTableMappingRow,
+    const IObjectStore* store,
     const TQueueControllerDynamicConfigPtr& dynamicConfig,
     const TQueueAgentClientDirectoryPtr& clientDirectory,
     IInvokerPtr invoker,
@@ -436,6 +475,7 @@ bool UpdateMultiConsumerController(
         dynamicConfig,
         QueueAgentProfiler(),
         clientDirectory,
+        store,
         std::move(invoker),
         dynamicState->MultiConsumerNames);
     newController->Initialize();

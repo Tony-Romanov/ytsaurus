@@ -1,6 +1,6 @@
 # Быстрый старт в {{product-name}} Flow (YQL)
 
-YQL over Flow позволяет описать [пайплайн](../../../flow/concepts/glossary.md#pipeline) потоковой обработки данных в виде декларативного SQL-запроса — без написания кода на [C++](../../../flow/cpp/getting-started.md), [Java](../../../flow/java/getting-started.md) или [Python](../../../flow/python/getting-started.md). Пайплайн запускается как ванилла операция на выбранном кластере {{product-name}}.
+YQL over Flow позволяет описать [пайплайн](../../../flow/concepts/glossary.md#pipeline) потоковой обработки данных в виде декларативного SQL-запроса — без написания кода на [C++](../../../flow/cpp/getting-started.md), [Java](../../../flow/java/getting-started.md), [Go](../../../flow/go/getting-started.md) или [Python](../../../flow/python/getting-started.md). Пайплайн запускается как ванилла операция на выбранном кластере {{product-name}}.
 
 {% note warning %}
 
@@ -34,6 +34,7 @@ YQL over Flow позволяет описать [пайплайн](../../../flow
 | `PRAGMA Ytflow.PipelineDirectory = "...";` | Путь к директории с пайплайнами в {{product-name}} |
 | `PRAGMA Ytflow.PipelineName = "...";` | Имя пайплайна. Полный путь: `{pipeline_directory}/{pipeline_name}` |
 | `PRAGMA Ytflow.WorkerCount = "...";` | Количество воркер-джобов ванилла операции |
+| `PRAGMA Ytflow.EnableComputationPatternResources = "true";` | Включает переиспользование шаблонов вычислений между графами одного воркера. По умолчанию `false` |
 {% if audience == "internal" %}| `PRAGMA Ytflow.LogbrokerConsumerPath = "...";` | Путь к [Logbroker](../../../flow/extensions/logbroker.md) консьюмеру (только при чтении из Logbroker) |
 {% endif %}
 
@@ -112,7 +113,7 @@ client.run_query(
 
 Для отслеживания работы запущенного пайплайна доступны:
 
-{% if audience == "internal" %}- **Граф обработки** с характеристиками потоков и потреблением ресурсов — [вкладка **Flow** пайплайна в UI {{product-name}}](../../../flow/release/ui.md).{% endif %}
+{% if audience == "internal" %}- **Граф обработки** с характеристиками потоков и потреблением ресурсов — [вкладка **Flow** пайплайна в UI {{product-name}}](../../../flow/devops/deploy/diagnostics/ui.md).{% endif %}
 - **Дашборд** — вкладка **Flow → Monitoring**.
 - **Логи контроллера** (состояние воркеров, возможные проблемы):
   ```bash

@@ -35,10 +35,9 @@ using namespace NApi;
 using namespace NTabletClient;
 using namespace NObjectClient;
 
-using NYT::ToProto;
-using NYT::FromProto;
-
 using NLsm::EStoreRotationReason;
+using NYT::FromProto;
+using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 /**
@@ -224,18 +223,18 @@ public:
         YT_LOG_DEBUG(
             "Replication transaction overlaps backup checkpoint timestamp, aborting backup "
             "(%v, StartTimestamp: %v, CheckpointTimestamp: %v, CommitTimestamp: %v)",
-            tablet->GetLoggingTag(),
+            tablet->GetLoggingTags(),
             transaction->GetStartTimestamp(),
             checkpointTimestamp,
             transaction->GetCommitTimestamp());
 
         auto error = TError("Backup aborted due to overlapping replication transaction")
-            << TErrorAttribute("tablet_id", tablet->GetId())
-            << TErrorAttribute("table_path", tablet->GetTablePath())
-            << TErrorAttribute("start_timestamp", transaction->GetStartTimestamp())
-            << TErrorAttribute("checkpoint_timestamp", checkpointTimestamp)
-            << TErrorAttribute("commit_timestamp", transaction->GetCommitTimestamp())
-            << TErrorAttribute("transaction_id", transaction->GetId());
+            .With("tablet_id", tablet->GetId())
+            .With("table_path", tablet->GetTablePath())
+            .With("start_timestamp", transaction->GetStartTimestamp())
+            .With("checkpoint_timestamp", checkpointTimestamp)
+            .With("commit_timestamp", transaction->GetCommitTimestamp())
+            .With("transaction_id", transaction->GetId());
 
         OnBackupFailed(tablet, std::move(error));
     }
@@ -372,7 +371,7 @@ private:
     {
         auto tabletId = FromProto<TTabletId>(request->tablet_id());
         auto mountRevision = FromProto<NHydra::TRevision>(request->mount_revision());
-        auto timestamp = request->timestamp();
+        auto timestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
         auto mode = FromProto<EBackupMode>(request->backup_mode());
         auto clockClusterTag = request->has_clock_cluster_tag()
             ? std::make_optional(FromProto<TClusterTag>(request->clock_cluster_tag()))
@@ -413,8 +412,8 @@ private:
                 !error.IsOK())
             {
                 error = error
-                    << TErrorAttribute("tablet_id", tablet->GetId())
-                    << TErrorAttribute("table_path", tablet->GetTablePath());
+                    .With("tablet_id", tablet->GetId())
+                    .With("table_path", tablet->GetTablePath());
                 YT_LOG_DEBUG(error,
                     "Replica statuses do not allow backup");
                 RejectCheckpoint(tablet, error, EBackupStage::TimestampReceived);
@@ -447,14 +446,14 @@ private:
 
         YT_LOG_DEBUG(
             "Backup checkpoint released (%v, BackupMode: %v, BackupStage: %v)",
-            tablet->GetLoggingTag(),
+            tablet->GetLoggingTags(),
             tablet->GetBackupMode(),
             tablet->GetBackupStage());
 
         if (!tablet->GetBackupCheckpointTimestamp()) {
             YT_LOG_ALERT("Backup checkpoint released from a tablet that does not participate "
                 "in backup (%v)",
-                tablet->GetLoggingTag());
+                tablet->GetLoggingTags());
             return;
         }
 
@@ -481,7 +480,7 @@ private:
         // Confirmed.
         for (const auto& confirmedInfo : request->confirmed_tablets()) {
             auto tabletId = FromProto<TTabletId>(confirmedInfo.tablet_id());
-            auto timestamp = confirmedInfo.timestamp();
+            auto timestamp = FromProto<NTransactionClient::TTimestamp>(confirmedInfo.timestamp());
 
             auto* tablet = tabletManager->FindTablet(tabletId);
             if (!tablet) {
@@ -645,17 +644,17 @@ private:
             if (tablet->GetDynamicStoreCount() >= DynamicStoreCountLimit) {
                 YT_LOG_DEBUG("Backup rejected since dynamic store count limit is exceeded "
                     "(%v, DynamicStoreCount: %v, Limit: %v)",
-                    tablet->GetLoggingTag(),
+                    tablet->GetLoggingTags(),
                     tablet->GetDynamicStoreCount(),
                     DynamicStoreCountLimit);
 
                 auto rejectedInfo = req.add_rejected_tablets();
                 ToProto(rejectedInfo->mutable_tablet_id(), tablet->GetId());
                 auto error = TError("Dynamic store count limit is exceeded")
-                    << TErrorAttribute("tablet_id", tablet->GetId())
-                    << TErrorAttribute("cell_id", Slot_->GetCellId())
-                    << TErrorAttribute("dynamic_store_count", tablet->GetDynamicStoreCount())
-                    << TErrorAttribute("dynamic_store_count_limit", DynamicStoreCountLimit);
+                    .With("tablet_id", tablet->GetId())
+                    .With("cell_id", Slot_->GetCellId())
+                    .With("dynamic_store_count", tablet->GetDynamicStoreCount())
+                    .With("dynamic_store_count_limit", DynamicStoreCountLimit);
                 ToProto(rejectedInfo->mutable_error(), error);
                 continue;
             }
@@ -669,7 +668,7 @@ private:
 
                 auto* confirmedInfo = req.add_confirmed_tablets();
                 ToProto(confirmedInfo->mutable_tablet_id(), tablet->GetId());
-                confirmedInfo->set_timestamp(tablet->GetBackupCheckpointTimestamp());
+                confirmedInfo->set_timestamp(ToProto(tablet->GetBackupCheckpointTimestamp()));
             } else {
                 YT_LOG_DEBUG("Transiently rejected backup checkpoint feasibility "
                     "(TabletId: %v, CheckpointTimestamp: %v, CurrentTimestamp: %v, "
@@ -682,11 +681,11 @@ private:
                 auto rejectedInfo = req.add_rejected_tablets();
                 ToProto(rejectedInfo->mutable_tablet_id(), tablet->GetId());
                 auto error = TError("Checkpoint timestamp is too late")
-                    << TErrorAttribute("checkpoint_timestamp", tablet->GetBackupCheckpointTimestamp())
-                    << TErrorAttribute("current_timestamp", currentTimestamp)
-                    << TErrorAttribute("tablet_id", tablet->GetId())
-                    << TErrorAttribute("cell_id", Slot_->GetCellId())
-                    << TErrorAttribute("clock_cluster_tag", clusterTag);
+                    .With("checkpoint_timestamp", tablet->GetBackupCheckpointTimestamp())
+                    .With("current_timestamp", currentTimestamp)
+                    .With("tablet_id", tablet->GetId())
+                    .With("cell_id", Slot_->GetCellId())
+                    .With("clock_cluster_tag", clusterTag);
                 ToProto(rejectedInfo->mutable_error(), error);
             }
         }
@@ -710,7 +709,7 @@ private:
             YT_LOG_ALERT(error,
                 "Attempted to abort tablet backup when it has already reported success "
                 "to master (%v)",
-                tablet->GetLoggingTag());
+                tablet->GetLoggingTags());
             return;
         }
 
@@ -807,13 +806,13 @@ private:
                     YT_LOG_DEBUG(
                         "Tablet with nonempty active store is not mounted "
                         "during backup checkpoint passing (%v, TabletState: %v)",
-                        tablet->GetLoggingTag(),
+                        tablet->GetLoggingTags(),
                         tablet->GetState());
                     auto error = TError("Tablet %v has nonempty dynamic store and is not mounted "
                         "during backup checkpoint passing",
                         tablet->GetId())
-                        << TErrorAttribute("tablet_state", tablet->GetState())
-                        << TErrorAttribute("cell_id", Slot_->GetCellId());
+                        .With("tablet_state", tablet->GetState())
+                        .With("cell_id", Slot_->GetCellId());
                     ToProto(req.mutable_error(), error);
                     req.set_confirmed(false);
 
@@ -825,11 +824,11 @@ private:
                     YT_LOG_DEBUG(
                         "Cannot perform backup cutoff due to empty "
                         "dynamic store id pool (%v)",
-                        tablet->GetLoggingTag());
+                        tablet->GetLoggingTags());
                     auto error = TError("Tablet %v cannot perform backup cutoff due to empty "
                         "dynamic store id pool",
                         tablet->GetId())
-                        << TErrorAttribute("cell_id", Slot_->GetCellId());
+                        .With("cell_id", Slot_->GetCellId());
                     ToProto(req.mutable_error(), error);
                     req.set_confirmed(false);
 
@@ -844,7 +843,7 @@ private:
                 YT_LOG_DEBUG(
                     "Store rotated to perform backup cutoff (%v, PreviousStoreId: %v, "
                     "NextStoreId: %v, BackupMode: %v)",
-                    tablet->GetLoggingTag(),
+                    tablet->GetLoggingTags(),
                     previousStoreId,
                     tablet->GetActiveStore()->GetId(),
                     tablet->GetBackupMode());
@@ -856,7 +855,7 @@ private:
                     YT_LOG_DEBUG(
                         "Dynamic store id for ordered tablet allocated "
                         "after backup cutoff (%v)",
-                        tablet->GetLoggingTag());
+                        tablet->GetLoggingTags());
                 }
             } else {
                 tablet->SetOutOfBandRotationRequested(true);
@@ -875,7 +874,7 @@ private:
 
             YT_LOG_DEBUG(
                 "Backup row index cutoff descriptor generated (%v, RowIndex: %v, NextDynamicStoreId: %v)",
-                tablet->GetLoggingTag(),
+                tablet->GetLoggingTags(),
                 tablet->GetTotalRowCount(),
                 nextDynamicStoreId);
         } else {
@@ -884,7 +883,7 @@ private:
 
             YT_LOG_DEBUG(
                 "Backup dynamic store list cutoff descriptor generated (%v, DynamicStoreIdsToKeep: %v)",
-                tablet->GetLoggingTag(),
+                tablet->GetLoggingTags(),
                 capturedDynamicStoreIds);
         }
 
@@ -923,7 +922,7 @@ private:
                 YT_LOG_DEBUG(
                     "Backup checkpoint confirmation is delayed by replication in progress "
                     "(%v, PendingAsyncReplicaCount: %v)",
-                    tablet->GetLoggingTag(),
+                    tablet->GetLoggingTags(),
                     pendingAsyncReplicaCount);
                 tablet->CheckedSetBackupStage(
                     EBackupStage::FeasibilityConfirmed,
@@ -976,7 +975,7 @@ private:
                 YT_LOG_DEBUG(
                     "Tablet has passed backup checkpoint but still has replicator writes "
                     "in progress (%v, PreparedTransactionIds: %v)",
-                    tablet->GetLoggingTag(),
+                    tablet->GetLoggingTags(),
                     MakeFormattableView(
                         tablet->PreparedReplicatorTransactionIds(),
                         TDefaultFormatter{}));
@@ -1034,7 +1033,7 @@ private:
                     "Reported backup checkpoint passage due to a transaction "
                     "with later timestamp (%v, CheckpointTimestamp: %v, "
                     "NextTransactionCommitTimestamp: %v)",
-                    tablet->GetLoggingTag(),
+                    tablet->GetLoggingTags(),
                     checkpointTimestamp,
                     commitTimestamp);
 
@@ -1043,16 +1042,16 @@ private:
                     "Rejected backup checkpoint timestamp due to a transaction "
                     "with later timestamp (%v, CheckpointTimestamp: %v, "
                     "CommitTimestamp: %v)",
-                    tablet->GetLoggingTag(),
+                    tablet->GetLoggingTags(),
                     checkpointTimestamp,
                     commitTimestamp);
 
                 auto error = TError("Failed to confirm checkpoint timestamp in time "
                     "due to a transaction with later timestamp")
-                    << TErrorAttribute("checkpoint_timestamp", checkpointTimestamp)
-                    << TErrorAttribute("commit_timestamp", commitTimestamp)
-                    << TErrorAttribute("tablet_id", tablet->GetId())
-                    << TErrorAttribute("cell_id", Slot_->GetCellId());
+                    .With("checkpoint_timestamp", checkpointTimestamp)
+                    .With("commit_timestamp", commitTimestamp)
+                    .With("tablet_id", tablet->GetId())
+                    .With("cell_id", Slot_->GetCellId());
 
                 RejectCheckpoint(tablet, error, EBackupStage::TimestampReceived);
             }
@@ -1075,7 +1074,7 @@ private:
 
         YT_LOG_DEBUG(
             "All replicator write transactions finished (%v)",
-            tablet->GetLoggingTag());
+            tablet->GetLoggingTags());
 
         YT_VERIFY(tablet->GetBackupMode() == EBackupMode::SortedAsyncReplica);
         tablet->CheckedSetBackupStage(
@@ -1159,7 +1158,7 @@ private:
                     if (replica.GetStatus() != ETableReplicaStatus::SyncInSync) {
                         return TError("Sync replica %v is not in sync",
                             replica.GetId())
-                            << TErrorAttribute("replica_status", replica.GetStatus());
+                            .With("replica_status", replica.GetStatus());
                     }
                     break;
 
@@ -1169,7 +1168,7 @@ private:
                     {
                         return TError("Async replica %v has synchronous writes in progress",
                             replica.GetId())
-                            << TErrorAttribute("replica_status", replica.GetStatus());
+                            .With("replica_status", replica.GetStatus());
 
                     }
                     break;

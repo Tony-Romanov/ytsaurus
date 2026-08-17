@@ -47,7 +47,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "ReplicatedTableTracker");
+static YT_DEFINE_LEAKY_GLOBAL(const NLogging::TLogger, Logger, "ReplicatedTableTracker");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -247,7 +247,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            Logger().WithTag("Cache: ClusterLivenessCheck"))
+            Logger().WithTag("Cache", "ClusterLivenessCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -292,7 +292,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            Logger().WithTag("Cache: ClusterIncomingReplicationCheck"))
+            Logger().WithTag("Cache", "ClusterIncomingReplicationCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -316,7 +316,7 @@ protected:
                     }
                     THROW_ERROR_EXCEPTION("Failed to check whether incoming replication to cluster %Qv is enabled",
                         key)
-                        << TError(resultOrError);
+                        .With(TError(resultOrError));
                 }
                 if (!ConvertTo<bool>(resultOrError.Value())) {
                     THROW_ERROR_EXCEPTION("Replica cluster %Qv incoming replication is disabled",
@@ -345,7 +345,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            Logger().WithTag("Cache: ClusterSafeModeCheck"))
+            Logger().WithTag("Cache", "ClusterSafeModeCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -392,7 +392,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            Logger().WithTag("Cache: HydraReadOnlyCheck"))
+            Logger().WithTag("Cache", "HydraReadOnlyCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -467,7 +467,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            Logger().WithTag("Cache: BundleHealth"))
+            Logger().WithTag("Cache", "BundleHealth"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -873,7 +873,7 @@ public:
                 {
                     return TError("Tablet cell bundle health check failed for %v times in a row",
                         IterationsWithoutAcceptableBundleHealth_)
-                        << bundleHealthOrError;
+                        .With(bundleHealthOrError);
                 }
             } else {
                 IterationsWithoutAcceptableBundleHealth_ = 0;

@@ -9,9 +9,14 @@ SRCS(
 )
 
 PEERDIR(
+    yt/yt/flow/library/cpp/common
     yt/yt/flow/library/cpp/computation
 
     library/cpp/json
 )
 
 END()
+
+RECURSE_FOR_TESTS(
+    unittests
+)

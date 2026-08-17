@@ -85,6 +85,16 @@ public:
         return iter->second;
     }
 
+    NProfiling::TProfiler GetProfiler() const override
+    {
+        return Underlying_->GetProfiler();
+    }
+
+    TPartitionId GetPartitionId() const override
+    {
+        return Underlying_->GetPartitionId();
+    }
+
 protected:
     IExternalStateManagerPtr GetExternalStateManagerOrThrow(const std::string& name) const override
     {
@@ -134,17 +144,31 @@ TTestStateEnvironment::TTestStateEnvironment(NTableClient::TTableSchemaPtr keySc
     ExternalManagers_ = std::make_shared<TExternalManagerMap>();
     ExternalJoiners_ = std::make_shared<TExternalJoinerMap>();
     StaticResources_ = std::make_shared<TStaticResourceMap>();
-    InitContext_ = New<TExternalAwareInitContext>(
-        New<TRuntimeInitContext>(StateManager_->CreateContext(), StateManager_),
-        ExternalManagers_,
-        ExternalJoiners_,
-        StaticResources_);
+    RebuildInitContext();
 }
 
 void TTestStateEnvironment::SetStaticParametersNode(NYTree::IMapNodePtr node)
 {
+    ParametersNode_ = std::move(node);
+    RebuildInitContext();
+}
+
+void TTestStateEnvironment::SetProfiler(NProfiling::TProfiler profiler)
+{
+    Profiler_ = std::move(profiler);
+    RebuildInitContext();
+}
+
+void TTestStateEnvironment::RebuildInitContext()
+{
     InitContext_ = New<TExternalAwareInitContext>(
-        New<TRuntimeInitContext>(StateManager_->CreateContext(), StateManager_, std::move(node)),
+        New<TRuntimeInitContext>(
+            StateManager_->CreateContext(),
+            StateManager_,
+            ManagerContext_->PartitionId,
+            ParametersNode_,
+            /*staticResources*/ THashMap<TResourceId, IResourcePtr>{},
+            Profiler_),
         ExternalManagers_,
         ExternalJoiners_,
         StaticResources_);
@@ -157,7 +181,7 @@ IRuntimeInitContextPtr TTestStateEnvironment::MakeReloadedInitContext()
     auto dynamicContext = New<TDynamicJobStateManagerContext>();
     dynamicContext->StateManager = New<TDynamicStateManagerSpec>();
     auto manager = New<TJobStateManager>(ManagerContext_, std::move(dynamicContext));
-    return New<TRuntimeInitContext>(manager->CreateContext(), manager);
+    return New<TRuntimeInitContext>(manager->CreateContext(), manager, ManagerContext_->PartitionId);
 }
 
 const IRuntimeInitContextPtr& TTestStateEnvironment::GetInitContext() const
@@ -168,6 +192,11 @@ const IRuntimeInitContextPtr& TTestStateEnvironment::GetInitContext() const
 const TJobStateManagerPtr& TTestStateEnvironment::GetStateManager() const
 {
     return StateManager_;
+}
+
+TPartitionId TTestStateEnvironment::GetPartitionId() const
+{
+    return ManagerContext_->PartitionId;
 }
 
 void TTestStateEnvironment::Sync()

@@ -291,6 +291,9 @@ public:
             result.SetSuccess();
         }
 
+        YQL_CLOG(DEBUG, ProviderDq) << "ExecuteGraph response: grpcOk=" << status.Ok()
+            << " success=" << result.Success() << " fallback=" << result.Fallback
+            << " truncated=" << result.Truncated << " dataBytes=" << result.Data.size();
         promise.SetValue(result);
     }
 
@@ -415,8 +418,11 @@ public:
         YQL_CLOG(DEBUG, ProviderDq) << "Send query of size " << queryPB.ByteSizeLong();
 
         auto self = weak_from_this();
+        YQL_CLOG(DEBUG, ProviderDq) << "ExecutePlan: waiting for OpenSessionFuture, initialized="
+            << OpenSessionFuture.Initialized() << " ready=" << OpenSessionFuture.HasValue();
         return OpenSessionFuture.Apply([self, sessionId = SessionId, queryPB, retry, settings, resultFormatSettings, modulesMapping,
             progressWriter](const TFuture<void>& f) {
+            YQL_CLOG(TRACE, ProviderDq) << "ExecutePlan: OpenSessionFuture ready, dispatching ExecuteGraph";
             f.TryRethrow();
             auto this_ = self.lock();
             if (!this_) {
@@ -792,10 +798,21 @@ TIntrusivePtr<IDqGateway> CreateDqGateway(const TString& host, int port) {
     return new TDqGateway(host, port, "", "");
 }
 
+TIntrusivePtr<IDqGateway> CreateDqGateway(const TString& host, int port, const TString& vanillaJobPath, const TString& vanillaJobMd5) {
+    return new TDqGateway(host, port, vanillaJobPath, vanillaJobMd5);
+}
+
 TIntrusivePtr<IDqGateway> CreateDqGateway(const NProto::TDqConfig& config) {
+    TString vanillaJobPath;
+    TString vanillaJobMd5;
+    if (!config.GetYtBackends().empty()) {
+        const auto& ytBackend = config.GetYtBackends()[0];
+        vanillaJobPath = ytBackend.GetVanillaJobLite();
+        vanillaJobMd5 = ytBackend.GetVanillaJobLiteMd5();
+    }
     return new TDqGateway("localhost", config.GetPort(),
-        config.GetYtBackends()[0].GetVanillaJobLite(),
-        config.GetYtBackends()[0].GetVanillaJobLiteMd5(),
+        vanillaJobPath,
+        vanillaJobMd5,
         TDuration::MilliSeconds(config.GetOpenSessionTimeoutMs()),
         TDuration::MilliSeconds(config.GetRequestTimeoutMs()));
 }

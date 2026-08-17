@@ -419,6 +419,7 @@ public:
         RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraScheduleChunkSeal, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraCreateChunkLists, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraAttachChunkTrees, Unretained(this)));
+        RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraDetachChunkTrees, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraUnstageChunkTree, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraUnstageExpiredChunks, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TChunkManager::HydraRedistributeConsistentReplicaPlacementTokens, Unretained(this)));
@@ -774,6 +775,15 @@ public:
             Bootstrap_->GetHydraFacade()->GetHydraManager(),
             std::move(context),
             &TChunkManager::HydraAttachChunkTrees,
+            this);
+    }
+
+    std::unique_ptr<TMutation> CreateDetachChunkTreesMutation(TCtxDetachChunkTreesPtr context) override
+    {
+        return CreateMutation(
+            Bootstrap_->GetHydraFacade()->GetHydraManager(),
+            std::move(context),
+            &TChunkManager::HydraDetachChunkTrees,
             this);
     }
 
@@ -1267,6 +1277,13 @@ public:
         auto requisitionIndex = ChunkRequisitionRegistry_.GetOrCreate(requisition, objectManager);
         chunk->SetLocalRequisitionIndex(requisitionIndex, GetChunkRequisitionRegistry(), objectManager);
 
+        // COMPAT(danilalexeev)
+        if (GetDynamicConfig()->UpdateHistoricallyNonVitalOnChunkCreationAndExport &&
+            !IsDurabilityRequiredForChunk(chunk, requisitionIndex))
+        {
+            chunk->SetHistoricallyNonVital(true);
+        }
+
         StageChunk(chunk, transaction, account);
 
         const auto& transactionManager = Bootstrap_->GetTransactionManager();
@@ -1529,6 +1546,13 @@ public:
 
     void ExportChunk(TChunk* chunk, TCellTag destinationCellTag) override
     {
+        // COMPAT(danilalexeev): Covers chunks created before this flag was enabled.
+        if (GetDynamicConfig()->UpdateHistoricallyNonVitalOnChunkCreationAndExport &&
+            !IsDurabilityRequiredForChunk(chunk, chunk->GetAggregatedRequisitionIndex()))
+        {
+            chunk->SetHistoricallyNonVital(true);
+        }
+
         chunk->Export(destinationCellTag, GetChunkRequisitionRegistry());
     }
 
@@ -2454,7 +2478,7 @@ public:
                 if (!IsMediumType(specifiedType)) {
                     if (throwOnInvalidId) {
                         THROW_ERROR_EXCEPTION("Invalid medium id")
-                            << TErrorAttribute("medium_id", mediumId);
+                            .With("medium_id", mediumId);
                     }
                     return nullptr;
                 }
@@ -2723,7 +2747,7 @@ public:
         if (enable) {
             if (std::ssize(VerboselyLoggedChunks_) >= GetDynamicConfig()->MaxVerboselyLoggedChunks) {
                 THROW_ERROR_EXCEPTION("Too many chunks with verbose logging enabled")
-                    << TErrorAttribute("limit", GetDynamicConfig()->MaxVerboselyLoggedChunks);
+                    .With("limit", GetDynamicConfig()->MaxVerboselyLoggedChunks);
             }
 
             VerboselyLoggedChunks_[chunkId] = GetCurrentMutationContext()->GetTimestamp();
@@ -2970,13 +2994,13 @@ private:
 
                 if (failOnLocationByIndexAndUuidMismatch) {
                     THROW_ERROR_EXCEPTION("UUID and index for the same location points to different locations")
-                        << TErrorAttribute("chunk_id", chunkId)
-                        << TErrorAttribute("node_id", node->GetId())
-                        << TErrorAttribute("node_address", node->GetDefaultAddress())
-                        << TErrorAttribute("location_index", locationIndex)
-                        << TErrorAttribute("location_uuid", locationUuid)
-                        << TErrorAttribute("location_by_index_id", locationByIndex.value() ? locationByIndex.value()->GetId() : NullObjectId)
-                        << TErrorAttribute("location_by_uuid_id", locationByUuid.value() ? locationByUuid.value()->GetId() : NullObjectId);
+                        .With("chunk_id", chunkId)
+                        .With("node_id", node->GetId())
+                        .With("node_address", node->GetDefaultAddress())
+                        .With("location_index", locationIndex)
+                        .With("location_uuid", locationUuid)
+                        .With("location_by_index_id", locationByIndex.value() ? locationByIndex.value()->GetId() : NullObjectId)
+                        .With("location_by_uuid_id", locationByUuid.value() ? locationByUuid.value()->GetId() : NullObjectId);
                 } else {
                     // NB: If locations mismatch and we cannot throw, better to return nullptr.
                     return nullptr;
@@ -4115,8 +4139,7 @@ private:
         const auto& config = GetDynamicConfig();
         auto oldestConfirmTime = GetCpuInstant() - DurationToCpuDuration(config->ReplicaApproveTimeout);
 
-        while (!RecentlyConfirmedChunksByConfirmTime_.empty())
-        {
+        while (!RecentlyConfirmedChunksByConfirmTime_.empty()) {
             auto [chunkId, confirmTime] = RecentlyConfirmedChunksByConfirmTime_.front();
             if (confirmTime >= oldestConfirmTime) {
                 break;
@@ -4145,7 +4168,7 @@ private:
         }
     }
 
-    void FlushWaitingSequoiaIncrementalHeartbeatRequests()
+    void FlushWaitingSequoiaIncrementalHeartbeatRequests() override
     {
         YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
 
@@ -4191,14 +4214,18 @@ private:
 
         auto nodeId = FromProto<TNodeId>(request->node_id());
 
+        auto isBatchFull = [&] {
+            const auto& config = GetDynamicConfig()->SequoiaChunkReplicas;
+            return ssize(WaitingSequoiaIncrementalHeartbeatRequests_) >= config->MaxRequestsInIncrementalHeartbeatBatch ||
+                ReplicasInWaitingSequoiaIncrementalHeartbeatRequests_ >= config->MaxReplicasInIncrementalHeartbeatBatch;
+        };
+
         auto tryAddRequestToCurrentBatch = [&] () mutable {
             if (WaitingSequoiaIncrementalHeartbeatRequests_.contains(nodeId)) {
                 return false;
             }
 
-            const auto& config = GetDynamicConfig()->SequoiaChunkReplicas;
-            if (ssize(WaitingSequoiaIncrementalHeartbeatRequests_) >= config->MaxRequestsInIncrementalHeartbeatBatch ||
-                ReplicasInWaitingSequoiaIncrementalHeartbeatRequests_ >= config->MaxReplicasInIncrementalHeartbeatBatch)
+            if (isBatchFull())
             {
                 return false;
             }
@@ -4214,9 +4241,13 @@ private:
         };
 
         int retryCount = 0;
-        while (!tryAddRequestToCurrentBatch() && retryCount < MaxTryAddRequestToCurrentBatchRetries) {
+        while (IsActiveLeader() && !tryAddRequestToCurrentBatch() && retryCount < MaxTryAddRequestToCurrentBatchRetries) {
             FlushWaitingSequoiaIncrementalHeartbeatRequests();
             retryCount++;
+        }
+
+        if (!IsActiveLeader()) {
+            THROW_ERROR_EXCEPTION(NRpc::EErrorCode::Unavailable, "Peer is not leading");
         }
 
         // There should not be more than one retry.
@@ -4228,9 +4259,15 @@ private:
 
         YT_LOG_DEBUG("Added request to waiting Sequoia incremental heartbeat requests (NodeId: %v)", nodeId);
 
-        return BatchSequoiaIncrementalHeartbeatPromise_
+        auto result = BatchSequoiaIncrementalHeartbeatPromise_
             .ToFuture()
             .ToUncancelable();
+
+        if (isBatchFull()) {
+            FlushWaitingSequoiaIncrementalHeartbeatRequests();
+        }
+
+        return result;
     }
 
     TFuture<void> ModifySequoiaReplicas(
@@ -5571,6 +5608,32 @@ private:
         ExecuteAttachChunkTreesSubrequest(request, response);
     }
 
+    void HydraDetachChunkTrees(
+        const TCtxDetachChunkTreesPtr& /*context*/,
+        TReqDetachChunkTrees* request,
+        TRspDetachChunkTrees* /*response*/)
+    {
+        YT_VERIFY(HasMutationContext());
+
+        auto parentId = FromProto<TChunkListId>(request->parent_id());
+        auto* parent = GetChunkListOrThrow(parentId);
+
+        auto policy = DeriveChunkTreeDetachPolicy(parent);
+
+        std::vector<TChunkTreeRawPtr> children;
+        children.reserve(request->child_ids_size());
+        for (const auto& protoChildId : request->child_ids()) {
+            children.push_back(GetChunkTreeOrThrow(FromProto<TChunkTreeId>(protoChildId)));
+        }
+
+        DetachFromChunkList(parent, children, policy);
+
+        YT_LOG_DEBUG("Chunk trees detached (ParentId: %v, ChildIds: %v, Policy: %v)",
+            parentId,
+            MakeShrunkFormattableView(children, TObjectIdFormatter(), 500),
+            policy);
+    }
+
     void ExecuteCreateChunkSubrequest(
         TReqCreateChunk* subrequest,
         TRspCreateChunk* subresponse)
@@ -6323,7 +6386,7 @@ private:
                 continue;
             }
 
-            VisitAllAncestorsInHunkTree(chunk, [&] (TChunkList* chunkList, bool firstOccurrence) {
+            VisitHunkTreeAncestors(chunk, [&] (TChunkList* chunkList, bool firstOccurrence) {
                 if (firstOccurrence) {
                     chunkList->AccumulateHunkStatistics(chunk, /*force*/ true);
                 }
@@ -7815,7 +7878,7 @@ private:
             return channel;
         } else {
             THROW_ERROR_EXCEPTION("Chunk replicator for chunk %v is not alive", chunk->GetId())
-                << TErrorAttribute("shard_index", chunk->GetShardIndex());
+                .With("shard_index", chunk->GetShardIndex());
         }
     }
 
@@ -7890,7 +7953,7 @@ private:
                 cellStatistics.set_oldest_part_missing_chunk_count(0);
                 cellStatistics.set_quorum_missing_chunk_count(0);
                 cellStatistics.set_inconsistently_placed_chunk_count(0);
-                if (onlineNodeCount.has_value()) {
+                if (onlineNodeCount) {
                     cellStatistics.set_online_node_count(*onlineNodeCount);
                 }
 
@@ -7948,9 +8011,9 @@ private:
         for (const auto& [chunkId, enabledAt] : VerboselyLoggedChunks_) {
             if (enabledAt + maxDuration < now) {
                 alerts.push_back(TError("Chunk stays in verbose logging set for too long")
-                    << TErrorAttribute("chunk_id", chunkId)
-                    << TErrorAttribute("enabled_at", enabledAt)
-                    << TErrorAttribute("max_duration", maxDuration));
+                    .With("chunk_id", chunkId)
+                    .With("enabled_at", enabledAt)
+                    .With("max_duration", maxDuration));
             }
         }
 

@@ -115,7 +115,7 @@ public:
     {
         YT_ASSERT_INVOKER_THREAD_AFFINITY(host->GetAutomatonInvoker(), AutomatonThread);
 
-        Logger = TabletNodeLogger().WithTag("CellId: %v", host->GetCellId());
+        Logger = TabletNodeLogger().WithTag("CellId", host->GetCellId());
 
         YT_LOG_INFO("Set transaction manager clock cluster tag (ClockClusterTag: %v)",
             ClockClusterTag_);
@@ -475,7 +475,7 @@ public:
     {
         NTabletClient::NProto::TReqRegisterTransactionActions request;
         ToProto(request.mutable_transaction_id(), transactionId);
-        request.set_transaction_start_timestamp(transactionStartTimestamp);
+        request.set_transaction_start_timestamp(ToProto(transactionStartTimestamp));
         request.set_transaction_timeout(ToProto(transactionTimeout));
         request.set_prepare_signature(prepareSignature);
         request.set_commit_signature(commitSignature);
@@ -992,8 +992,8 @@ public:
             .value_or(Config_->MaxParallelTransactionCount);
         if (currentTransactionCount > maxTransactionCount) {
             THROW_ERROR_EXCEPTION("Maximum transaction count exceeded")
-                << TErrorAttribute("current_transaction_count", currentTransactionCount)
-                << TErrorAttribute("max_transaction_count", maxTransactionCount);
+                .With("current_transaction_count", currentTransactionCount)
+                .With("max_transaction_count", maxTransactionCount);
         }
     }
 
@@ -1409,7 +1409,7 @@ private:
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
         auto externalizationToken = FromProto<TTransactionExternalizationToken>(request->externalization_token());
 
-        auto transactionStartTimestamp = request->transaction_start_timestamp();
+        auto transactionStartTimestamp = FromProto<NTransactionClient::TTimestamp>(request->transaction_start_timestamp());
         auto transactionTimeout = FromProto<TDuration>(request->transaction_timeout());
         auto prepareSignature = request->prepare_signature();
         auto commitSignature = request->has_commit_signature()
@@ -1539,7 +1539,7 @@ private:
 
     void HydraHandleTransactionBarrier(NTabletNode::NProto::TReqHandleTransactionBarrier* request)
     {
-        auto barrierTimestamp = request->timestamp();
+        auto barrierTimestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
 
         YT_LOG_DEBUG("Handling transaction barrier (Timestamp: %v)",
             barrierTimestamp);
@@ -1605,7 +1605,7 @@ private:
     void HydraExternalizeTransaction(NProto::TReqExternalizeTransaction* request)
     {
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
-        auto transactionStartTimestamp = request->transaction_start_timestamp();
+        auto transactionStartTimestamp = FromProto<NTransactionClient::TTimestamp>(request->transaction_start_timestamp());
         auto transactionTimeout = FromProto<TDuration>(request->transaction_timeout());
         auto tabletId = FromProto<TTabletId>(request->externalizer_tablet_id());
         auto token = FromProto<TTransactionExternalizationToken>(
@@ -1790,7 +1790,7 @@ private:
         TransientBarrierTimestamp_ = minPrepareTimestamp;
 
         NTabletNode::NProto::TReqHandleTransactionBarrier request;
-        request.set_timestamp(TransientBarrierTimestamp_);
+        request.set_timestamp(ToProto(TransientBarrierTimestamp_));
         YT_UNUSED_FUTURE(CreateMutation(HydraManager_, request)
             ->CommitAndLog(Logger));
     }
@@ -1910,9 +1910,9 @@ private:
         if (ClockClusterTag_ != timestampClusterTag) {
             if (Config_->RejectIncorrectClockClusterTag && canThrow) {
                 THROW_ERROR_EXCEPTION("Transaction timestamp is generated from unexpected clock")
-                    << TErrorAttribute("transaction_id", transactionId)
-                    << TErrorAttribute("timestamp_cluster_tag", timestampClusterTag)
-                    << TErrorAttribute("clock_cluster_tag", ClockClusterTag_);
+                    .With("transaction_id", transactionId)
+                    .With("timestamp_cluster_tag", timestampClusterTag)
+                    .With("clock_cluster_tag", ClockClusterTag_);
             }
 
             YT_LOG_ALERT("Transaction timestamp is generated from unexpected clock (TransactionId: %v, TransactionClusterTag: %v, ClockClusterTag: %v)",

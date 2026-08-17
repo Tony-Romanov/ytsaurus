@@ -7,6 +7,7 @@ SRCS(
     compact_unversioned_owning_row.cpp
     counter.cpp
     debug_build_warning.cpp
+    deploy_url_provider.cpp
     identifier.cpp
     cow_tree.cpp
     crash_recorder.cpp
@@ -16,6 +17,7 @@ SRCS(
     linear_system.cpp
     load_throughput_throttler.cpp
     mutable_unversioned_row.cpp
+    node_address_provider.cpp
     node_info.cpp
     ordered_memory.cpp
     reconfigurable.cpp
@@ -23,7 +25,6 @@ SRCS(
     retryable_client.cpp
     retryable_transaction.cpp
     status_profiler.cpp
-    version_helpers.cpp
     weighted_random.cpp
 )
 
@@ -44,6 +45,7 @@ END()
 
 RECURSE(
     proto
+    testing
 )
 
 RECURSE_FOR_TESTS(

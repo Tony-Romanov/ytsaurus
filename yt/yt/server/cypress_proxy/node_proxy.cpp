@@ -63,6 +63,7 @@
 
 #include <yt/yt/core/ypath/token.h>
 
+#include <yt/yt/core/misc/protobuf_helpers.h>
 #include <yt/yt/core/ytree/exception_helpers.h>
 #include <yt/yt/core/ytree/fluent.h>
 #include <yt/yt/core/ytree/ypath_detail.h>
@@ -593,8 +594,8 @@ protected:
 
         if (SequoiaSession_->GetCurrentCypressTransactionId()) {
             THROW_ERROR_EXCEPTION("Rootstock cannot be removed under transaction")
-                << TErrorAttribute("scion_id", Id_)
-                << TErrorAttribute("cypress_transaction_id", SequoiaSession_->GetCurrentCypressTransactionId());
+                .With("scion_id", Id_)
+                .With("cypress_transaction_id", SequoiaSession_->GetCurrentCypressTransactionId());
         }
 
         // Scion removal causes rootstock removal.
@@ -1657,7 +1658,7 @@ DEFINE_YPATH_SERVICE_METHOD(TNodeProxy, Lock)
     auto mode = FromProto<ELockMode>(request->mode());
     auto childKey = YT_OPTIONAL_FROM_PROTO(*request, child_key);
     auto attributeKey = YT_OPTIONAL_FROM_PROTO(*request, attribute_key);
-    auto timestamp = request->timestamp();
+    auto timestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
     auto waitable = request->waitable();
 
     context->SetRequestInfo("Mode: %v, Key: %v, Waitable: %v",
@@ -1854,7 +1855,7 @@ DEFINE_YPATH_SERVICE_METHOD(TNodeProxy, LockCopyDestination)
         inheritedAttributes->ListPairs());
 
     response->set_sequoia_destination(true);
-    response->set_native_cell_tag(nativeCellTag.Underlying());
+    response->set_native_cell_tag(ToProto(nativeCellTag));
     ToProto(response->mutable_account_id(), accountId);
     ToProto(response->mutable_effective_inheritable_attributes(), *inheritedAttributes);
 
@@ -1878,8 +1879,8 @@ DEFINE_YPATH_SERVICE_METHOD(TNodeProxy, LockCopySource)
     auto nodesToCopy = SequoiaSession_->FetchSubtree(Path_);
     if (std::ssize(nodesToCopy.Nodes) > maxSubtreeSize) {
         THROW_ERROR_EXCEPTION("Subtree is too large for cross-cell copy")
-            << TErrorAttribute("subtree_size", subtreeSize)
-            << TErrorAttribute("max_subtree_size", maxSubtreeSize);
+            .With("subtree_size", subtreeSize)
+            .With("max_subtree_size", maxSubtreeSize);
     }
 
     ValidateCopyFromSourcePermissions(
@@ -2791,7 +2792,7 @@ private:
 
         if (limit && limit < 0) {
             THROW_ERROR_EXCEPTION("Limit is negative")
-                << TErrorAttribute("limit", limit);
+                .With("limit", limit);
         }
 
         ValidatePermissionForThis(EPermission::Read);

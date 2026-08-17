@@ -134,7 +134,7 @@ TReplicaSynchronicitiesFetchResult BuildTabletReplicaSynchronicities(
                     ++replicaIdToSyncTabletCount[replicaId];
                 }
 
-                auto timestamp = protoReplicaInfo.last_replication_timestamp();
+                auto timestamp = FromProto<NTransactionClient::TTimestamp>(protoReplicaInfo.last_replication_timestamp());
                 auto [it, inserted] = replicationTimestamps.insert({replicaId, timestamp});
                 if (!inserted) {
                     it->second = std::min(timestamp, it->second);
@@ -198,9 +198,9 @@ TFuture<TReplicaSynchronicitiesFetchResult> FetchReplicatedTableReplicaSynchroni
         cellIds.push_back(cellId);
     }
 
-    YT_LOG_DEBUG("Looking for in-sync replicas (Path: %v, CellCount: %v)",
-        tableMountInfo->Path,
-        cellIdToTabletIds.size());
+    YT_TLOG_DEBUG("Looking for in-sync replicas")
+        .With("Path", tableMountInfo->Path)
+        .With("CellCount", cellIdToTabletIds.size());
 
     try {
         auto cellDescriptorsByPeer = GroupCellDescriptorsByPeer(connection, cellIds);
@@ -250,7 +250,8 @@ TFuture<TReplicaSynchronicitiesFetchResult> FetchReplicatedTableReplicaSynchroni
             throw;
         }
 
-        YT_LOG_DEBUG(ex, "Failed looking for in-sync replicas, building dummy response");
+        YT_TLOG_DEBUG("Failed looking for in-sync replicas, building dummy response")
+            .With(ex);
         return MakeFuture(BuildDummyTableReplicaSynchronicities(tableMountInfo));
     }
 }

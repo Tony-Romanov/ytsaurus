@@ -29,7 +29,7 @@ Java SDK Flow (с поддержкой Kotlin) предоставляет два
 Для создания [компьютейшена](../../../flow/concepts/glossary.md#stream-and-computation) на Java необходимо выбрать подходящий билдер, соответствующий [типу Computation-a в C++](../../../flow/concepts/companion.md#vidy-computation-ov-dlya-raboty-s-kompanonami):
 
 - `Computation.builder()` — для `TTransformCompanionComputation` и `TSwiftMapCompanionComputation`.
-- `SourceComputation.builder()` — для `TSwiftOrderedSourceCompanionComputation`.
+- `SourceComputation.builder()` — для `TSwiftOrderedSourceCompanionComputation` и `TTransformOrderedSourceCompanionComputation`.
 
 {% list tabs group=lang %}
 
@@ -81,7 +81,7 @@ Java SDK Flow (с поддержкой Kotlin) предоставляет два
 
 ## Runner
 
-Класс с `main`-методом для запуска [пайплайна](../../../flow/concepts/glossary.md#pipeline). `SimpleRunnerProgram` является Java-аналогом [NYT::NFlow::TSimpleRunnerProgram](../../../flow/release/basic-rules.md#launch-flow) и принимает те же файлы конфигурации и переменные среды.
+Класс с `main`-методом для запуска [пайплайна](../../../flow/concepts/glossary.md#pipeline). `SimpleRunnerProgram` является Java-аналогом [NYT::NFlow::TSimpleRunnerProgram](../../../flow/devops/vanilla/releases.md#launch-flow) и принимает те же файлы конфигурации и переменные среды.
 
 {% list tabs group=lang %}
 

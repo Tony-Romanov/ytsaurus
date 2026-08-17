@@ -767,7 +767,7 @@ public:
                 auto unrecognizedOptions = dynamicOptions->GetRecursiveUnrecognized();
                 if (unrecognizedOptions->GetChildCount() > 0) {
                     UnrecognizedOptionsAlert_ = TError("Found unrecognized parameters in dynamic tablet cell options")
-                        << TErrorAttribute("unrecognized_options", unrecognizedOptions);
+                        .With("unrecognized_options", unrecognizedOptions);
                 } else {
                     UnrecognizedOptionsAlert_ = {};
                 }
@@ -1093,9 +1093,9 @@ private:
 
     NLogging::TLogger MakeLogger() const
     {
-        return CellarAgentLogger().WithTag("CellId: %v, PeerId: %v",
-            CellDescriptor_.CellId,
-            PeerId_);
+        return CellarAgentLogger()
+            .WithTag("CellId", CellDescriptor_.CellId)
+            .WithTag("PeerId", PeerId_);
     }
 };
 

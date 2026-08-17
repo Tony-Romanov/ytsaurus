@@ -866,6 +866,40 @@ DEFINE_REFCOUNTED_TYPE(TJobControllerDynamicConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct TMediumAwareBlockCacheManagerConfig
+    : public NYTree::TYsonStruct
+{
+    bool Enable = false;
+    //! Block cache configuration grouped by medium name.
+    //! Each capacity is specified per location and multiplied by the location count for the medium.
+    THashMap<std::string, NChunkClient::TBlockCacheConfigPtr> BlockCacheConfigPerMediumPerLocation;
+
+    REGISTER_YSON_STRUCT(TMediumAwareBlockCacheManagerConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TMediumAwareBlockCacheManagerConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
+struct TMediumAwareBlockCacheManagerDynamicConfig
+    : public NYTree::TYsonStruct
+{
+    std::optional<bool> Enable;
+    //! Block cache overrides grouped by medium name.
+    //! Each capacity is specified per location and multiplied by the location count for the medium.
+    THashMap<std::string, NChunkClient::TBlockCacheDynamicConfigPtr> BlockCacheConfigPerMediumPerLocation;
+
+    REGISTER_YSON_STRUCT(TMediumAwareBlockCacheManagerDynamicConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TMediumAwareBlockCacheManagerDynamicConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct TDataNodeConfig
     : public TJournalManagerConfig
 {
@@ -911,8 +945,11 @@ struct TDataNodeConfig
     //! Cache for partition block metas.
     TSlruCacheConfigPtr BlockMetaCache;
 
-    //! Cache for all types of blocks.
+    //! Ordinary block cache configuration.
     NChunkClient::TBlockCacheConfigPtr BlockCache;
+
+    //! Medium-aware block cache manager configuration.
+    TMediumAwareBlockCacheManagerConfigPtr MediumAwareBlockCacheManager;
 
     //! Opened blob chunks cache.
     TSlruCacheConfigPtr BlobReaderCache;
@@ -1086,6 +1123,9 @@ struct TDataNodeDynamicConfig
     TSlruCacheDynamicConfigPtr BlocksExtCache;
     TSlruCacheDynamicConfigPtr BlockMetaCache;
     NChunkClient::TBlockCacheDynamicConfigPtr BlockCache;
+
+    TMediumAwareBlockCacheManagerDynamicConfigPtr MediumAwareBlockCacheManager;
+
     TSlruCacheDynamicConfigPtr BlobReaderCache;
     TSlruCacheDynamicConfigPtr ChangelogReaderCache;
     TTableSchemaCacheDynamicConfigPtr TableSchemaCache;
@@ -1115,6 +1155,7 @@ struct TDataNodeDynamicConfig
 
     bool UseDisableSendBlocks;
     bool UseProbePutBlocks;
+    bool EnableProbePutBlocksFairShare;
     bool PreallocateDiskSpace;
 
     bool WaitPrecedingBlocksReceived;

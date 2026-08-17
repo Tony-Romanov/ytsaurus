@@ -83,8 +83,9 @@ public:
         TDynamicKeyVisitorContextPtr dynamicContext);
 
     //! Loads persisted coverage via Store and starts the background fill task.
-    //! Must be called once before GetNextBatch.
-    TFuture<void> Init();
+    //! When |upstreamCompleted|, applies the completion signal after loading coverage
+    //! and before background filling starts. Must be called once before GetNextBatch.
+    TFuture<void> Init(bool upstreamCompleted = false);
 
     //! Updates dynamic settings: throttler rate from `period`, background fill
     //! period, draining flag.
@@ -95,9 +96,11 @@ public:
     //! When draining or out of work yields an empty vector.
     std::vector<TVisit> GetNextBatch(i64 batchSize);
 
-    //! Signals that all upstream non-visit streams are completed; the next
-    //! pass is started as Final, after which the visitor reports itself empty.
-    //! One-way and idempotent.
+    //! Signals that all upstream non-visit streams are completed; the first pass to
+    //! start at or after that moment is Final, after which the visitor reports itself
+    //! empty. Idempotent. Ignored by a non-finite stream: such a visitor never
+    //! finalizes, and switching a stream back to non-finite drops the signal — though a
+    //! pass already marked Final stays final.
     void SetUpstreamCompleted();
 
     //! Single-entry inflight map; Empty becomes true once the Final pass is
@@ -106,6 +109,9 @@ public:
 
     //! Persists the coverage diff produced since the last Sync.
     void Sync(NApi::IDynamicTableTransactionPtr transaction);
+
+    //! Publishes processed-rate accounting after the coverage transaction commits.
+    void Commit();
 
     //! Stops the background fill executor so the owner can drop its last
     //! strong reference. Idempotent.
@@ -128,6 +134,9 @@ private:
     const IStatusErrorStatePtr BackgroundFillError_;
 
     bool UpstreamCompleted_ = false;
+    //! True after a Pending range has been chosen and until its read snapshot is
+    //! recorded as Buffered. Such a scan may predate an upstream-completion signal.
+    bool BackgroundFillInProgress_ = false;
 
     THashSet<std::string> NonVisitorJoinerWarned_;
 
@@ -158,9 +167,10 @@ private:
     //! InflightMetrics->{NewCountPerSec, ProcessedCountPerSec} so that
     //! standard Solomon dashboards see visit-stream throughput like for
     //! source/timer streams. Emitted = visits pushed into Buffer_;
-    //! Consumed = visits handed out via GetNextBatch.
+    //! Processed = visits included in a committed coverage transaction.
     TSimpleEmaCounter EmittedRate_;
-    TSimpleEmaCounter ConsumedRate_;
+    TSimpleEmaCounter ProcessedRate_;
+    i64 PendingProcessedCount_ = 0;
 
     //! Worker-side raw counters surfaced as
     //! /key_visitor_streams/{registered,persisted}_count, mirroring

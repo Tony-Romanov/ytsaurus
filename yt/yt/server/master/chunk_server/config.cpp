@@ -49,8 +49,8 @@ void TChunkManagerConfig::Register(TRegistrar registrar)
     registrar.Postprocessor([] (TThis* config) {
         if (config->MaxReplicationFactor < MinVitalReplicationFactor) {
             THROW_ERROR_EXCEPTION("\"max_replication_factor\" should be greater than MinVitalReplicationFactor")
-                << TErrorAttribute("max_replication_factor", config->MaxReplicationFactor)
-                << TErrorAttribute("min_vital_replication_factor", MinVitalReplicationFactor);
+                .With("max_replication_factor", config->MaxReplicationFactor)
+                .With("min_vital_replication_factor", MinVitalReplicationFactor);
         }
     });
 }
@@ -83,8 +83,8 @@ void TDomesticMediumConfig::Register(TRegistrar registrar)
     registrar.Postprocessor([] (TThis* config) {
         if (config->MaxReplicationFactor < MinVitalReplicationFactor) {
             THROW_ERROR_EXCEPTION("\"max_replication_factor\" should be greater than MinVitalReplicationFactor")
-                << TErrorAttribute("max_replication_factor", config->MaxReplicationFactor)
-                << TErrorAttribute("min_vital_replication_factor", MinVitalReplicationFactor);
+                .With("max_replication_factor", config->MaxReplicationFactor)
+                .With("min_vital_replication_factor", MinVitalReplicationFactor);
         }
     });
 }
@@ -220,8 +220,8 @@ void TDynamicMasterCellChunkStatisticsCollectorConfig::Register(TRegistrar regis
 
         if (std::ssize(config->CreationTimeHistogramBucketBounds) > MaxChunkCreationTimeHistogramBuckets) {
             THROW_ERROR_EXCEPTION("\"creation_time_histogram_bucket_bounds\" is too large")
-                << TErrorAttribute("size", std::ssize(config->CreationTimeHistogramBucketBounds))
-                << TErrorAttribute("limit", MaxChunkCreationTimeHistogramBuckets);
+                .With("size", std::ssize(config->CreationTimeHistogramBucketBounds))
+                .With("limit", MaxChunkCreationTimeHistogramBuckets);
         }
 
         Sort(config->CreationTimeHistogramBucketBounds);
@@ -353,6 +353,8 @@ void TDynamicDataNodeTrackerConfig::Register(TRegistrar registrar)
         .Default(true);
     registrar.Parameter("enable_chunk_replicas_throttling_in_heartbeats", &TThis::EnableChunkReplicasThrottlingInHeartbeats)
         .Default(false);
+    registrar.Parameter("flush_batched_incremental_heartbeats_on_throttling", &TThis::FlushBatchedIncrementalHeartbeatsOnThrottling)
+        .Default(false);
     registrar.Parameter("enable_location_indexes_in_data_node_heartbeats", &TThis::EnableLocationIndexesInDataNodeHeartbeats)
         .Default(false);
     registrar.Parameter("use_location_indexes_in_sequoia_chunk_confirmation", &TThis::UseLocationIndexesInSequoiaChunkConfirmation)
@@ -379,10 +381,6 @@ void TDynamicDataNodeTrackerConfig::Register(TRegistrar registrar)
         .DefaultNew();
 
     registrar.Postprocessor([] (TThis* config) {
-        if (config->EnableValidationFullHeartbeats && !config->EnablePerLocationFullHeartbeats) {
-            THROW_ERROR_EXCEPTION("Validation full heartbeats requires location full heartbeats to be enabled");
-        }
-
         if (!config->EnableLocationIndexesInDataNodeHeartbeats) {
             if (config->UseLocationIndexesInSequoiaChunkConfirmation) {
                 THROW_ERROR_EXCEPTION("Location indices in chunk confirmation requires location indices in data node heartbeats to be enabled");
@@ -502,10 +500,10 @@ void TDynamicSequoiaChunkReplicasConfig::Register(TRegistrar registrar)
         .Default(TDuration::Seconds(1));
 
     registrar.Parameter("max_requests_in_incremental_heartbeat_batch", &TThis::MaxRequestsInIncrementalHeartbeatBatch)
-        .Default(100);
+        .Default(5);
 
     registrar.Parameter("max_replicas_in_incremental_heartbeat_batch", &TThis::MaxReplicasInIncrementalHeartbeatBatch)
-        .Default(30000);
+        .Default(3000);
 
     // COMPAT(grphil).
     registrar.Parameter("compat_replicas_percentage", &TThis::CompatReplicasPercentage)
@@ -1043,6 +1041,12 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
         .Default(false)
         .DontSerializeDefault();
 
+    registrar.Parameter(
+        "update_historically_non_vital_on_chunk_creation_and_export",
+        &TThis::UpdateHistoricallyNonVitalOnChunkCreationAndExport)
+        .Default(false)
+        .DontSerializeDefault();
+
     registrar.Parameter("allow_offshore_media", &TThis::AllowOffshoreMedia)
         .Default(false);
 
@@ -1061,8 +1065,28 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
             }
         }
 
-        if (config->SequoiaChunkReplicas->Enable && config->AllowOffshoreMedia) {
+        const auto& sequoiaReplicasConfig = config->SequoiaChunkReplicas;
+        const auto& dataNodeTrackerConfig = config->DataNodeTracker;
+
+        if (sequoiaReplicasConfig->Enable && config->AllowOffshoreMedia) {
             THROW_ERROR_EXCEPTION("Offshore media and Sequoia replicas cannot coexist (yet)");
+        }
+
+        if (sequoiaReplicasConfig->Enable && sequoiaReplicasConfig->BatchIncrementalHeartbeat) {
+            if (dataNodeTrackerConfig->EnableChunkReplicasThrottlingInHeartbeats) {
+                if (dataNodeTrackerConfig->MaxConcurrentChunkReplicasDuringIncrementalHeartbeat <
+                    sequoiaReplicasConfig->MaxReplicasInIncrementalHeartbeatBatch * 2)
+                {
+                    // We should allow at least 2x of MaxReplicasInIncrementalHeartbeatBatch for batching not to stuck.
+                    THROW_ERROR_EXCEPTION("max_concurrent_chunk_replicas_during_incremental_heartbeat should be at lest 2x of Sequoia max_replicas_in_incremental_heartbeat_batch");
+                }
+            } else {
+                if (dataNodeTrackerConfig->MaxConcurrentIncrementalHeartbeats <=
+                    sequoiaReplicasConfig->MaxRequestsInIncrementalHeartbeatBatch)
+                {
+                    THROW_ERROR_EXCEPTION("max_concurrent_incremental_heartbeats should be grater than Sequoia max_requests_in_incremental_heartbeat_batch");
+                }
+            }
         }
     });
 }

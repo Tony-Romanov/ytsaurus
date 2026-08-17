@@ -138,6 +138,8 @@ public:
             .SetHeavy(true));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(AttachChunkTrees)
             .SetHeavy(true));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(DetachChunkTrees)
+            .SetHeavy(true));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(ExecuteBatch)
             .SetCancelable(true)
             .SetHeavy(true)
@@ -568,10 +570,10 @@ private:
                 auto* medium = chunkManager->GetMediumByIndexOrThrow(sessionId.MediumIndex);
                 if (medium->IsOffshore()) {
                     THROW_ERROR_EXCEPTION("Write targets allocation for offshore media is forbidden")
-                        << TErrorAttribute("chunk_id", sessionId.ChunkId)
-                        << TErrorAttribute("medium_index", medium->GetIndex())
-                        << TErrorAttribute("medium_name", medium->GetName())
-                        << TErrorAttribute("medium_type", medium->GetType());
+                        .With("chunk_id", sessionId.ChunkId)
+                        .With("medium_index", medium->GetIndex())
+                        .With("medium_name", medium->GetName())
+                        .With("medium_type", medium->GetType());
                 }
 
                 TNodeList forbiddenNodes;
@@ -617,7 +619,7 @@ private:
                     // This is really weird.
                     if (it == replicas.end()) {
                         THROW_ERROR_EXCEPTION("Replicas were not fetched for chunk")
-                            << TErrorAttribute("chunk_id", sessionId.ChunkId);
+                            .With("chunk_id", sessionId.ChunkId);
                     }
 
                     const auto& chunkReplicas = it->second
@@ -726,7 +728,7 @@ private:
 
         auto syncSession = New<TMultiPhaseCellSyncSession>(
             Bootstrap_,
-            ChunkServerLogger().WithTag("RequestId: %v", context->GetRequestId()));
+            ChunkServerLogger().WithTag("RequestId", context->GetRequestId()));
         WaitFor(syncSession->Sync(cellTagsToSyncWith))
             .ThrowOnError();
 
@@ -862,6 +864,25 @@ private:
             chunkManager->CreateAttachChunkTreesMutation(context),
             enableMutationBoomerangs,
             AreCypressTransactionsInSequoiaEnabled());
+    }
+
+    DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, DetachChunkTrees)
+    {
+        auto parentId = FromProto<TChunkListId>(request->parent_id());
+
+        context->SetRequestInfo(
+            "ParentId: %v, "
+            "ChildCount: %v",
+            parentId,
+            request->child_ids_size());
+
+        ValidateClusterInitialized();
+        ValidatePeer(EPeerKind::Leader);
+
+        const auto& chunkManager = Bootstrap_->GetChunkManager();
+        auto mutation = chunkManager->CreateDetachChunkTreesMutation(context);
+        mutation->SetCurrentTraceContext();
+        YT_UNUSED_FUTURE(mutation->CommitAndReply(context));
     }
 
     DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, UnstageChunkTree)

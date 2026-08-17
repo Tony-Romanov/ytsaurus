@@ -1,9 +1,11 @@
 RECURSE(
     add_message_distribute_flag
+    arrival_order_table_sink
     at_most_once_sink
     companion
     computation_cycles_and_buffers
     diagnostic_tools
+    epoch_seqno_sync
     external_joiner
     flow_execute
     ipv4_support
@@ -40,6 +42,8 @@ RECURSE(
     test_distributed_throttler/pipeline
     test_resource_control_channel
     test_resource_control_channel/pipeline
+    transform_ordered_source
+    transform_ordered_source/pipeline
     word_count_sync
     working_pipeline_telemetry
     working_pipeline_telemetry/pipeline
@@ -61,6 +65,8 @@ IF (NOT OPENSOURCE)
     )
 
     RECURSE(
+        key_visitor/go
+        key_visitor/go/pipeline
         key_visitor/java
         key_visitor/java/companion
         key_visitor/java_external

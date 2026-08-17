@@ -188,6 +188,9 @@ public:
     //! Returns the medium name.
     std::string GetMediumName() const;
 
+    //! Returns the medium index.
+    int GetMediumIndex() const;
+
     //! Returns the medium descriptor.
     NChunkClient::TMediumDescriptorPtr GetMediumDescriptor() const;
 
@@ -304,6 +307,8 @@ public:
     //! Try to acquire memory for top requests.
     void CheckProbePutBlocksRequests();
 
+    void RemoveProbePutBlocksRequestSupplier(const TProbePutBlocksRequestSupplierPtr& supplier);
+
     //! Calc sum of all requested memory passeed to AcquireProbePutBlocks.
     i64 GetRequestedMemory() const;
 
@@ -328,7 +333,6 @@ private:
 
     TLocationPerformanceCountersPtr PerformanceCounters_;
 
-    // TODO(vvshlyaga): Change to fair share queue.
     YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, ProbePutBlocksRequestsLock_);
     std::deque<TProbePutBlocksRequestSupplierPtr> ProbePutBlocksRequests_;
     THashSet<TSessionId> ProbePutBlocksSessionIds_;
@@ -336,7 +340,6 @@ private:
     const IMemoryUsageTrackerPtr ReadMemoryTracker_;
     const IMemoryUsageTrackerPtr WriteMemoryTracker_;
 
-    TChunkLocationUuid Uuid_;
     TChunkLocationIndex Index_ = NNodeTrackerClient::InvalidChunkLocationIndex;
 
     TAtomicIntrusivePtr<NChunkClient::TMediumDescriptor> MediumDescriptor_;
@@ -360,6 +363,8 @@ private:
     THazardPtr<TChunkLocationConfig> GetRuntimeConfig() const;
 
     void DoCheckProbePutBlocksRequests();
+    void DoCheckFifoProbePutBlocksRequests();
+    void DoCheckFairShareProbePutBlocksRequests();
     bool ContainsProbePutBlocksRequestSupplier(const TProbePutBlocksRequestSupplierPtr& supplier) const;
 
     void IncreaseUsedMemory(EIODirection direction, EIOCategory category, i64 delta);

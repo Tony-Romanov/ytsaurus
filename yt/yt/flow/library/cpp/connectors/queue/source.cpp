@@ -54,9 +54,9 @@ int ExtractQueuePartitionIndex(const TKey& key)
 {
     if (key.Underlying().GetCount() != QueueKeyExpectedColumns) {
         THROW_ERROR_EXCEPTION("Queue Key should have exactly %v fields, got: %v",
-                QueueKeyExpectedColumns,
-                key.Underlying().GetCount())
-            << TErrorAttribute("queue_key", key);
+            QueueKeyExpectedColumns,
+            key.Underlying().GetCount())
+            .With("queue_key", key);
     }
     return FromUnversionedValue<i64>(key.Underlying()[QueueKeyPartitionIndexColumn]);
 }
@@ -78,7 +78,7 @@ TQueueSourceController::TQueueSourceController(
         GetParameters(),
         GetContext()->ClientsCache->GetClient(*GetParameters()->QueuePath.GetCluster()),
         GetContext()->Invoker,
-        GetContext()->Logger.WithTag("QueuePath: %v", GetParameters()->QueuePath),
+        GetContext()->Logger.WithTag("QueuePath", GetParameters()->QueuePath),
         GetContext()->StatusProfiler->WithPrefix("/queue_info")))
 {
 }
@@ -148,10 +148,10 @@ TQueueSourceImpl::TQueueSourceImpl(
     TDynamicSourceContextPtr dynamicContext)
     : TIntegerOffsetOrderedSourceBase(std::move(context), std::move(dynamicContext))
     , PartitionIndex_(ExtractQueuePartitionIndex(GetContext()->SourceKey))
-    , Logger(TOrderedSourceBase::Logger.WithTag("QueuePath: %v, ConsumerPath: %v, PartitionIndex: %v",
-        GetParameters()->QueuePath,
-        GetParameters()->ConsumerPath,
-        PartitionIndex_))
+    , Logger(TOrderedSourceBase::Logger
+            .WithTag("QueuePath", GetParameters()->QueuePath)
+            .WithTag("ConsumerPath", GetParameters()->ConsumerPath)
+            .WithTag("PartitionIndex", PartitionIndex_))
     , ConsumerClient_(GetContext()->ClientsCache->GetClient(*GetParameters()->ConsumerPath.GetCluster()))
     , QueueClient_(GetContext()->ClientsCache->GetClient(*GetParameters()->QueuePath.GetCluster()))
     , SubConsumerClient_(NQueueClient::CreateSubConsumerClient(
@@ -165,6 +165,8 @@ TQueueSourceImpl::TQueueSourceImpl(
 
 void TQueueSourceImpl::DoInit()
 {
+    ReadErrorState_ = CreateAvailabilityErrorState("/read");
+
     PartitionInfoUpdater_ = New<NConcurrency::TPeriodicExecutor>(
         GetContext()->SerializedInvoker,
         BIND(&TQueueSourceImpl::TryUpdatePartitionInfo, MakeWeak(this)),
@@ -297,7 +299,7 @@ void TQueueSourceImpl::TryUpdatePartitionInfo()
         }
         UpdatePartitionInfoErrorState_->ClearError();
     } catch (const std::exception& ex) {
-        auto error = TError("Failed to update partition info") << TError(ex);
+        auto error = TError("Failed to update partition info").With(TError(ex));
         UpdatePartitionInfoErrorState_->SetError(error);
     }
 }
@@ -375,11 +377,11 @@ auto TQueueSourceImpl::DoReadNextBatch(
                     auto future = std::move(CurrentRequestFuture_);
                     CurrentRequestFuture_ = {};
                     if (future.GetOrCrash().IsOK()) {
-                        GetReadErrorState()->ClearError();
+                        ReadErrorState_->ClearError();
                         return future;
                     } else {
                         auto error = TError("Failed to read from partition") << future.GetOrCrash();
-                        GetReadErrorState()->SetError(error);
+                        ReadErrorState_->SetError(error);
                     }
                 }
                 return MakeFuture(std::vector<TQueueSourceImpl::TRecord>{});
@@ -433,11 +435,11 @@ auto TQueueSourceImpl::ParseData(
                 } catch (const std::exception& ex) {
                     if (GetParameters()->IgnoreMalformedFlowQueueMeta) {
                         YT_TLOG_WARNING("Failed to parse flow queue meta")
-                            .With("RawMeta", *raw, "%Qv")
+                            .With("RawMeta", *raw)
                             .With(ex);
                     } else {
                         THROW_ERROR_EXCEPTION("Failed to parse flow queue meta from %Qv", *raw)
-                            << TError(ex);
+                            .With(TError(ex));
                     }
                 }
             }

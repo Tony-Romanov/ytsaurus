@@ -51,6 +51,11 @@ namespace NYT::NFlow {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+inline constexpr TStringBuf ActiveSourceStateName = "$active_source";
+inline constexpr TStringBuf WatermarkStateName = "$watermark";
+
+////////////////////////////////////////////////////////////////////////////////
+
 //! A default abstract base class for all computations.
 /*!
  *  This base provides the following features out-of-the-box:
@@ -152,7 +157,8 @@ protected:
     bool UpdateTraverse(
         TSystemTimestamp reportTime,
         TSystemTimestamp systemWatermark,
-        const THashMap<TStreamId, TInflightStreamTraverseDataPtr>& inflights);
+        const THashMap<TStreamId, TInflightStreamTraverseDataPtr>& inflights,
+        i64 iterationCycle);
 
     //! Returns the distributed throttler client for the given id.
     //! Throws if |throttlerId| is not in the dynamic pipeline spec's
@@ -306,6 +312,9 @@ struct TUniversalComputationDynamicPartitionSpec
 public:
     NYTree::IMapNodePtr ActiveSource;
     THashSet<TStreamId> BlockedOutputStreams;
+    //! Every partition of this partition's availability group is unavailable, as decided by the last
+    //! traverse. Passed to the source so it can stop publishing errors, never to be acted upon otherwise.
+    bool AvailabilityGroupUnavailable{};
 
     REGISTER_YSON_STRUCT(TUniversalComputationDynamicPartitionSpec);
 
@@ -452,7 +461,8 @@ protected:
     TSystemTimestamp GetWatermark(const TStreamId& streamId, ETimeType timeType) const;
     TSystemTimestamp GetEpochWatermark(const TStreamId& streamId, ETimeType timeType) const;
 
-    THashMap<TStreamId, TInflightStreamTraverseDataPtr> BuildInflights() const;
+    THashMap<TStreamId, TInflightStreamTraverseDataPtr> BuildInflights(
+        const IComputationRunContextPtr& context) const;
 
     void RegisterInputBeforeProcessing(
         const std::vector<TInputMessageConstPtr>& inputMessages,
@@ -511,6 +521,9 @@ protected:
     TCheckOutputLimitsResult CheckOutputLimits(
         const TDynamicComputationSpecPtr& dynamicSpec,
         const TUniversalComputationDynamicPartitionSpecPtr& dynamicPartitionSpec);
+    void InitBufferWarmupState();
+    void RefreshBufferWarmupState();
+
     void WaitForBackoff(
         const TDynamicComputationSpecPtr& dynamicSpec,
         const TCheckOutputLimitsResult& outputLimitsCheckResult,
@@ -518,6 +531,8 @@ protected:
     void ValidateTimerStoreLimits(const TDynamicComputationSpecPtr& dynamicSpec) const;
 
     ITimeProvider::TGlobalUniqueSeqNo GenerateGlobalUniqueSeqNo();
+
+    std::optional<TUniqueSeqNo> GetEpochUniqueSeqNo() const;
 
     template <class... T>
     void ClearAsynchronously(T&&... args) const
@@ -537,6 +552,12 @@ protected:
     void DoInterrupt(const IComputationRunContextPtr& context, NTracing::TTraceContextGuard&& initTraceContextGuard);
     void DoComplete(const IComputationRunContextPtr& context, NTracing::TTraceContextGuard&& initTraceContextGuard);
     void DoCleanup(const IComputationRunContextPtr& context, bool eraseOwnedState);
+
+    //! Computations that register persisted keyed output (#IOutputStore::TryRegisterKeyedBatch
+    //! with |persist| = true) must drain it before DoCleanup erases the source key's state,
+    //! or the output rows are orphaned (never delivered, no TTL) and get re-sent with a reset
+    //! dedup state if the key's range is later re-read.
+    virtual bool HasPersistedKeyedOutput() const;
 
     ISinkPtr GetOrCreateSink(const TSinkId& sinkId, const std::optional<TKey>& parentKey, const TDynamicComputationSpecPtr& dynamicSpec);
     std::vector<std::tuple<TSinkId, std::optional<TKey>, ISinkPtr>> GetAllSinks() const;
@@ -558,7 +579,7 @@ protected:
         const auto spec = GetContext()->StreamSpecStorage->GetSpec(message.StreamId);
         if (!spec->ClassName) {
             THROW_ERROR_EXCEPTION("Impossible to convert message to yson message due to undefined \"class_name\"")
-                << TErrorAttribute("stream_id", message.StreamId);
+                .With("stream_id", message.StreamId);
         }
         auto ysonMessage = TRegistry::Get()->CreateYsonMessage(*spec->ClassName);
         ::NYT::NFlow::ConvertToYsonMessage(message, ysonMessage);
@@ -578,7 +599,7 @@ protected:
         auto spec = GetContext()->StreamSpecStorage->GetSpec(streamId);
         if (!spec->ClassName) {
             THROW_ERROR_EXCEPTION("Impossible to convert yson message to message due to undefined \"class_name\"")
-                << TErrorAttribute("stream_id", streamId);
+                .With("stream_id", streamId);
         }
         TRegistry::Get()->ValidateYsonMessageType(*spec->ClassName, ysonMessage);
         auto message = ::NYT::NFlow::ConvertToMessage(ysonMessage, spec->Schema);
@@ -596,6 +617,11 @@ protected:
 
 protected:
     const TJobStateManagerPtr StateManager_;
+    //! System partition state carrying #TPartitionBufferWarmup: read at start to
+    //! seed the buffer manager, refreshed (drift-gated) before every commit.
+    IMutableStateProviderPtr BufferWarmupState_;
+    TPartitionBufferWarmup LastWrittenWarmup_;
+    TInstant LastWarmupRefreshInstant_;
     const bool HasVisitorDrivenJoiners_;
     const std::optional<TStreamId> ActiveSourceStreamId_;
     const ISourcePtr ActiveSource_;
@@ -636,6 +662,8 @@ private:
 
     NProfiling::TEventTimer EpochTimer_;
     NProfiling::TCounter EpochCounter_;
+    //! Touched from the run fiber only; published by GenerateGlobalUniqueSeqNo.
+    std::optional<TUniqueSeqNo> EpochUniqueSeqNo_;
     THashMap<TStreamId, TStreamMessageCounters> StreamMessageCounters_;
 
     TStreamEventLagObserver InputEventLagObserver_;

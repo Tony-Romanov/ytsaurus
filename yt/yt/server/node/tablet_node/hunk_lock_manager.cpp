@@ -87,7 +87,7 @@ public:
         ITabletContext* context)
         : Tablet_(tablet)
         , Context_(context)
-        , Logger(TabletNodeLogger().WithTag("LockerTabletId: %v", tablet->GetId()))
+        , Logger(TabletNodeLogger().WithTag("LockerTabletId", tablet->GetId()))
     { }
 
     void StartEpoch() override
@@ -437,8 +437,8 @@ private:
     {
         if (lock) {
             auto error = TError("Hunk store lock aborted")
-                << TErrorAttribute("hunk_store_id", hunkStoreId)
-                << innerError;
+                .With("hunk_store_id", hunkStoreId)
+                .With(innerError);
             SetHunkStoreLockingFuture(hunkStoreId, std::move(error));
         } else {
             auto it = HunkStoreIdToLockingState_.find(hunkStoreId);

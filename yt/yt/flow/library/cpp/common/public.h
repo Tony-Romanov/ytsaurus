@@ -23,6 +23,7 @@ namespace NYT::NFlow {
 
 YT_DEFINE_STRONG_TYPEDEF(TJobId, TGuid);
 YT_DEFINE_STRONG_TYPEDEF(TIncarnationId, TGuid);
+YT_DEFINE_STRONG_TYPEDEF(TResourceInstanceId, TGuid);
 YT_DEFINE_STRONG_TYPEDEF(TKey, TCompactUnversionedOwningRow);
 struct TKeyRange;
 YT_FLOW_DEFINE_IDENTIFIER_TYPEDEF(TMessageId);
@@ -67,6 +68,7 @@ static constexpr auto ZeroSystemTimestamp = TSystemTimestamp(0);
 
 DECLARE_REFCOUNTED_STRUCT(ITimeProvider);
 DECLARE_REFCOUNTED_STRUCT(TDynamicPartitionSpec);
+DECLARE_REFCOUNTED_STRUCT(IPartitionBufferState);
 
 struct TMessageMeta;
 struct TMessage;
@@ -341,6 +343,18 @@ DECLARE_REFCOUNTED_STRUCT(TResourceRevision);
 DECLARE_REFCOUNTED_STRUCT(TResourceControllerContext);
 DECLARE_REFCOUNTED_STRUCT(TDynamicResourceControllerContext);
 DECLARE_REFCOUNTED_STRUCT(IResourceController);
+
+DECLARE_REFCOUNTED_STRUCT(TFileSourceSpec);
+DECLARE_REFCOUNTED_STRUCT(TFileSourceRevision);
+DECLARE_REFCOUNTED_STRUCT(TFileSourceContext);
+DECLARE_REFCOUNTED_STRUCT(IFileSource);
+
+DEFINE_ENUM(EFileResourceUpdateState,
+    ((Downloading)     (0))
+    ((Initializing)    (1))
+    ((Validating)      (2))
+    ((WaitingForRetry) (3))
+);
 
 using TVersionedResourceTargetRevisions = TVersionedValue<THashMap<TResourceId, TResourceRevisionPtr>>;
 DECLARE_REFCOUNTED_TYPE(TVersionedResourceTargetRevisions);

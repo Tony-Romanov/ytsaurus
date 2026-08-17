@@ -1,5 +1,6 @@
 #include "journal_block_device.h"
 
+#include "block_compactor.h"
 #include "block_flusher.h"
 #include "block_map.h"
 #include "block_store.h"
@@ -22,9 +23,14 @@
 
 #include <yt/yt/ytlib/table_client/table_read_spec.h>
 
+#include <yt/yt/client/api/transaction.h>
+#include <yt/yt/client/api/transaction_client.h>
+
 #include <yt/yt/client/ypath/rich.h>
 
 #include <yt/yt/client/misc/workload.h>
+
+#include <yt/yt/client/cypress_client/public.h>
 
 #include <yt/yt/client/object_client/public.h>
 
@@ -32,9 +38,14 @@
 
 #include <yt/yt/core/actions/future.h>
 
+#include <yt/yt/core/ytree/attribute_filter.h>
 #include <yt/yt/core/ytree/attributes.h>
+#include <yt/yt/core/ytree/convert.h>
+#include <yt/yt/core/ytree/fluent.h>
 
+#include <yt/yt/core/concurrency/periodic_yielder.h>
 #include <yt/yt/core/concurrency/scheduler_api.h>
+#include <yt/yt/core/concurrency/thread_affinity.h>
 #include <yt/yt/core/concurrency/thread_pool.h>
 
 #include <yt/yt/core/misc/async_slru_cache.h>
@@ -42,9 +53,9 @@
 #include <yt/yt/core/misc/finally.h>
 #include <yt/yt/core/misc/serialize.h>
 
-#include <yt/yt/core/ytree/fluent.h>
-
 #include <library/cpp/yt/logging/logger.h>
+
+#include <library/cpp/yt/misc/variant.h>
 
 #include <library/cpp/yt/threading/atomic_object.h>
 #include <library/cpp/yt/threading/spin_lock.h>
@@ -52,12 +63,16 @@
 namespace NYT::NNbd::NJournal {
 
 using namespace NApi;
+using namespace NChunkClient;
 using namespace NConcurrency;
 using namespace NObjectClient;
-
-namespace {
+using namespace NTableClient;
+using namespace NYPath;
+using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
+
+namespace {
 
 class TCleanBlock
     : public TAsyncCacheValueBase<TStoredBlockId, TCleanBlock>
@@ -90,7 +105,7 @@ public:
     { }
 
 protected:
-    i64 GetWeight(const TCleanBlockPtr& value) const override
+    i64 GetWeight(const TCleanBlockPtr& value) const final
     {
         return value->GetPayload().Size();
     }
@@ -112,8 +127,8 @@ public:
         TJournalBlockDeviceConfigPtr config,
         TJournalBlockDeviceOptionsPtr options,
         TTransactionId transactionId,
-        NChunkClient::TChunkListId chunkListId,
-        std::optional<TSnapshotLoadSpec> snapshotReadSpec,
+        TChunkListId chunkListId,
+        std::optional<TYPath> snapshotPath,
         NNative::IClientPtr client,
         NLogging::TLogger logger)
         : DeviceId_(std::move(deviceId))
@@ -123,9 +138,9 @@ public:
         , Invoker_(ThreadPool_->GetInvoker())
         , Logger(std::move(logger))
         , Client_(std::move(client))
-        , SnapshotReadSpec_(std::move(snapshotReadSpec))
+        , SnapshotPath_(std::move(snapshotPath))
         , ExternalCellTag_(CellTagFromId(transactionId))
-        , Geometry_(MakeGeometry(Options_->Size, Config_->BlockSize))
+        , Geometry_(MakeGeometry(Options_->DeviceSize, Options_->BlockSize))
         , BlockMap_(CreateBlockMap(Geometry_.BlockCount))
         , DirtyPool_(CreateDirtyBlockPool(
             static_cast<int>(Config_->BlockFlusher->DirtyBlockPoolCapacity / Geometry_.BlockSize)))
@@ -146,6 +161,14 @@ public:
             BlockStore_,
             Invoker_,
             Logger))
+        , BlockCompactor_(Config_->BlockCompactor
+            ? CreateBlockCompactor(
+                Config_->BlockCompactor,
+                BlockMap_,
+                BlockStore_,
+                Invoker_,
+                Logger)
+            : GetNullBlockCompactor())
     { }
 
     i64 GetTotalSize() const final
@@ -185,7 +208,7 @@ public:
 
     TFuture<void> Finalize() final
     {
-        BlockFlusher_->Stop();
+        StopBackgroundActivities();
 
         YT_LOG_INFO("Journal block device finalized");
 
@@ -207,16 +230,39 @@ public:
         return OKFuture;
     }
 
-    TCellTag GetExternalCellTag() const override
+    bool IsTrimSupported() const final
+    {
+        return true;
+    }
+
+    TFuture<void> Trim(i64 offset, i64 length, const TTrimOptions& /*options*/) final
+    {
+        // A whole-device discard covers every block of the map, so keep it off the connection thread.
+        return BIND(&TJournalBlockDevice::DoTrim, MakeStrong(this), offset, length)
+            .AsyncVia(Invoker_)
+            .Run();
+    }
+
+    TJournalBlockDeviceOptionsPtr GetOptions() const final
+    {
+        return Options_;
+    }
+
+    TCellTag GetExternalCellTag() const final
     {
         return ExternalCellTag_;
     }
 
-    TFuture<void> SaveSnapshot(const TSnapshotSaveSpec& spec) override
+    TFuture<TSnapshotSaveResult> SaveSnapshot(const TSnapshotSaveSpec& spec) final
     {
         return BIND(&TJournalBlockDevice::DoSaveSnapshot, MakeStrong(this), spec)
             .AsyncVia(Invoker_)
             .Run();
+    }
+
+    TFuture<void> FlushBlocks() final
+    {
+        return BlockFlusher_->RequestFlushBarrier();
     }
 
 private:
@@ -231,8 +277,8 @@ private:
     const IInvokerPtr Invoker_;
     const NLogging::TLogger Logger;
     const NNative::IClientPtr Client_;
-    //! If set, the snapshot the device restores from on initialization.
-    const std::optional<TSnapshotLoadSpec> SnapshotReadSpec_;
+    //! If set, the path of the snapshot the device restores from on initialization.
+    const std::optional<TYPath> SnapshotPath_;
     //! The cell hosting the device's chunks (derived from its transaction); a snapshot table must be
     //! co-located here so it can reference them.
     const TCellTag ExternalCellTag_;
@@ -244,10 +290,11 @@ private:
     const TSharedRef EmptyBlock_;
     const IBlockStorePtr BlockStore_;
     const IBlockFlusherPtr BlockFlusher_;
+    const IBlockCompactorPtr BlockCompactor_;
 
     struct TSnapshotInfo
     {
-        NYPath::TYPath Path;
+        TYPath Path;
         TInstant Timestamp;
     };
 
@@ -255,38 +302,68 @@ private:
     //! #DoSaveSnapshot) and read from the orchid producer (on an arbitrary thread).
     NThreading::TAtomicObject<std::optional<TSnapshotInfo>> LatestSnapshotInfo_;
 
-    void DoBuildOrchid(NYson::IYsonConsumer* consumer) const override
+    void DoBuildOrchid(NYson::IYsonConsumer* consumer) const final
     {
         auto snapshotInfo = LatestSnapshotInfo_.Load();
 
-        NYTree::BuildYsonMapFragmentFluently(consumer)
-            .Item("block_count").Value(Geometry_.BlockCount)
+        BuildYsonMapFragmentFluently(consumer)
+            .Item("total_block_count").Value(Geometry_.BlockCount)
             .Item("used_block_count").Value(BlockMap_->GetUsedBlockCount())
             .Item("dirty_pool_size").Value(DirtyPool_->GetSize())
             .Item("dirty_pool_capacity").Value(DirtyPool_->GetCapacity())
-            .Item("chunks").DoMap([this] (NYTree::TFluentMap fluent) {
-                BlockStore_->BuildChunksOrchid(fluent);
+            .Item("chunks").DoMapFor(BlockStore_->GetChunkInfos(), [] (TFluentMap fluent, const TChunkInfo& info) {
+                fluent.Item(ToString(info.ChunkId)).BeginMap()
+                    .Item("index").Value(info.ChunkIndex)
+                    .Item("restored").Value(info.RestoredFromSnapshot)
+                    .Item("seal_state").Value(info.SealState)
+                    .Item("record_count").Value(info.RecordCount)
+                    .Item("data_size").Value(info.DataSize)
+                    .Item("referenced_block_count").Value(info.ReferencedBlockCount)
+                    .Item("written_block_count").Value(info.WrittenBlockCount)
+                    .Item("droppable").Value(info.Droppable)
+                .EndMap();
             })
             // Whether the device was restored from a snapshot, and the latest one it has saved.
-            .Item("restored_from_snapshot").Value(SnapshotReadSpec_.has_value())
-            .DoIf(snapshotInfo.has_value(), [&] (NYTree::TFluentMap fluent) {
+            .Item("restored_from_snapshot").Value(SnapshotPath_.has_value())
+            .DoIf(snapshotInfo.has_value(), [&] (TFluentMap fluent) {
                 fluent
                     .Item("latest_snapshot_path").Value(snapshotInfo->Path)
                     .Item("latest_snapshot_timestamp").Value(snapshotInfo->Timestamp);
             });
     }
 
+    //! Once the device has failed, its chunks may be gone for good (an aborted staging transaction
+    //! destroys them), so upkeep has nothing left to converge on and would retry indefinitely.
+    void StopBackgroundActivities()
+    {
+        BlockCompactor_->Stop();
+        BlockFlusher_->Stop();
+        BlockStore_->Stop();
+    }
+
+    void OnDeviceFailed(const TError& error)
+    {
+        YT_LOG_ERROR(error, "Journal block device failed");
+
+        StopBackgroundActivities();
+    }
+
     void DoInitialize()
     {
-        if (SnapshotReadSpec_) {
-            RestoreFromSnapshot(*SnapshotReadSpec_);
+        YT_ASSERT_INVOKER_AFFINITY(Invoker_);
+
+        if (SnapshotPath_) {
+            RestoreFromSnapshot(*SnapshotPath_);
         }
 
         BlockFlusher_->SubscribeBlockFlushed(BIND(&TJournalBlockDevice::OnBlockFlushed, MakeWeak(this)));
-        BlockFlusher_->SubscribeFailed(BIND(&TJournalBlockDevice::OnFlushFailed, MakeWeak(this)));
-        BlockMap_->SubscribeStoredBlockDied(BIND(&TJournalBlockDevice::OnStoredBlockDied, MakeWeak(this)));
+        BlockStore_->SubscribeFailed(BIND(&TJournalBlockDevice::OnFailed, MakeWeak(this)));
+        BlockMap_->SubscribeStoredBlockUnreferenced(BIND(&TJournalBlockDevice::OnStoredBlockUnreferenced, MakeWeak(this)));
+        SubscribeError(BIND(&TJournalBlockDevice::OnDeviceFailed, MakeWeak(this)));
 
+        BlockStore_->Start();
         BlockFlusher_->Start();
+        BlockCompactor_->Start();
 
         YT_LOG_INFO("Journal block device initialized (BlockSize: %v, BlockCount: %v, DirtyPoolCapacity: %v)",
             Geometry_.BlockSize,
@@ -294,43 +371,136 @@ private:
             DirtyPool_->GetCapacity());
     }
 
-    //! Runs on Invoker_. Loads a previously saved snapshot.
-    void RestoreFromSnapshot(const TSnapshotLoadSpec& readSpec)
+    //! Loads a previously saved snapshot.
+    void RestoreFromSnapshot(const TYPath& path)
     {
-        YT_LOG_INFO("Restoring journal block device from snapshot");
+        YT_ASSERT_INVOKER_AFFINITY(Invoker_);
 
-        auto snapshotBlocks = ReadJournalSnapshot(Client_, readSpec, Logger);
+        YT_LOG_INFO("Restoring journal block device from snapshot (Path: %v)", path);
 
-        std::vector<TStoredBlockRef> blockRefs;
-        blockRefs.reserve(snapshotBlocks.size());
-        for (const auto& block : snapshotBlocks) {
-            THROW_ERROR_EXCEPTION_UNLESS(
-                0 <= block.Index && block.Index < Geometry_.BlockCount,
-                "Snapshot block index %v is out of range [0, %v) for a device of size %v",
-                block.Index,
-                Geometry_.BlockCount,
-                Geometry_.GetByteSize());
-            blockRefs.push_back(block.Ref);
-        }
-
-        auto storedBlockIds = WaitFor(BlockStore_->RestoreBlocks(blockRefs))
+        // Take a snapshot lock so the table (and the journal chunks it pins) cannot be removed while we
+        // fetch its read spec, read its rows, and fetch its chunks' sizes.
+        auto transactionAttributes = CreateEphemeralAttributes();
+        transactionAttributes->Set(
+            "title",
+            Format("Restoring from NBD snapshot %v", path));
+        TTransactionStartOptions transactionOptions;
+        transactionOptions.Attributes = std::move(transactionAttributes);
+        auto transaction = WaitFor(Client_->StartTransaction(
+            NTransactionClient::ETransactionType::Master,
+            transactionOptions))
             .ValueOrThrow();
 
-        TBlockMapSnapshot snapshot;
-        snapshot.Blocks.reserve(snapshotBlocks.size());
-        for (int index = 0; index < std::ssize(snapshotBlocks); ++index) {
-            snapshot.Blocks.emplace_back(snapshotBlocks[index].Index, ToMappedBlockId(storedBlockIds[index]));
+        TLockNodeOptions lockOptions;
+        lockOptions.TransactionId = transaction->GetId();
+        auto lockResult = WaitFor(Client_->LockNode(path, NCypressClient::ELockMode::Snapshot, lockOptions))
+            .ValueOrThrow();
+
+        // Address the table by the locked node's id: the snapshot lock pins the node, not the path, which a
+        // concurrent move or removal could otherwise redirect. Its path stays on the object for diagnostics.
+        TUserObject userObject(TRichYPath(path), transaction->GetId());
+        userObject.ObjectId = lockResult.NodeId;
+
+        TFetchSingleTableReadSpecOptions loadSpecOptions;
+        loadSpecOptions.TransactionId = transaction->GetId();
+
+        auto readSpec = FetchSingleTableReadSpec(
+            &userObject,
+            Client_,
+            loadSpecOptions);
+
+        // A large device's block map runs to tens of gigabytes, so it is never held whole.
+        auto reader = CreateSnapshotReader(Client_, userObject, readSpec, Geometry_, Invoker_, Logger);
+        WaitFor(reader->Open())
+            .ThrowOnError();
+
+        WaitFor(BlockStore_->BeginRestoreBlocks())
+            .ThrowOnError();
+        BlockMap_->BeginLoadSnapshot();
+
+        i64 blockCount = 0;
+        TBlockMapSnapshot blockMapSnapshot;
+        while (true) {
+            auto blocks = WaitFor(reader->ReadBlocks())
+                .ValueOrThrow();
+            if (blocks.empty()) {
+                break;
+            }
+
+            // Take the indexes before handing the batch over; the store consumes it.
+            blockMapSnapshot.Blocks.clear();
+            blockMapSnapshot.Blocks.reserve(blocks.size());
+            for (const auto& block : blocks) {
+                blockMapSnapshot.Blocks.emplace_back(block.Index, EmptyMappedBlockId);
+            }
+            blockCount += std::ssize(blocks);
+
+            auto storedBlockIds = WaitFor(BlockStore_->RestoreBlocks(std::move(blocks)))
+                .ValueOrThrow();
+            YT_VERIFY(std::ssize(storedBlockIds) == std::ssize(blockMapSnapshot.Blocks));
+            for (int index = 0; index < std::ssize(storedBlockIds); ++index) {
+                blockMapSnapshot.Blocks[index].second = ToMappedBlockId(storedBlockIds[index]);
+            }
+            BlockMap_->LoadSnapshotPart(blockMapSnapshot);
         }
-        BlockMap_->LoadSnapshot(snapshot);
+
+        BlockMap_->EndLoadSnapshot();
+
+        auto chunkBlockCounts = WaitFor(reader->GetChunkBlockCounts())
+            .ValueOrThrow();
+        WaitFor(BlockStore_->EndRestoreBlocks(chunkBlockCounts))
+            .ThrowOnError();
 
         YT_LOG_INFO("Journal block device restored from snapshot (BlockCount: %v)",
-            snapshotBlocks.size());
+            blockCount);
     }
 
-    //! Runs on Invoker_. Saves a crash-consistent point-in-time snapshot of the device to a Cypress
-    //! table, concurrently with ongoing writes.
+    //! Saves a crash-consistent point-in-time snapshot of the device to a Cypress table, concurrently
+    //! with ongoing writes.
     //! Defined out of line, below TSnapshotSession, which it instantiates.
-    void DoSaveSnapshot(const TSnapshotSaveSpec& spec);
+    TSnapshotSaveResult DoSaveSnapshot(const TSnapshotSaveSpec& spec);
+
+    //! Empties the block map over the trimmed range, so the blocks read back as zeroes and their stored
+    //! payloads become unreferenced -- which is what eventually lets a chunk go dead.
+    /*!
+     *  The clean-block cache is left as is: a discarded block's stored id is now unreachable from the
+     *  map, and stored ids are never reused, so a stale entry can never be read back.
+     */
+    void DoTrim(i64 offset, i64 length)
+    {
+        YT_ASSERT_INVOKER_AFFINITY(Invoker_);
+
+        auto deviceSize = Geometry_.GetByteSize();
+        THROW_ERROR_EXCEPTION_UNLESS(
+            offset >= 0 && length >= 0 && offset <= deviceSize && length <= deviceSize - offset,
+            "Trim request at offset %v of length %v is out of range for a device of size %v",
+            offset,
+            length,
+            deviceSize);
+
+        auto blockSize = Geometry_.BlockSize;
+        // Only the blocks the range fully covers are discarded; a partially covered head or tail block
+        // keeps its content, which is within a trim's latitude.
+        int beginBlockIndex = (offset + blockSize - 1) / blockSize;
+        int endBlockIndex = (offset + length) / blockSize;
+
+        // Do not hog Invoker_ for seconds.
+        auto yielder = CreatePeriodicYielder(TDuration::MilliSeconds(100));
+        int discardedBlockCount = 0;
+        for (int blockIndex = beginBlockIndex; blockIndex < endBlockIndex; ++blockIndex) {
+            yielder.TryYield();
+            if (BlockMap_->DiscardBlock(blockIndex)) {
+                ++discardedBlockCount;
+            }
+        }
+
+        YT_LOG_DEBUG("Blocks discarded (Offset: %v, Length: %v, BlockRange: [%v, %v), DiscardedBlockCount: %v)",
+            offset,
+            length,
+            beginBlockIndex,
+            endBlockIndex,
+            discardedBlockCount);
+    }
 
     struct TEmptyBlockTag
     { };
@@ -350,13 +520,12 @@ private:
             byteSize,
             blockSize);
 
-        constexpr i64 MaxBlockCount = 1LL << 30;
         auto blockCount = byteSize / blockSize;
         THROW_ERROR_EXCEPTION_UNLESS(
-            blockCount < MaxBlockCount,
+            blockCount < MaxBlocksPerDevice,
             "Journal device block count %v must be less than %v",
             blockCount,
-            MaxBlockCount);
+            MaxBlocksPerDevice);
 
         return TBlockDeviceGeometry{
             .BlockSize = blockSize,
@@ -368,19 +537,19 @@ private:
     {
         // Publish as clean only if no newer write superseded this block since it was drained;
         // otherwise the newer (dirty) version stays and the flushed copy is left orphaned.
-        if (BlockMap_->TryMakeClean(block->BlockIndex, block->BlockId, storedBlockId)) {
+        if (BlockMap_->TryPutBlock(block->BlockIndex, ToMappedBlockId(block->BlockId), storedBlockId)) {
             if (auto cookie = BlockCache_->BeginInsert(storedBlockId); cookie.IsActive()) {
                 cookie.EndInsert(New<TCleanBlock>(storedBlockId, block->Payload));
             }
         }
     }
 
-    void OnFlushFailed(const TError& error)
+    void OnFailed(const TError& error)
     {
         SetError(error);
     }
 
-    void OnStoredBlockDied(TStoredBlockId storedBlockId)
+    void OnStoredBlockUnreferenced(TStoredBlockId storedBlockId)
     {
         BlockStore_->ReleaseBlock(storedBlockId);
     }
@@ -451,10 +620,7 @@ private:
             blockIds.push_back(blockId);
         }
 
-        NChunkClient::TClientChunkReadOptions options{
-            .WorkloadDescriptor = TWorkloadDescriptor(EWorkloadCategory::UserInteractive),
-        };
-        Owner_->BlockStore_->ReadBlocks(blockIds, options)
+        Owner_->BlockStore_->ReadBlocks(blockIds, EWorkloadCategory::UserInteractive)
             .AsUnique()
             .Subscribe(
                 BIND(&TReadSession::OnBlocksRead, MakeStrong(this))
@@ -495,8 +661,10 @@ private:
 
     void OnBlocksRead(TErrorOr<std::vector<TSharedRef>>&& resultOrError)
     {
+        YT_ASSERT_INVOKER_AFFINITY(Owner_->Invoker_);
+
         if (!resultOrError.IsOK()) {
-            auto error = TError("Block read failed") << resultOrError;
+            auto error = TError("Block read failed").With(resultOrError);
             Owner_->SetError(error);
             Promise_.Set(error);
             return;
@@ -598,7 +766,7 @@ private:
                 // The pool is full and the put is waiting for space; kick the flusher out of
                 // band (rather than idling until the next periodic tick) and resume via a
                 // subscription once space frees up.
-                Owner_->BlockFlusher_->RequestFlush();
+                Owner_->BlockFlusher_->RequestFlush(/*force*/ true);
                 future.Subscribe(BIND(&TWriteSession::OnPut, MakeStrong(this)));
                 return;
             }
@@ -626,11 +794,28 @@ private:
     {
         for (int index = 0; index < std::ssize(blockIds); ++index) {
             const auto& block = Blocks_[WrittenBlockCount_ + index];
-            Owner_->BlockMap_->PutDirty(block->BlockIndex, blockIds[index]);
+            Owner_->BlockMap_->PutBlock(block->BlockIndex, blockIds[index]);
         }
         WrittenBlockCount_ += std::ssize(blockIds);
+
+        Owner_->BlockFlusher_->RequestFlush();
     }
 };
+
+////////////////////////////////////////////////////////////////////////////////
+
+//! Walks an open snapshot in parts of |partSize| blocks, handing each to |onPart|. Bounds what a caller
+//! holds at once to one part, whatever the device's size.
+template <class TOnPart>
+void ScanSnapshot(const IBlockMapPtr& blockMap, int partSize, const TOnPart& onPart)
+{
+    YT_VERIFY(partSize > 0);
+
+    int blockCount = blockMap->GetBlockCount();
+    for (int begin = 0; begin < blockCount; begin += partSize) {
+        onPart(blockMap->ScanSnapshotPart(begin, std::min(begin + partSize, blockCount)));
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -642,67 +827,88 @@ public:
         : Owner_(std::move(owner))
     { }
 
-    //! Runs on Owner_->Invoker_. Snapshots a consistent point-in-time cut of the block map and returns a
-    //! stored location for every used block, blocking until each snapshotted dirty version is flushed.
+    //! Registers every dirty version the open snapshot captures and blocks until each is flushed,
+    //! returning how many blocks the cut holds.
     /*!
-     *  Clean blocks resolve straight from the snapshot; dirty ones resolve to the location their flush
-     *  yields. We subscribe to BlockFlushObserved before arming the scan and the map fires it strictly
+     *  Clean blocks resolve straight from the cut; dirty ones resolve to the location their flush
+     *  yields. We subscribe to BlockFlushObserved before arming the cut and the map fires it strictly
      *  after updating the slot, so no flush the snapshot may reference is missed: a block captured dirty is
      *  either already in Flushed_ (not registered as pending) or still Pending_ and waited for.
+     *
+     *  Leaves the cut armed for the caller to scan; ends it if this throws.
      */
-    std::vector<std::pair<int, TStoredBlockId>> Run()
+    i64 Run()
     {
+        YT_ASSERT_INVOKER_AFFINITY(Owner_->Invoker_);
+
         auto onBlockFlushObserved = BIND(&TSnapshotSession::OnBlockFlushObserved, MakeStrong(this));
-        auto onFlushFailed = BIND(&TSnapshotSession::OnFlushFailed, MakeStrong(this));
+        auto onFailed = BIND(&TSnapshotSession::OnFailed, MakeStrong(this));
         Owner_->BlockMap_->SubscribeBlockFlushObserved(onBlockFlushObserved);
-        Owner_->BlockFlusher_->SubscribeFailed(onFlushFailed);
+        Owner_->SubscribeError(onFailed);
         auto unsubscribeGuard = Finally([&] {
             Owner_->BlockMap_->UnsubscribeBlockFlushObserved(onBlockFlushObserved);
-            Owner_->BlockFlusher_->UnsubscribeFailed(onFlushFailed);
+            Owner_->UnsubscribeError(onFailed);
         });
 
-        auto snapshot = Owner_->BlockMap_->TakeSnapshot();
+        // Register the captured dirty versions not already flushed as pending; each one's flush yields
+        // its stored location via OnBlockFlushObserved. Retains nothing per block: the caller re-scans
+        // the same cut to emit the rows once the flushes have landed.
+        Owner_->BlockMap_->BeginSnapshot();
+        auto endSnapshotGuard = Finally([&] {
+            Owner_->BlockMap_->EndSnapshot();
+        });
 
-        // Register the snapshotted dirty versions not already flushed as pending; each one's flush
-        // yields its stored location via OnBlockFlushObserved.
+        i64 blockCount = 0;
+        // Bounded by the dirty pool's capacity, unlike the cut itself.
+        std::vector<ui64> dirtyBlockIds;
+        ScanSnapshot(Owner_->BlockMap_, Owner_->Config_->SnapshotBlocksPerBatch, [&] (const TBlockMapSnapshot& part) {
+            blockCount += std::ssize(part.Blocks);
+            for (auto [blockIndex, mappedBlockId] : part.Blocks) {
+                if (IsDirtyMappedBlockId(mappedBlockId)) {
+                    dirtyBlockIds.push_back(ToDirtyBlockId(mappedBlockId).Underlying());
+                }
+            }
+        });
+
         {
             auto guard = Guard(Lock_);
-            for (const auto& [blockIndex, mappedBlockId] : snapshot.Blocks) {
-                if (IsDirtyMappedBlockId(mappedBlockId) &&
-                    !Flushed_.contains(ToDirtyBlockId(mappedBlockId).Underlying()))
-                {
-                    Pending_.insert(ToDirtyBlockId(mappedBlockId).Underlying());
+            for (auto dirtyBlockId : dirtyBlockIds) {
+                if (!Flushed_.contains(dirtyBlockId)) {
+                    Pending_.insert(dirtyBlockId);
                 }
             }
             if (Pending_.empty()) {
-                AllFlushed_.TrySet();
+                AllFlushedPromise_.TrySet();
             }
         }
 
         // The snapshotted dirty versions all sit below the pool's current tail, so an eager flush drains
         // them; wait until every one has been flushed.
-        Owner_->BlockFlusher_->RequestFlushAll();
-        // Uncancelable so the timeout cannot cancel AllFlushed_ out from under the flusher callbacks.
-        WaitFor(AllFlushed_.ToFuture()
-            .ToUncancelable()
+        auto flushBarrierFuture = Owner_->BlockFlusher_->RequestFlushBarrier();
+
+        // Neither the timeout nor a failed barrier may cancel AllFlushedPromise_ out from under the flusher
+        // callbacks.
+        WaitFor(AllSucceeded(
+            std::vector{flushBarrierFuture, AllFlushedPromise_.ToFuture()},
+            {.PropagateCancelationToInput = false, .CancelInputOnShortcut = false})
             .WithTimeout(
                 Owner_->Config_->BlockStore->SnapshotFlushTimeout,
                 {.Error = TError("Timed out flushing the snapshot blocks")}))
             .ThrowOnError();
 
-        // The snapshot is in ascending block index order, so the result is too.
-        std::vector<std::pair<int, TStoredBlockId>> blocks;
-        blocks.reserve(snapshot.Blocks.size());
-        {
-            auto guard = Guard(Lock_);
-            for (const auto& [blockIndex, mappedBlockId] : snapshot.Blocks) {
-                auto storedBlockId = IsStoredMappedBlockId(mappedBlockId)
-                    ? ToStoredBlockId(mappedBlockId)
-                    : GetOrCrash(Flushed_, ToDirtyBlockId(mappedBlockId).Underlying());
-                blocks.emplace_back(blockIndex, storedBlockId);
-            }
+        endSnapshotGuard.Release();
+        return blockCount;
+    }
+
+    //! Resolves a snapshotted mapped id to where its content ended up. Only after #Run has returned,
+    //! by which point every snapshotted dirty version has been flushed.
+    TStoredBlockId ResolveStoredBlockId(TMappedBlockId mappedBlockId)
+    {
+        if (IsStoredMappedBlockId(mappedBlockId)) {
+            return ToStoredBlockId(mappedBlockId);
         }
-        return blocks;
+        auto guard = Guard(Lock_);
+        return GetOrCrash(Flushed_, ToDirtyBlockId(mappedBlockId).Underlying());
     }
 
 private:
@@ -711,71 +917,115 @@ private:
     YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, Lock_);
     //! Stored location each block flushed during this session landed at, keyed by its dirty id.
     THashMap<ui64, TStoredBlockId> Flushed_;
-    //! Captured dirty versions not yet flushed; AllFlushed_ fires once this drains.
+    //! Captured dirty versions not yet flushed; AllFlushedPromise_ fires once this drains.
     THashSet<ui64> Pending_;
-    const TPromise<void> AllFlushed_ = NewPromise<void>();
+    const TPromise<void> AllFlushedPromise_ = NewPromise<void>();
 
     void OnBlockFlushObserved(TDirtyBlockId dirtyBlockId, TStoredBlockId storedBlockId)
     {
         auto guard = Guard(Lock_);
         Flushed_[dirtyBlockId.Underlying()] = storedBlockId;
         if (Pending_.erase(dirtyBlockId.Underlying()) > 0 && Pending_.empty()) {
-            AllFlushed_.TrySet();
+            AllFlushedPromise_.TrySet();
         }
     }
 
-    void OnFlushFailed(const TError& error)
+    void OnFailed(const TError& error)
     {
-        AllFlushed_.TrySet(TError("Block flush failed while taking a snapshot") << error);
+        AllFlushedPromise_.TrySet(TError("Device failed while taking a snapshot").With(error));
     }
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void TJournalBlockDevice::DoSaveSnapshot(const TSnapshotSaveSpec& spec)
+IJournalBlockDevice::TSnapshotSaveResult TJournalBlockDevice::DoSaveSnapshot(const TSnapshotSaveSpec& spec)
 {
+    YT_ASSERT_INVOKER_AFFINITY(Invoker_);
+
     BlockStore_->BeginSnapshot();
-    auto endSnapshotGuard = Finally([&] {
+    auto endStoreSnapshotGuard = Finally([&] {
         BlockStore_->EndSnapshot();
     });
 
-    // Blocks come back in ascending index order, as the sorted snapshot table requires.
-    auto blocks = New<TSnapshotSession>(MakeStrong(this))->Run();
+    auto session = New<TSnapshotSession>(MakeStrong(this));
+    auto blockCount = session->Run();
 
-    std::vector<TStoredBlockId> storedBlockIds;
-    storedBlockIds.reserve(blocks.size());
-    for (const auto& [blockIndex, storedBlockId] : blocks) {
-        storedBlockIds.push_back(storedBlockId);
-    }
-    auto blockRefs = BlockStore_->GetBlockRefs(storedBlockIds);
+    // Run leaves the cut armed so that the second pass below reads it too.
+    auto endMapSnapshotGuard = Finally([&] {
+        BlockMap_->EndSnapshot();
+    });
 
     // Reference exactly the chunks the snapshot uses, not every chunk the store ever created -- an
     // empty chunk is unconfirmed and could never be sealed.
-    std::vector<TSnapshotBlock> snapshotBlocks;
-    snapshotBlocks.reserve(blocks.size());
-    THashSet<NChunkClient::TChunkId> hunkChunkIdSet;
-    for (int index = 0; index < std::ssize(blocks); ++index) {
-        snapshotBlocks.push_back({
-            .Index = blocks[index].first,
-            .Ref = blockRefs[index],
+    std::vector<TChunkId> hunkChunkIds;
+    if (blockCount > 0) {
+        // The caller has created and resolved the table (|spec|) under its transaction; write the rows
+        // into it under the same transaction (the caller commits it).
+        auto writer = CreateSnapshotWriter(Client_, spec, Logger);
+        WaitFor(writer->Open())
+            .ThrowOnError();
+
+        // Emit the rows a batch at a time, re-scanning the cut rather than holding it in memory: a
+        // materialized cut costs O(block count), which a large device makes prohibitive. Blocks come
+        // back in ascending index order, as the sorted snapshot table requires.
+        std::vector<TStoredBlockId> storedBlockIds;
+        std::vector<TSnapshotBlock> snapshotBlocks;
+        i64 writtenBlockCount = 0;
+
+        ScanSnapshot(BlockMap_, Config_->SnapshotBlocksPerBatch, [&] (const TBlockMapSnapshot& part) {
+            if (part.Blocks.empty()) {
+                return;
+            }
+
+            storedBlockIds.clear();
+            for (auto [blockIndex, mappedBlockId] : part.Blocks) {
+                storedBlockIds.push_back(session->ResolveStoredBlockId(mappedBlockId));
+            }
+            auto blockRefs = BlockStore_->GetBlockRefs(storedBlockIds);
+
+            snapshotBlocks.clear();
+            for (int index = 0; index < std::ssize(part.Blocks); ++index) {
+                snapshotBlocks.push_back({
+                    .Index = part.Blocks[index].first,
+                    .Ref = blockRefs[index],
+                });
+            }
+            WaitFor(writer->WriteBlocks(snapshotBlocks))
+                .ThrowOnError();
+
+            writtenBlockCount += std::ssize(part.Blocks);
         });
-        hunkChunkIdSet.insert(blockRefs[index].ChunkId);
+
+        endMapSnapshotGuard.Release();
+        BlockMap_->EndSnapshot();
+
+        // Both scans see the same cut, so the rows written must match what the first pass counted.
+        if (writtenBlockCount != blockCount) {
+            YT_LOG_ALERT_AND_THROW("Snapshot wrote an unexpected number of blocks (Written: %v, Expected: %v)",
+                writtenBlockCount,
+                blockCount);
+        }
+
+        hunkChunkIds = writer->GetReferencedChunkIds();
+
+        // The snapshot table's hunk chunk list only accepts sealed chunks, so seal every chunk it is
+        // about to reference (which retires those still being written into).
+        WaitFor(BlockStore_->SealChunks(hunkChunkIds))
+            .ThrowOnError();
+
+        WaitFor(writer->Close())
+            .ThrowOnError();
     }
-    std::vector hunkChunkIds(hunkChunkIdSet.begin(), hunkChunkIdSet.end());
-
-    // The snapshot table's hunk chunk list only accepts sealed chunks, so seal every chunk it is about
-    // to reference (which retires those still being written into).
-    WaitFor(BlockStore_->SealChunks(hunkChunkIds))
-        .ThrowOnError();
-
-    // The caller has created and resolved the table (|spec|) under its transaction; write the rows into
-    // it under the same transaction (the caller commits it).
-    WriteJournalSnapshot(Client_, spec, snapshotBlocks, hunkChunkIds, Logger);
 
     LatestSnapshotInfo_.Store(TSnapshotInfo{
         .Path = spec.GetPath(),
         .Timestamp = TInstant::Now(),
     });
+
+    return {
+        .BlockCount = blockCount,
+        .ChunkCount = static_cast<int>(hunkChunkIds.size()),
+    };
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -802,52 +1052,132 @@ TFuture<TWriteResponse> TJournalBlockDevice::Write(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-IJournalBlockDevicePtr CreateJournalBlockDevice(
-    NNative::IClientPtr client,
+namespace {
+
+//! Reconstructs a restored device's options from the snapshot table: its geometry from @device_params
+//! and the rest from the table's own account and primary medium.
+TJournalBlockDeviceOptionsPtr FetchDeviceOptions(
+    const NNative::IClientPtr& client,
+    const TYPath& snapshotPath,
+    const NLogging::TLogger& Logger)
+{
+    // TODO(babenko): fetch this under the same transaction that loads the snapshot.
+    YT_LOG_INFO("Fetching device params from snapshot table (SnapshotPath: %v)",
+        snapshotPath);
+
+    TGetNodeOptions options;
+    options.Attributes = {
+        "type",
+        "device_params",
+        "account",
+        "primary_medium",
+    };
+    auto nodeYson = WaitFor(client->GetNode(snapshotPath, options))
+        .ValueOrThrow();
+    auto node = ConvertToNode(nodeYson);
+    const auto& attributes = node->Attributes();
+
+    auto type = attributes.Get<EObjectType>("type");
+    THROW_ERROR_EXCEPTION_UNLESS(type == EObjectType::Table,
+        "Invalid snapshot %v type: expected %Qlv, got %Qlv",
+        snapshotPath,
+        EObjectType::Table,
+        type);
+
+    auto params = attributes.Get<TSerializableDeviceParams>("device_params");
+
+    auto deviceOptions = New<TJournalBlockDeviceOptions>();
+    deviceOptions->DeviceSize = params.DeviceSize;
+    deviceOptions->BlockSize = params.BlockSize;
+    deviceOptions->Account = attributes.Get<std::string>("account");
+    deviceOptions->MediumName = attributes.Get<std::string>("primary_medium");
+    deviceOptions->Postprocess();
+    return deviceOptions;
+}
+
+IJournalBlockDevicePtr DoCreateJournalBlockDevice(
+    const NNative::IClientPtr& client,
     std::string deviceId,
     TJournalBlockDeviceConfigPtr deviceConfig,
-    TJournalBlockDeviceOptionsPtr storeOptions,
+    const TDeviceCreationDescriptor& creationDescriptor,
     TTransactionId transactionId,
-    NChunkClient::TChunkListId chunkListId,
-    std::optional<TSnapshotLoadSpec> snapshotReadSpec,
+    TChunkListId chunkListId,
     NLogging::TLogger logger)
 {
+    std::optional<TYPath> snapshotPath;
+    TJournalBlockDeviceOptionsPtr deviceOptions;
+    Visit(creationDescriptor,
+        [&] (const TFreshDeviceCreationDescriptor& freshDescriptor) {
+            deviceOptions = freshDescriptor.Options;
+        },
+        [&] (const TRestoredDeviceCreationDescriptor& restoredDescriptor) {
+            // A restored device does not carry options: they are reconstructed from the snapshot table's
+            // persisted params, so its geometry matches the device the snapshot was taken from.
+            snapshotPath = restoredDescriptor.SnapshotPath;
+            deviceOptions = FetchDeviceOptions(client, restoredDescriptor.SnapshotPath, logger);
+        });
+
     return New<TJournalBlockDevice>(
         std::move(deviceId),
         std::move(deviceConfig),
-        std::move(storeOptions),
+        std::move(deviceOptions),
         transactionId,
         chunkListId,
-        std::move(snapshotReadSpec),
-        std::move(client),
+        std::move(snapshotPath),
+        client,
         std::move(logger));
+}
+
+} // namespace
+
+////////////////////////////////////////////////////////////////////////////////
+
+TFuture<IJournalBlockDevicePtr> CreateJournalBlockDevice(
+    NNative::IClientPtr client,
+    std::string deviceId,
+    TJournalBlockDeviceConfigPtr deviceConfig,
+    TDeviceCreationDescriptor creationDescriptor,
+    TTransactionId transactionId,
+    TChunkListId chunkListId,
+    NLogging::TLogger logger)
+{
+    const auto& invoker = client->GetConnection()->GetInvoker();
+    return BIND(
+        &DoCreateJournalBlockDevice,
+        std::move(client),
+        std::move(deviceId),
+        std::move(deviceConfig),
+        std::move(creationDescriptor),
+        transactionId,
+        chunkListId,
+        std::move(logger))
+        .AsyncVia(invoker)
+        .Run();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TSnapshotLoadSpec FetchSnapshotLoadSpec(
-    const NNative::IClientPtr& client,
-    const NYPath::TYPath& path,
-    const TFetchSnapshotLoadTableSpecOptions& options)
-{
-    NChunkClient::TUserObject userObject{NYPath::TRichYPath(path)};
-    return NTableClient::FetchSingleTableReadSpec(
-        &userObject,
-        client,
-        options);
-}
+namespace {
 
-void CreateSnapshotTable(
-    const NApi::IClientPtr& client,
-    const NYPath::TYPath& path,
-    std::optional<NObjectClient::TCellTag> externalCellTag,
+void DoCreateSnapshotTable(
+    const IClientPtr& client,
+    const TYPath& path,
+    std::optional<TCellTag> externalCellTag,
+    const TJournalBlockDeviceOptionsPtr& deviceOptions,
     const TCreateSnapshotTableOptions& options)
 {
+    TSerializableDeviceParams deviceParams;
+    deviceParams.DeviceSize = deviceOptions->DeviceSize;
+    deviceParams.BlockSize = deviceOptions->BlockSize;
+
     auto adjustedOptions = options;
     if (!adjustedOptions.Attributes) {
-        adjustedOptions.Attributes = NYTree::CreateEphemeralAttributes();
+        adjustedOptions.Attributes = CreateEphemeralAttributes();
     }
     adjustedOptions.Attributes->Set("schema", NRecords::TSnapshotBlockDescriptor::Get()->GetSchema());
+    adjustedOptions.Attributes->Set("primary_medium", deviceOptions->MediumName);
+    adjustedOptions.Attributes->Set("account", deviceOptions->Account);
+    adjustedOptions.Attributes->Set("device_params", deviceParams);
     if (externalCellTag) {
         adjustedOptions.Attributes->Set("has_hunk_chunk_list", true);
         adjustedOptions.Attributes->Set("external_cell_tag", *externalCellTag);
@@ -856,22 +1186,48 @@ void CreateSnapshotTable(
         .ThrowOnError();
 }
 
-TSnapshotSaveSpec FetchSnapshotSaveSpec(
-    const NApi::NNative::IClientPtr& client,
-    const NYPath::TYPath& path,
+TSnapshotSaveSpec DoFetchSnapshotSaveSpec(
+    const NNative::IClientPtr& client,
+    const TYPath& path,
     const TFetchSnapshotSaveTableSpecOptions& options)
 {
     // The transaction is carried by the user object (and reused by SaveSnapshot), so the fallback
     // transaction id below is left null.
-    NChunkClient::TUserObject userObject(NYPath::TRichYPath(path), options.TransactionId);
-    NChunkClient::GetUserObjectBasicAttributes(
+    TUserObject userObject(TRichYPath(path), options.TransactionId);
+    GetUserObjectBasicAttributes(
         client,
         {&userObject},
         /*defaultTransactionId*/ {},
         Logger(),
-        NYTree::EPermission::Write,
+        EPermission::Write,
         options);
     return userObject;
+}
+
+} // namespace
+
+////////////////////////////////////////////////////////////////////////////////
+
+TFuture<void> CreateSnapshotTable(
+    const NApi::IClientPtr& client,
+    const TYPath& path,
+    std::optional<NObjectClient::TCellTag> externalCellTag,
+    const TJournalBlockDeviceOptionsPtr& deviceOptions,
+    const TCreateSnapshotTableOptions& options)
+{
+    return BIND(&DoCreateSnapshotTable, client, path, externalCellTag, deviceOptions, options)
+        .AsyncVia(client->GetConnection()->GetInvoker())
+        .Run();
+}
+
+TFuture<TSnapshotSaveSpec> FetchSnapshotSaveSpec(
+    const NApi::NNative::IClientPtr& client,
+    const TYPath& path,
+    const TFetchSnapshotSaveTableSpecOptions& options)
+{
+    return BIND(&DoFetchSnapshotSaveSpec, client, path, options)
+        .AsyncVia(client->GetConnection()->GetInvoker())
+        .Run();
 }
 
 ////////////////////////////////////////////////////////////////////////////////

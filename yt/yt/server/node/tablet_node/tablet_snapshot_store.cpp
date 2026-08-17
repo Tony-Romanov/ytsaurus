@@ -162,7 +162,7 @@ public:
                     NTabletClient::EErrorCode::NoSuchTablet,
                     "Tablet %v has been unregistered",
                     tabletSnapshot->TabletId)
-                    << TErrorAttribute("tablet_id", tabletSnapshot->TabletId);
+                    .With("tablet_id", tabletSnapshot->TabletId);
             }
         }
     }
@@ -192,9 +192,9 @@ public:
         if (dynamicOptions->BanMessage) {
             THROW_ERROR_EXCEPTION(NTabletClient::EErrorCode::BundleIsBanned,
                 "Bundle %Qv is banned", bundleName)
-                << TError(TRuntimeFormat(dynamicOptions->BanMessage.value()))
-                << TErrorAttribute("tablet_id", tabletSnapshot->TabletId)
-                << TErrorAttribute("table_path", tabletSnapshot->TablePath);
+                .With(TError(TRuntimeFormat(dynamicOptions->BanMessage.value())))
+                .With("tablet_id", tabletSnapshot->TabletId)
+                .With("table_path", tabletSnapshot->TablePath);
         }
     }
 
@@ -273,7 +273,7 @@ public:
 
                     YT_LOG_DEBUG("Tablet snapshot unregistered; eviction scheduled "
                         "(%v, MountRevision: %x, CellId: %v, EvictionTimeout: %v)",
-                        snapshot->LoggingTag,
+                        snapshot->LoggingTags,
                         snapshot->MountRevision,
                         slot->GetCellId(),
                         evictionTimeout);
@@ -454,7 +454,7 @@ private:
                 NTabletClient::EErrorCode::NoSuchTablet,
                 "Tablet %v is not known",
                 tabletId)
-                << TErrorAttribute("tablet_id", tabletId);
+                .With("tablet_id", tabletId);
         }
 
         const auto& slotManager = Bootstrap_->GetSlotManager();
@@ -464,8 +464,8 @@ private:
                 NTabletClient::EErrorCode::NoSuchCell,
                 "Cell %v is not known",
                 cellId)
-                << TErrorAttribute("tablet_id", tabletId)
-                << TErrorAttribute("cell_id", cellId);
+                .With("tablet_id", tabletId)
+                .With("cell_id", cellId);
         }
 
         auto hydraManager = slot->GetHydraManager();
@@ -474,15 +474,15 @@ private:
                 NTabletClient::EErrorCode::NoSuchCell,
                 "Cell %v is not active",
                 cellId)
-                << TErrorAttribute("tablet_id", tabletId)
-                << TErrorAttribute("cell_id", cellId);
+                .With("tablet_id", tabletId)
+                .With("cell_id", cellId);
         } else {
             THROW_ERROR_EXCEPTION(
                 NTabletClient::EErrorCode::NoSuchTablet,
                 "Tablet %v is not known",
                 tabletId)
-                << TErrorAttribute("tablet_id", tabletId)
-                << TErrorAttribute("cell_id", cellId);
+                .With("tablet_id", tabletId)
+                .With("cell_id", cellId);
         }
     }
 
@@ -615,10 +615,10 @@ private:
                 .Item("atomicity").Value(replica->RuntimeData->Atomicity.load(std::memory_order::relaxed))
                 .Item("preserve_timestamps").Value(replica->RuntimeData->PreserveTimestamps)
                 .Item("start_replication_timestamp").Value(replica->StartReplicationTimestamp)
-                .Item("last_replication_timestamp").Value(replica->RuntimeData->LastReplicationTimestamp)
+                .Item("last_replication_timestamp").Value(replica->RuntimeData->LastReplicationTimestamp.load())
                 .Item("current_replication_row_index").Value(replica->RuntimeData->CurrentReplicationRowIndex)
                 .Item("committed_replication_row_index").Value(replica->RuntimeData->CommittedReplicationRowIndex)
-                .Item("current_replication_timestamp").Value(replica->RuntimeData->CurrentReplicationTimestamp)
+                .Item("current_replication_timestamp").Value(replica->RuntimeData->CurrentReplicationTimestamp.load())
                 .Item("prepared_replication_row_index").Value(replica->RuntimeData->PreparedReplicationRowIndex)
             .EndMap();
     }

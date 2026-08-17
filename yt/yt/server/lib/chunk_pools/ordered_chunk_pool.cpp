@@ -80,8 +80,6 @@ public:
     {
         Logger = options.Logger;
 
-        ValidateLogger(Logger);
-
         if (JobSizeConstraints_->IsExplicitJobCount() && JobSizeConstraints_->GetJobCount() == 1) {
             SingleJob_ = true;
         }
@@ -669,9 +667,9 @@ private:
 
                 if (GetDataSliceCounter()->GetTotal() > MaxTotalSliceCount_) {
                     THROW_ERROR_EXCEPTION(NChunkPools::EErrorCode::DataSliceLimitExceeded, "Total number of data slices in ordered pool is too large")
-                        << TErrorAttribute("actual_total_slice_count", GetDataSliceCounter()->GetTotal())
-                        << TErrorAttribute("max_total_slice_count", MaxTotalSliceCount_)
-                        << TErrorAttribute("current_job_count", jobIndex);
+                        .With("actual_total_slice_count", GetDataSliceCounter()->GetTotal())
+                        .With("max_total_slice_count", MaxTotalSliceCount_)
+                        .With("current_job_count", jobIndex);
                 }
 
                 CurrentJob()->Finalize();
@@ -749,9 +747,6 @@ void TOrderedChunkPool::RegisterMetadata(auto&& registrar)
     PHOENIX_REGISTER_FIELD(16, JobSizeAdjuster_,
         .SinceVersion(ESnapshotVersion::OrderedAndSortedJobSizeAdjuster));
 
-    registrar.AfterLoad([] (TThis* this_, auto& /*context*/) {
-        ValidateLogger(this_->Logger);
-    });
 }
 
 PHOENIX_DEFINE_TYPE(TOrderedChunkPool);

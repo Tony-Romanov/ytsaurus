@@ -5,6 +5,7 @@
 
 #include <yt/yt/core/concurrency/scheduler_api.h>
 
+#include <yt/yt/core/misc/protobuf_helpers.h>
 #include <yt/yt/core/test_framework/framework.h>
 
 namespace NYT::NFlow {
@@ -12,6 +13,8 @@ namespace {
 
 using namespace NConcurrency;
 using namespace NTransactionClient;
+
+using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -22,7 +25,7 @@ class TCountingTimestampProvider
 {
 public:
     explicit TCountingTimestampProvider(TTimestamp startTimestamp)
-        : Current_(startTimestamp)
+        : Current_(startTimestamp.Underlying())
     { }
 
     TFuture<TTimestamp> GenerateTimestamps(int count, NObjectClient::TCellTag /*clockClusterTag*/) override
@@ -30,12 +33,12 @@ public:
         ++CallCount_;
         // Advance by a full second of timestamp space per call so that seqno
         // headroom grows the way it does with a real cluster clock.
-        return MakeFuture<TTimestamp>(Current_.fetch_add(static_cast<TTimestamp>(count) << TimestampCounterWidth));
+        return MakeFuture<TTimestamp>(NYT::NTransactionClient::TTimestamp(Current_.fetch_add(static_cast<ui64>(count) << TimestampCounterWidth)));
     }
 
     TTimestamp GetLatestTimestamp(NObjectClient::TCellTag /*clockClusterTag*/) override
     {
-        return Current_.load();
+        return FromProto<NYT::NTransactionClient::TTimestamp>(Current_.load());
     }
 
     void Reconfigure(const TRemoteTimestampProviderConfigPtr& /*config*/) override
@@ -47,14 +50,14 @@ public:
     }
 
 private:
-    std::atomic<TTimestamp> Current_;
+    std::atomic<ui64> Current_;
     std::atomic<int> CallCount_{0};
 };
 
 DEFINE_REFCOUNTED_TYPE(TCountingTimestampProvider);
 
 constexpr ui64 StartUnixTime = 1'000'000;
-constexpr TTimestamp StartTimestamp = StartUnixTime << TimestampCounterWidth;
+constexpr TTimestamp StartTimestamp = NYT::NTransactionClient::TTimestamp(StartUnixTime << TimestampCounterWidth);
 
 struct TTimeProviderTest
     : public ::testing::Test
@@ -76,7 +79,7 @@ TEST_F(TTimeProviderTest, GlobalUniqueSeqNoDecomposition)
 
     auto first = WaitFor(provider->GenerateGlobalUniqueSeqNo()).ValueOrThrow();
     EXPECT_EQ(first.Timestamp, TSystemTimestamp(StartUnixTime));
-    EXPECT_EQ(first.UniqueSeqNo, TUniqueSeqNo(StartTimestamp));
+    EXPECT_EQ(first.UniqueSeqNo, TUniqueSeqNo(StartTimestamp.Underlying()));
 
     auto second = WaitFor(provider->GenerateGlobalUniqueSeqNo()).ValueOrThrow();
     EXPECT_GT(second.UniqueSeqNo, first.UniqueSeqNo);
@@ -151,6 +154,64 @@ TEST_F(TTimeProviderTest, SeqNoRangeIsCachedBetweenCalls)
         Y_UNUSED(provider->GenerateSeqNo());
     }
     EXPECT_EQ(TimestampProvider_->GetCallCount(), callCount);
+}
+
+TEST_F(TTimeProviderTest, SeqNoCarriesTheClusterWallClock)
+{
+    auto provider = CreateProvider();
+
+    auto seqNo = provider->GenerateSeqNo();
+    EXPECT_EQ(UnixTimeFromTimestamp(TTimestamp(seqNo)), StartUnixTime);
+}
+
+TEST_F(TTimeProviderTest, SeqNoNeverRunsAheadOfTheClock)
+{
+    auto provider = CreateProvider();
+
+    for (int i = 0; i < 100; ++i) {
+        auto seqNo = provider->GenerateSeqNo();
+        EXPECT_LE(static_cast<TTimestamp>(seqNo), TimestampProvider_->GetLatestTimestamp(NObjectClient::InvalidCellTag));
+    }
+}
+
+TEST_F(TTimeProviderTest, SeqNoKeepsIncreasingAcrossLeaderChange)
+{
+    auto leader = CreateProvider();
+    i64 last = 0;
+    for (int i = 0; i < 100; ++i) {
+        last = leader->GenerateSeqNo();
+    }
+
+    auto successor = CreateProvider();
+    EXPECT_GT(successor->GenerateSeqNo(), last);
+}
+
+TEST_F(TTimeProviderTest, SeqNoBarrierOutrunsForeignSeqNo)
+{
+    // A fenced ex-leader whose range was reserved before the successor appeared.
+    auto fenced = CreateProvider();
+    Y_UNUSED(fenced->GenerateSeqNo());
+
+    auto successor = CreateProvider();
+    auto foreign = successor->GenerateSeqNo();
+
+    // Without a barrier the fenced instance keeps serving from its stale range,
+    // below the seqno it can now observe in the successor's persisted state.
+    EXPECT_LT(fenced->GenerateSeqNo(), foreign);
+
+    WaitFor(fenced->InsertSeqNoBarrier())
+        .ThrowOnError();
+    EXPECT_GT(fenced->GenerateSeqNo(), foreign);
+}
+
+TEST_F(TTimeProviderTest, SeqNoBarrierOnFreshProvider)
+{
+    auto provider = CreateProvider();
+    WaitFor(provider->InsertSeqNoBarrier())
+        .ThrowOnError();
+
+    // The barrier fetch is the very first issued timestamp; seqnos start at or above it.
+    EXPECT_GE(provider->GenerateSeqNo(), static_cast<i64>(StartTimestamp.Underlying()));
 }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -285,16 +285,16 @@ TInternalReadResponse DoRead(
 
             if (useDirectIO && reallyRead < toRead && fileOffset + reallyRead != request.Handle->GetLength()) {
                 THROW_ERROR_EXCEPTION(NFS::EErrorCode::IOError, "DirectIO call failed")
-                    << TErrorAttribute("handle", static_cast<FHANDLE>(*request.Handle))
-                    << TErrorAttribute("to_read_remaining", toReadRemaining)
-                    << TErrorAttribute("max_bytes_per_read", maxBytesPerRead)
-                    << TErrorAttribute("request_size", request.Size)
-                    << TErrorAttribute("request_offset", request.Offset)
-                    << TErrorAttribute("to_read", toRead)
-                    << TErrorAttribute("really_read", reallyRead)
-                    << TErrorAttribute("file_offset", fileOffset)
-                    << TErrorAttribute("file_size", request.Handle->GetLength())
-                    << TError::FromSystem();
+                    .With("handle", static_cast<FHANDLE>(*request.Handle))
+                    .With("to_read_remaining", toReadRemaining)
+                    .With("max_bytes_per_read", maxBytesPerRead)
+                    .With("request_size", request.Size)
+                    .With("request_offset", request.Offset)
+                    .With("to_read", toRead)
+                    .With("really_read", reallyRead)
+                    .With("file_offset", fileOffset)
+                    .With("file_size", request.Handle->GetLength())
+                    .With(TError::FromSystem());
             } else if (useDirectIO && fileOffset + reallyRead == request.Handle->GetLength()) {
                 toReadRemaining = 0;
                 break;
@@ -324,14 +324,14 @@ TInternalReadResponse DoRead(
 
     if (toReadRemaining > 0) {
         THROW_ERROR_EXCEPTION(NFS::EErrorCode::IOError, "Unexpected end-of-file in read request")
-            << TErrorAttribute("to_read_remaining", toReadRemaining)
-            << TErrorAttribute("max_bytes_per_read", maxBytesPerRead)
-            << TErrorAttribute("request_size", request.Size)
-            << TErrorAttribute("request_offset", request.Offset)
-            << TErrorAttribute("file_offset", fileOffset)
-            << TErrorAttribute("file_size", request.Handle->GetLength())
-            << TErrorAttribute("handle", static_cast<FHANDLE>(*request.Handle))
-            << TError::FromSystem();
+            .With("to_read_remaining", toReadRemaining)
+            .With("max_bytes_per_read", maxBytesPerRead)
+            .With("request_size", request.Size)
+            .With("request_offset", request.Offset)
+            .With("file_offset", fileOffset)
+            .With("file_size", request.Handle->GetLength())
+            .With("handle", static_cast<FHANDLE>(*request.Handle))
+            .With(TError::FromSystem());
     }
 
     return response;
@@ -354,6 +354,15 @@ TWriteResponse DoWrite(
     auto guard = std::move(requestCounterGuard);
     TWriteResponse writeResponse;
     if (hugePageBlob) {
+        THROW_ERROR_EXCEPTION_IF(
+            request.Offset % directIoBlockSize != 0,
+            "File offset %v is not aligned to direct IO block size %v",
+            request.Offset,
+            directIoBlockSize)
+            .With("handle", static_cast<FHANDLE>(*request.Handle))
+            .With("request_size", GetByteSize(request.Buffers))
+            .With("file_size", request.Handle->GetLength());
+
         writeResponse = DoWriteAligned(
             request,
             directIoBlockSize,
@@ -404,19 +413,18 @@ TWriteResponse DoWriteAligned(
     YT_VERIFY(hugePageBlob.Size() % directIoBlockSize == 0);
 
     auto fileOffset = request.Offset;
+    YT_VERIFY(fileOffset % directIoBlockSize == 0);
 
     TWriteResponse response;
 
     NFS::WrapIOErrors([&] {
         NTracing::TNullTraceContextGuard nullTraceContextGuard;
 
-        auto fileSize = request.Handle->GetLength();
         auto totalSize = static_cast<i64>(GetByteSize(request.Buffers));
 
         auto toWriteRemaining = AlignUp<i64>(totalSize, directIoBlockSize);
-        memset(hugePageBlob.Begin() + totalSize, 0, toWriteRemaining - totalSize);
-
         YT_VERIFY(static_cast<i64>(hugePageBlob.Size()) >= toWriteRemaining);
+        memset(hugePageBlob.Begin() + totalSize, 0, toWriteRemaining - totalSize);
 
         i64 hugePageBlobBufferOffset = 0;
         for (const auto& buffer : request.Buffers) {
@@ -450,10 +458,6 @@ TWriteResponse DoWriteAligned(
             toWriteRemaining -= reallyWritten;
 
             ++response.IOWriteRequests;
-        }
-
-        if (ftruncate(*request.Handle, fileSize + totalSize) < 0) {
-            ythrow TFileError();
         }
     });
     response.WrittenBytes = fileOffset - request.Offset;

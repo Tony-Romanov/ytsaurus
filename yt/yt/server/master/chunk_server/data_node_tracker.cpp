@@ -203,7 +203,7 @@ public:
         auto preparedRequest = SplitRequest(context, locationDirectory);
 
         auto timeBefore = NProfiling::GetInstant();
-        // TODO: Should be acquire with timeout.
+        // TODO(aleksandra-zh): Should be acquire with timeout.
         auto guard = WaitFor(semaphore->AsyncAcquire(slots).AsUnique())
             .ValueOrThrow();
 
@@ -355,10 +355,6 @@ public:
     {
         YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
 
-        if (!GetDynamicConfig()->EnablePerLocationFullHeartbeats) {
-            THROW_ERROR_EXCEPTION("Per-location full data node heartbeats are disabled");
-        }
-
         ValidateHeartbeatRequest(node, context->Request());
 
         auto locationUuid = FromProto<TChunkLocationUuid>(context->Request().location_uuid());
@@ -497,6 +493,7 @@ public:
         ValidateHeartbeatRequest(node, originalRequest);
 
         auto enableChunkReplicasThrottling = GetDynamicConfig()->EnableChunkReplicasThrottlingInHeartbeats;
+
         const auto& semaphore = enableChunkReplicasThrottling
             ? IncrementalHeartbeatPerReplicasSemaphore_
             : IncrementalHeartbeatSemaphore_;
@@ -525,11 +522,39 @@ public:
         i64 slots = 1;
         if (enableChunkReplicasThrottling) {
             slots = originalRequest.added_chunks_size() + originalRequest.removed_chunks_size();
+
+            const auto& sequoiaReplicasConfig = Bootstrap_->GetConfigManager()->GetConfig()->ChunkManager->SequoiaChunkReplicas;
+            if (!GetDynamicConfig()->FlushBatchedIncrementalHeartbeatsOnThrottling &&
+                sequoiaReplicasConfig->BatchIncrementalHeartbeat &&
+                slots > GetDynamicConfig()->MaxConcurrentChunkReplicasDuringIncrementalHeartbeat / 2)
+            {
+                YT_LOG_WARNING("Data node incremental heartbeat chunk replicas throttler allows less than twice of required slots"
+                    "(SemaphoreSlotsTotal: %v, RequiredSlots: %v, IsReplicasThrottlingEnabled: %v)",
+                    semaphore->GetTotal(),
+                    slots,
+                    enableChunkReplicasThrottling);
+                // We change the number of occupied slots by request to avoid locking the incremental heartbeat batch:
+                // We hold the invariant that number of occupied slots is not grater than number of replicas in batch.
+                // We also maintain that throttler allows at least 2x of max number of replicas in batch.
+                // That means that if batch is not full, at least half of throttler slots are empty, so we will not throttle the next request.
+                slots = GetDynamicConfig()->MaxConcurrentChunkReplicasDuringIncrementalHeartbeat / 2;
+            }
         }
 
+        const auto& chunkManager = Bootstrap_->GetChunkManager();
+
         auto timeBefore = NProfiling::GetInstant();
-        auto guard = WaitFor(semaphore->AsyncAcquire(slots).AsUnique())
-            .ValueOrThrow();
+        TAsyncSemaphoreGuard guard;
+        if (GetDynamicConfig()->FlushBatchedIncrementalHeartbeatsOnThrottling) {
+            guard = TAsyncSemaphoreGuard::TryAcquire(semaphore, slots);
+            if (!guard) {
+                chunkManager->FlushWaitingSequoiaIncrementalHeartbeatRequests();
+            }
+        }
+        if (!guard) {
+            guard = WaitFor(semaphore->AsyncAcquire(slots).AsUnique())
+                .ValueOrThrow();
+        }
         auto timeAfter = NProfiling::GetInstant();
 
         auto requestTimeout = context->GetTimeout();
@@ -542,8 +567,6 @@ public:
         auto locationDirectory = ParseLocationDirectory(node, originalRequest);
 
         auto preparedRequest = SplitRequest(context, locationDirectory);
-
-        const auto& chunkManager = Bootstrap_->GetChunkManager();
 
         if (preparedRequest->SequoiaRequest->removed_chunks_size() + preparedRequest->SequoiaRequest->added_chunks_size() > 0) {
             YT_LOG_TRACE("There are Sequoia replicas for this request (NodeId: %v)", nodeId);
@@ -720,7 +743,7 @@ public:
             SerializeMediumOverrides(node, dataNodeInfoExt->mutable_medium_overrides());
 
             dataNodeInfoExt->set_require_location_uuids(false);
-            dataNodeInfoExt->set_per_location_full_heartbeats_enabled(GetDynamicConfig()->EnablePerLocationFullHeartbeats);
+            dataNodeInfoExt->set_per_location_full_heartbeats_enabled(true);
             dataNodeInfoExt->set_location_indexes_in_heartbeats_enabled(
                 GetDynamicConfig()->EnableLocationIndexesInDataNodeHeartbeats
                 && request->location_indexes_in_heartbeats_supported());
@@ -1092,7 +1115,7 @@ private:
                 uuid);
             THROW_ERROR_EXCEPTION(
                 "Heartbeats with unknown location in location directory are invalid")
-                << TErrorAttribute("location_uuid", uuid);
+                .With("location_uuid", uuid);
         }
 
         auto locationNode = location->GetNode();
@@ -1106,7 +1129,7 @@ private:
                 uuid);
             THROW_ERROR_EXCEPTION(
                 "Heartbeats with dangling locations in location directory are invalid")
-                << TErrorAttribute("location_uuid", uuid);
+                .With("location_uuid", uuid);
         }
 
         if (locationNode != node) {
@@ -1120,8 +1143,8 @@ private:
                 locationNode->GetDefaultAddress());
             THROW_ERROR_EXCEPTION(
                 "Heartbeat's location directory cannot contain location which belongs to other node")
-                << TErrorAttribute("location_uuid", uuid)
-                << TErrorAttribute("node", locationNode->GetDefaultAddress());
+                .With("location_uuid", uuid)
+                .With("node", locationNode->GetDefaultAddress());
         }
         return location;
     }
@@ -1338,10 +1361,10 @@ private:
                                 isSequoiaChunk = sequoiaChunkReplicasConfig->GhostFullHeartbeats;
                             }
                         }
-
                     }
 
                     if (isSequoiaChunk) {
+                        YT_VERIFY(isSequoiaEnabled || isGhostSequoiaEnabled);
                         if constexpr (std::is_same_v<TChunkInfo, NChunkClient::NProto::TChunkAddInfo>) {
                             if (isMasterOnlyChunk) {
                                 sequoiaRequest->add_added_chunks()->CopyFrom(chunkInfo);
@@ -1693,10 +1716,10 @@ private:
                 diskFamilyWhitelist,
                 diskFamily);
             LocationAlerts_[locationUuid] = TError("Inconsistent medium")
-                << TErrorAttribute("location_uuid", locationUuid)
-                << TErrorAttribute("medium_name", medium->GetName())
-                << TErrorAttribute("disk_family_whitelist", diskFamilyWhitelist)
-                << TErrorAttribute("disk_family", diskFamily);
+                .With("location_uuid", locationUuid)
+                .With("medium_name", medium->GetName())
+                .With("disk_family_whitelist", diskFamilyWhitelist)
+                .With("disk_family", diskFamily);
         } else {
             LocationAlerts_.erase(locationUuid);
         }
@@ -1714,7 +1737,7 @@ private:
                 locationUuid);
             THROW_ERROR_EXCEPTION(
                 "Chunk statistics reports with unknown location are invalid")
-                << TErrorAttribute("location_uuid", locationUuid);
+                .With("location_uuid", locationUuid);
         }
         location->Statistics() = statistics;
         UpdateLocationDiskFamilyAlert(location);
@@ -1763,7 +1786,7 @@ private:
         }
 
         if (oldConfig->ChunkManager->DataNodeTracker->EnableValidationFullHeartbeats &&
-            (!GetDynamicConfig()->EnablePerLocationFullHeartbeats || !GetDynamicConfig()->EnableValidationFullHeartbeats))
+            !GetDynamicConfig()->EnableValidationFullHeartbeats)
         {
             ResetScheduledValidationFullHeartbeats();
         }
@@ -1809,9 +1832,9 @@ private:
                     location->GetUuid());
                 THROW_ERROR_EXCEPTION(
                     "Restarted node has disappeared location")
-                    << TErrorAttribute("node_address", node->GetDefaultAddress())
-                    << TErrorAttribute("node_id", node->GetId())
-                    << TErrorAttribute("location_uuid", location->GetUuid());
+                    .With("node_address", node->GetDefaultAddress())
+                    .With("node_id", node->GetId())
+                    .With("location_uuid", location->GetUuid());
             }
         }
         node->ChunkLocations().clear();

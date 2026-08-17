@@ -80,7 +80,7 @@ public:
     {
         YT_ASSERT_INVOKER_THREAD_AFFINITY(Slot_->GetAutomatonInvoker(), AutomatonThread);
 
-        Logger = ChaosNodeLogger().WithTag("CellId: %v", slot->GetCellId());
+        Logger = ChaosNodeLogger().WithTag("CellId", slot->GetCellId());
 
         YT_LOG_INFO("Set transaction manager clock cluster tag (ClockClusterTag: %v)",
             ClockClusterTag_);
@@ -479,7 +479,7 @@ private:
     void HydraRegisterTransactionActions(NChaosClient::NProto::TReqRegisterTransactionActions* request)
     {
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
-        auto transactionStartTimestamp = request->transaction_start_timestamp();
+        auto transactionStartTimestamp = FromProto<NTransactionClient::TTimestamp>(request->transaction_start_timestamp());
         auto transactionTimeout = FromProto<TDuration>(request->transaction_timeout());
         auto signature = request->signature();
 
@@ -580,9 +580,9 @@ private:
         if (ClockClusterTag_ != timestampClusterTag) {
             if (shouldThrow) {
                 THROW_ERROR_EXCEPTION("Transaction timestamp is generated from unexpected clock")
-                    << TErrorAttribute("transaction_id", transactionId)
-                    << TErrorAttribute("transaction_clock_cluster_tag", timestampClusterTag)
-                    << TErrorAttribute("coordinator_clock_cluster_tag", ClockClusterTag_);
+                    .With("transaction_id", transactionId)
+                    .With("transaction_clock_cluster_tag", timestampClusterTag)
+                    .With("coordinator_clock_cluster_tag", ClockClusterTag_);
             }
 
             YT_LOG_ALERT(

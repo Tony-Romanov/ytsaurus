@@ -17,7 +17,7 @@
 
 #include <yt/yt/core/actions/signal.h>
 
-#include <yt/yt/core/misc/chunked_vector.h>
+#include <library/cpp/yt/containers/skip_list.h>
 
 #include <library/cpp/yt/misc/property.h>
 

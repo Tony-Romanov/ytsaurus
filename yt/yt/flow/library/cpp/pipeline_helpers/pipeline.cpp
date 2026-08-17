@@ -154,7 +154,7 @@ static void WaitPipelineState(
     while (true) {
         if (TInstant::Now() > deadline) {
             THROW_ERROR_EXCEPTION("Wait timed out")
-                << TErrorAttribute("timeout", waitTimeout);
+                .With("timeout", waitTimeout);
         }
         int attempt = 0;
         while (true) {
@@ -242,15 +242,38 @@ void RunPipeline(
     bool enablePipelineCreation,
     bool enablePipelineStopOrPause)
 {
+    auto connection = NApi::NRpcProxy::CreateConnection(
+        NApi::NRpcProxy::TConnectionConfig::CreateFromClusterUrl(clusterUrl, proxyRole));
+    auto client = connection->CreateClient(NApi::GetClientOptionsFromEnvStatic());
+
+    RunPipeline(
+        std::move(client),
+        root,
+        spec,
+        dynamicSpec,
+        setFlowCoreTarget,
+        graceful,
+        waitTimeout,
+        enablePipelineCreation,
+        enablePipelineStopOrPause);
+}
+
+void RunPipeline(
+    NApi::IClientPtr client,
+    const TYPath& root,
+    const TPipelineSpecPtr& spec,
+    const TDynamicPipelineSpecPtr& dynamicSpec,
+    bool setFlowCoreTarget,
+    std::optional<bool> graceful,
+    TDuration waitTimeout,
+    bool enablePipelineCreation,
+    bool enablePipelineStopOrPause)
+{
     if (!graceful) {
         graceful = IsGracefulUpdateFromEnv();
     }
     ValidatePipelineSpec(spec);
     ValidateDynamicPipelineSpec(dynamicSpec);
-
-    auto connection = NApi::NRpcProxy::CreateConnection(
-        NApi::NRpcProxy::TConnectionConfig::CreateFromClusterUrl(clusterUrl, proxyRole));
-    auto client = connection->CreateClient(NApi::GetClientOptionsFromEnvStatic());
 
     TLogReader controllerLogReader(client, NYPath::YPathJoin(root, ControllerLogsTableName));
 
@@ -281,19 +304,26 @@ void RunPipeline(
                 .ValueOrThrow()
                 .State;
 
-            THashSet<EPipelineState> targetStates = {
-                EPipelineState::Unknown,
-                EPipelineState::Paused,
-                EPipelineState::Stopped};
-
-            if (enablePipelineStopOrPause) {
-                targetStates.insert(EPipelineState::Working);
-            }
-
-            if (!targetStates.contains(currentState)) {
+            if (currentState == EPipelineState::Completed) {
                 fatalError = true;
 
-                THROW_ERROR_EXCEPTION("Found unexpected pipeline state: %Qv",
+                THROW_ERROR_EXCEPTION(
+                    "Pipeline state is %Qv; the controller cannot transition out of it, "
+                    "recreate the pipeline to recover",
+                    currentState);
+            }
+
+            // A runner permitted to stop or pause the pipeline handles the remaining states below,
+            // including a Draining or Pausing left by an earlier iteration of this loop. Unknown is
+            // how a pipeline looks while its controller has no synced flow view.
+            if (!enablePipelineStopOrPause &&
+                currentState != EPipelineState::Unknown &&
+                currentState != EPipelineState::Paused &&
+                currentState != EPipelineState::Stopped)
+            {
+                fatalError = true;
+
+                THROW_ERROR_EXCEPTION("Pipeline state is %Qv, but it must be stopped or paused to update its specs",
                     currentState);
             }
 
@@ -404,12 +434,21 @@ void WaitPipeline(
     auto pipelinePath = TRichYPath(root);
     pipelinePath.SetCluster(clusterUrl);
 
-    YT_TLOG_INFO("Wait for pipeline to complete")
-        .With("Pipeline", pipelinePath);
-
     auto connection = NApi::NRpcProxy::CreateConnection(
         NApi::NRpcProxy::TConnectionConfig::CreateFromClusterUrl(clusterUrl, proxyRole));
     auto client = connection->CreateClient(NApi::GetClientOptionsFromEnvStatic());
+
+    WaitPipeline(std::move(client), pipelinePath);
+}
+
+void WaitPipeline(
+    NApi::IClientPtr client,
+    const TRichYPath& pipelinePath)
+{
+    const auto& root = pipelinePath.GetPath();
+
+    YT_TLOG_INFO("Wait for pipeline to complete")
+        .With("Pipeline", pipelinePath);
 
     TLogReader controllerLogReader(client, NYPath::YPathJoin(root, ControllerLogsTableName));
 

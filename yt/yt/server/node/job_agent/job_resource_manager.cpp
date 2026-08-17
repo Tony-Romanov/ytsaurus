@@ -58,7 +58,7 @@ using NNodeTrackerClient::NProto::TDiskResources;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "JobResourceManager");
+static YT_DEFINE_LEAKY_GLOBAL(const NLogging::TLogger, Logger, "JobResourceManager");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -594,8 +594,8 @@ public:
         THROW_ERROR_EXCEPTION_IF(
             !acquireResult.IsOK(),
             TError("GPU slot acquisition failed")
-                << TErrorAttribute("gpu_count", gpuCount)
-                << acquireResult);
+                .With("gpu_count", gpuCount)
+                .With(acquireResult));
 
         auto result = acquireResult.Value();
 
@@ -1780,7 +1780,7 @@ TResourceHolder::TResourceHolder(
     const TJobResources& resources)
     : ResourcesConsumerType(resourceConsumerType)
     , Id_(id)
-    , Logger(NJobAgent::Logger().WithTag("ResourceHolderId: %v", id))
+    , Logger(NJobAgent::Logger().WithTag("ResourceHolderId", id))
     , ResourceManagerImpl_(static_cast<TJobResourceManager::TImpl*>(jobResourceManager))
     , BaseResourceUsage_(resources)
     , AdditionalResourceUsage_(ZeroJobResources())
@@ -2218,7 +2218,7 @@ TResourceHolder::TResourceHolderInfo TResourceHolder::BuildResourceHolderInfo() 
     };
 }
 
-template <CInvocable<TJobResources(const TJobResources&)> TResourceUsageUpdater>
+template <NMpl::CInvocable<TJobResources(const TJobResources&)> TResourceUsageUpdater>
 bool TResourceHolder::DoSetResourceUsage(
     const TJobResources& newResourceUsage,
     TStringBuf argumentName,

@@ -2,6 +2,7 @@
 
 #include "computation.h"
 #include "computation_controller.h"
+#include "file_source.h"
 #include "process_function.h"
 #include "resource.h"
 #include "resource_controller.h"
@@ -189,6 +190,18 @@ NYTree::TYsonStructPtr TRegistry::ParseResourceDynamicParameters(
     return dynamicParameters;
 }
 
+IFileSourcePtr TRegistry::CreateFileSource(const TFileSourceContextPtr& context)
+{
+    return GetFileSourceDescriptor(context->SourceSpec->FileSourceClassName).Factory(context);
+}
+
+NYTree::TYsonStructPtr TRegistry::ParseFileSourceParameters(const TFileSourceSpecPtr& spec)
+{
+    auto parameters = GetFileSourceDescriptor(spec->FileSourceClassName).ParametersFactory();
+    parameters->Load(spec->Parameters);
+    return parameters;
+}
+
 IExternalStateManagerPtr TRegistry::CreateExternalStateManager(
     const TExternalStateManagerContextPtr& context,
     const TDynamicExternalStateManagerContextPtr& dynamicContext)
@@ -361,6 +374,15 @@ void TRegistry::ValidateResourceSpec(const TResourceSpecPtr& spec) const
     GetResourceDescriptor(typeName).ValidateSpec(*spec);
 }
 
+void TRegistry::ValidateFileSourceSpec(const TFileSourceSpecPtr& spec) const
+{
+    const auto& descriptor = GetFileSourceDescriptor(spec->FileSourceClassName);
+    descriptor.ValidateSpec(*spec);
+
+    auto parameters = descriptor.ParametersFactory();
+    parameters->Load(spec->Parameters);
+}
+
 void TRegistry::ValidateStreamSpec(const TStreamSpecPtr& spec) const
 {
     const auto& typeName = spec->ClassName;
@@ -398,7 +420,7 @@ void TRegistry::ValidateYsonMessageType(TStringBuf name, const TYsonMessagePtr& 
     const auto& descriptor = GetYsonMessageDescriptor(name);
     if (ysonMessage->GetMeta() != descriptor.Meta) {
         THROW_ERROR_EXCEPTION("Unexpected class of yson message")
-            << TErrorAttribute("expected_class_name", name);
+            .With("expected_class_name", name);
     }
 }
 
@@ -596,7 +618,7 @@ std::vector<TError> TRegistry::ValidatePipelineSpecParseability(const NYTree::IM
     }
 
     if (!unrecognized->GetKeys().empty()) {
-        errors.push_back(TError("Static spec has unrecognized fields") << TErrorAttribute("unrecognized_fields", unrecognized));
+        errors.push_back(TError("Static spec has unrecognized fields").With("unrecognized_fields", unrecognized));
     }
 
     return errors;
@@ -767,7 +789,7 @@ std::vector<TError> TRegistry::ValidateDynamicPipelineSpecParseability(const TPi
     }
 
     if (!unrecognized->GetKeys().empty()) {
-        errors.push_back(TError("Dynamic spec has unrecognized fields") << TErrorAttribute("unrecognized_fields", unrecognized));
+        errors.push_back(TError("Dynamic spec has unrecognized fields").With("unrecognized_fields", unrecognized));
     }
 
     return errors;
@@ -827,6 +849,11 @@ const TRegistry::TSinkDescriptor& TRegistry::GetSinkDescriptor(TStringBuf typeNa
 const TRegistry::TResourceDescriptor& TRegistry::GetResourceDescriptor(TStringBuf typeName) const
 {
     return GetDescriptor("resource", TypeNameToResourceDescriptor_, typeName);
+}
+
+const TRegistry::TFileSourceDescriptor& TRegistry::GetFileSourceDescriptor(TStringBuf typeName) const
+{
+    return GetDescriptor("file source", TypeNameToFileSourceDescriptor_, typeName);
 }
 
 const TRegistry::TExternalStateManagerDescriptor& TRegistry::GetExternalStateManagerDescriptor(TStringBuf typeName) const

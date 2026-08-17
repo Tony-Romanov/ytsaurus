@@ -837,6 +837,24 @@ void TJobControllerDynamicConfig::Register(TRegistrar registrar)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void TMediumAwareBlockCacheManagerConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("enable", &TThis::Enable)
+        .Default(false);
+    registrar.Parameter("block_cache_config_per_medium_per_location", &TThis::BlockCacheConfigPerMediumPerLocation)
+        .Default();
+}
+
+void TMediumAwareBlockCacheManagerDynamicConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("enable", &TThis::Enable)
+        .Optional();
+    registrar.Parameter("block_cache_config_per_medium_per_location", &TThis::BlockCacheConfigPerMediumPerLocation)
+        .Default();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void TDataNodeConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("lease_transaction_timeout", &TThis::LeaseTransactionTimeout)
@@ -885,6 +903,8 @@ void TDataNodeConfig::Register(TRegistrar registrar)
             blockCache->CompressedData = TSlruCacheConfig::CreateWithCapacity(6_GB, 16);
             return blockCache;
         });
+    registrar.Parameter("medium_aware_block_cache_manager", &TThis::MediumAwareBlockCacheManager)
+        .DefaultNew();
     registrar.Parameter("blob_reader_cache", &TThis::BlobReaderCache)
         .DefaultCtor([] {
             return TSlruCacheConfig::CreateWithCapacity(1_MB, 16);
@@ -1092,6 +1112,8 @@ void TDataNodeDynamicConfig::Register(TRegistrar registrar)
         .DefaultNew();
     registrar.Parameter("block_cache", &TThis::BlockCache)
         .DefaultNew();
+    registrar.Parameter("medium_aware_block_cache_manager", &TThis::MediumAwareBlockCacheManager)
+        .DefaultNew();
     registrar.Parameter("blob_reader_cache", &TThis::BlobReaderCache)
         .DefaultNew();
     registrar.Parameter("changelog_reader_cache", &TThis::ChangelogReaderCache)
@@ -1135,6 +1157,9 @@ void TDataNodeDynamicConfig::Register(TRegistrar registrar)
         .Default(true);
 
     registrar.Parameter("use_probe_put_blocks", &TThis::UseProbePutBlocks)
+        .Default(false);
+
+    registrar.Parameter("enable_probe_put_blocks_fair_share", &TThis::EnableProbePutBlocksFairShare)
         .Default(false);
 
     registrar.Parameter("preallocate_disk_space", &TThis::PreallocateDiskSpace)

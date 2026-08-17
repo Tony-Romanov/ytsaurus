@@ -327,8 +327,8 @@ TFuture<std::vector<std::pair<TOperationId, TError>>> TSnapshotBuilder::UploadSn
                 .AsyncViaGuarded(
                     cancelableInvoker,
                     TError("Cannot upload snapshot for canceled controller of operation %v", operationId)
-                        << TErrorAttribute("operation_id", operationId)
-                        << TErrorAttribute("snapshot_index", snapshotIndex))
+                        .With("operation_id", operationId)
+                        .With("snapshot_index", snapshotIndex))
                 .Run();
         snapshotUploadFutures.push_back(std::move(uploadFuture));
         operationIds.push_back(operationId);
@@ -351,7 +351,7 @@ void TSnapshotBuilder::UploadSnapshot(const TSnapshotJobPtr& job)
     auto operationId = job->OperationId;
 
     auto Logger = this->Logger
-        .WithTag("OperationId: %v", operationId);
+        .WithTag("OperationId", operationId);
 
     try {
         YT_LOG_INFO("Started uploading snapshot");

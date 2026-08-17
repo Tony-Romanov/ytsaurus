@@ -302,9 +302,9 @@ private:
     {
         if (tablet->GetDynamicStoreCount() >= DynamicStoreCountLimit) {
             auto error = TError("Dynamic store count limit is exceeded")
-                << TErrorAttribute("tablet_id", tablet->GetId())
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::Rotation)
-                << TErrorAttribute("limit", DynamicStoreCountLimit);
+                .With("tablet_id", tablet->GetId())
+                .With("background_activity", ETabletBackgroundActivity::Rotation)
+                .With("limit", DynamicStoreCountLimit);
             YT_LOG_DEBUG(error);
             tablet->RuntimeData()->Errors
                 .BackgroundErrors[ETabletBackgroundActivity::Rotation].Store(error);
@@ -493,9 +493,8 @@ private:
         const auto& storeManager = tablet->GetStoreManager();
 
         auto Logger = TabletNodeLogger()
-            .WithTag("%v, StoreId: %v",
-                tablet->GetLoggingTag(),
-                store->GetId());
+            .WithTags(tablet->GetLoggingTags())
+            .WithTag("StoreId", store->GetId());
 
         auto traceId = task->Info->TaskId;
         auto traceContext = TTraceContext::NewRoot("StoreFlusher", traceId);
@@ -577,7 +576,7 @@ private:
                     ToProto(updateTabletStoresReq.mutable_unleashed_backing_store_id(), store->GetId());
                 }
 
-                updateTabletStoresReq.set_conflict_horizon_timestamp(store->GetMaxTimestamp());
+                updateTabletStoresReq.set_conflict_horizon_timestamp(ToProto(store->GetMaxTimestamp()));
             }
 
             updateTabletStoresReq.set_create_hunk_chunks_during_prepare(true);
@@ -611,7 +610,7 @@ private:
             }
 
             if (tabletSnapshot->Settings.MountConfig->MergeRowsOnFlush) {
-                updateTabletStoresReq.set_retained_timestamp(retainedTimestamp);
+                updateTabletStoresReq.set_retained_timestamp(ToProto(retainedTimestamp));
             }
 
             tablet->GetStructuredLogger()->LogEvent("end_flush")
@@ -652,8 +651,8 @@ private:
                 timer.GetElapsedTime());
         } catch (const std::exception& ex) {
             auto error = TError(ex)
-                << TErrorAttribute("tablet_id", tabletId)
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::Flush);
+                .With("tablet_id", tabletId)
+                .With("background_activity", ETabletBackgroundActivity::Flush);
 
             tabletSnapshot->TabletRuntimeData->Errors
                 .BackgroundErrors[ETabletBackgroundActivity::Flush].Store(error);

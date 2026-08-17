@@ -600,7 +600,7 @@ private:
 
         if (!hasExeFile && LeaderRevision != Revision) {
             Send(ev->Sender, new TEvAllocateWorkersResponse(
-                Sprintf("Wrong revision %s!=%s", LeaderRevision.c_str(), Revision.c_str()), NYql::NDqProto::StatusIds::BAD_REQUEST));
+                Sprintf("Wrong revision %s!=%s", LeaderRevision.c_str(), Revision.c_str()), NYql::NDqProto::StatusIds::UNSUPPORTED));
         } else {
             ev->Get()->Record.SetIsForwarded(true);
             ctx.Send(ev->Forward(MakeWorkerManagerActorID(LeaderId)));
@@ -674,7 +674,6 @@ private:
         UpdateLeaderInfo(attributes);
 
         YQL_CLOG(INFO, ProviderDq) << "Become leader, epoch=" << CurrentResourceId.Epoch;
-        YQL_CLOG(INFO, ProviderDq) << "Leader attributes leader=" << ev->Get()->Attributes;
         YQL_CLOG(INFO, ProviderDq) << "Leader resolver=" << LeaderHost << ":" << LeaderPort;
 
         if (LeaderPinger) {

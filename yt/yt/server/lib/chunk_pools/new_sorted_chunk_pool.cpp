@@ -70,8 +70,6 @@ public:
     {
         Logger = options.Logger;
         StructuredLogger = options.StructuredLogger;
-        ValidateLogger(Logger);
-
         YT_VERIFY(RowBuffer_);
 
         if (options.JobSizeAdjusterConfig && JobSizeConstraints_->CanAdjustDataWeightPerJob()) {
@@ -634,7 +632,7 @@ private:
         if (!succeeded) {
             YT_LOG_DEBUG("Retry limit exceeded (MaxBuildRetryCount: %v)", JobSizeConstraints_->GetMaxBuildRetryCount());
             THROW_ERROR_EXCEPTION("Retry limit exceeded while building jobs")
-                << errors;
+                .With(errors);
         }
 
         // TODO(max42): why does job manager accept a vector of unique pointers to job stubs
@@ -870,7 +868,6 @@ void TNewSortedChunkPool::RegisterMetadata(auto&& registrar)
         .SinceVersion(ESnapshotVersion::ChunkPoolStatistics));
 
     registrar.AfterLoad([] (TThis* this_, auto& /*context*/) {
-        ValidateLogger(this_->Logger);
         this_->RowBuffer_ = New<TRowBuffer>();
     });
 }

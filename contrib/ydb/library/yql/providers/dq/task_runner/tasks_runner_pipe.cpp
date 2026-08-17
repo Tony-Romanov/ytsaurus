@@ -1749,11 +1749,16 @@ public:
         return "";
     }
 
-    void Prepare(const TDqTaskSettings& task, const TDqTaskRunnerMemoryLimits& memoryLimits,
-        const IDqTaskRunnerExecutionContext& execCtx, TDqComputeActorWatermarks* watermarksTracker) override
-    {
+    void Prepare(
+        const TDqTaskSettings& task,
+        const TDqTaskRunnerMemoryLimits& memoryLimits,
+        const IDqTaskRunnerExecutionContext& execCtx,
+        TDqComputeActorWatermarks* watermarksTracker,
+        TDqWatermarkGeneratorTracker* sourceWatermarksTracker
+    ) override {
         Y_UNUSED(execCtx);
         Y_UNUSED(watermarksTracker);
+        Y_UNUSED(sourceWatermarksTracker);
         Y_ABORT_UNLESS(Task.GetId() == task.GetId());
         try {
             auto result = Delegate->Prepare(memoryLimits);
@@ -1921,6 +1926,14 @@ public:
             // Stats.CodeGenFullTime = f.GetCodeGenFullTime();
             // Stats.CodeGenFinalizeTime = f.GetCodeGenFinalizeTime();
             // Stats.CodeGenModulePassTime = f.GetCodeGenModulePassTime();
+
+            Stats.MkqlStats.clear();
+            for (const auto& stat : protoStats.GetMkqlStats()) {
+                Stats.MkqlStats.emplace_back(TMkqlStat{
+                    TStatKey(stat.GetName(), stat.GetDeriv()),
+                    stat.GetValue()
+                });
+            }
 
             for (const auto& input : protoStats.GetInputChannels()) {
                 InputChannels[input.GetChannelId()]->FromProto(input);

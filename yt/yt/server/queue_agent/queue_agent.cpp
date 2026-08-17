@@ -9,13 +9,12 @@
 #include "queue_controller.h"
 #include "queue_export_manager.h"
 #include "snapshot.h"
+#include "ytree_helpers.h"
 
 #include <yt/yt/server/lib/alert_manager/alert_manager.h>
 
-#include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/config.h>
-
-#include <yt/yt/library/discovery_client/member_client.h>
+#include <yt/yt/ytlib/api/native/connection.h>
 
 #include <yt/yt/ytlib/auth/native_authenticating_channel.h>
 
@@ -25,12 +24,16 @@
 
 #include <yt/yt/library/cypress_election/election_manager.h>
 
+#include <yt/yt/library/discovery_client/member_client.h>
+
 #include <yt/yt/library/orchid/orchid_ypath_service.h>
 
 #include <yt/yt/core/concurrency/periodic_executor.h>
 #include <yt/yt/core/concurrency/thread_pool.h>
 
 #include <yt/yt/core/misc/collection_helpers.h>
+
+#include <yt/yt/core/rpc/helpers.h>
 
 #include <yt/yt/core/ypath/token.h>
 
@@ -167,7 +170,7 @@ constinit const auto Logger = QueueAgentLogger;
 ////////////////////////////////////////////////////////////////////////////////
 
 class TObjectMapBoundService
-    : public TVirtualMapBase
+    : public TVirtualMapPartBase
 {
 public:
     TObjectMapBoundService(
@@ -248,10 +251,9 @@ public:
         }
 
         if (!Owner_->ObjectsWithOurStage_[ObjectKind_].contains(ref)) {
-            // NB(apachee): It is possible to try to access queue using consumers orchid (and vice versa), e.g.
-            // //queue_agent/consumers/<queue>, and previously that would've let to redirect, but
-            // this condition short-circuits resolving of such paths.
-            THROW_ERROR_EXCEPTION("Type of the object %v does not match with the path used", ref);
+            // The object is of a different kind and belongs to a sibling part of the merged map;
+            // returning null lets the merged service consult it instead of short-circuiting here.
+            return nullptr;
         }
 
         const auto& objectAgentId = objectToHostIt->second;
@@ -263,9 +265,9 @@ public:
                     "Object %v is not available from instance %v",
                     ref,
                     Owner_->AgentId_)
-                    << TErrorAttribute("cached_object_agent_id", objectAgentId);
+                    .With("cached_object_agent_id", objectAgentId);
                 THROW_ERROR_EXCEPTION(NRpc::EErrorCode::Unavailable, "Unavailable, retry later")
-                    << error;
+                    .With(error);
             }
 
             auto remoteRoot = Format("%v/%v", ProxyConfig_.RemoteQueryRoot, ToYPathLiteral(key));
@@ -294,6 +296,8 @@ private:
     };
     const TProxyConfig ProxyConfig_;
 };
+
+using TObjectMapBoundServicePtr = TIntrusivePtr<TObjectMapBoundService>;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -491,7 +495,6 @@ TQueueAgent::TQueueAgent(
     std::string queueAgentUser,
     IInvokerPtr controlInvoker,
     TDynamicStatePtr dynamicState,
-    ICypressElectionManagerPtr electionManager,
     IAlertCollectorPtr alertCollector,
     std::string agentId)
     : Config_(std::move(config))
@@ -500,7 +503,6 @@ TQueueAgent::TQueueAgent(
     , QAClientDirectory_(New<TQueueAgentClientDirectory>(ClientDirectory_))
     , ControlInvoker_(std::move(controlInvoker))
     , DynamicState_(std::move(dynamicState))
-    , ElectionManager_(std::move(electionManager))
     , AlertCollector_(std::move(alertCollector))
     , ControllerThreadPool_(CreateThreadPool(DynamicConfig_->ControllerThreadCount, "Controller"))
     , PassExecutor_(New<TPeriodicExecutor>(
@@ -509,25 +511,43 @@ TQueueAgent::TQueueAgent(
         DynamicConfig_->PassPeriod))
     , PassProfiler_(QueueAgentProfiler())
     , AgentId_(std::move(agentId))
-    , QueueAgentChannelFactory_(nativeConnection->GetChannelFactory())
+    , BaseQueueAgentChannelFactory_(nativeConnection->GetChannelFactory())
+    , QueueAgentChannelFactory_(NRpc::CreateDefaultTimeoutChannelFactory(
+        BaseQueueAgentChannelFactory_,
+        DynamicConfig_->QueueAgentChannelRequestTimeout))
     , QueueExportManager_(CreateQueueExportManager(
         nativeConnection,
         std::move(queueAgentUser),
         Config_->QueueExportManager,
         DynamicConfig_->QueueExportManager))
 {
+    TEnumIndexedArray<EObjectKind, TObjectMapBoundServicePtr> objectServices;
+    TEnumIndexedArray<EObjectKind, TObjectMapBoundServicePtr> ownedObjectServices;
     for (auto objectKind : TEnumTraits<EObjectKind>::GetDomainValues()) {
-        ObjectServiceNodes_[objectKind] = CreateVirtualNode(
-            New<TObjectMapBoundService>(
-                this,
-                objectKind,
-                /*enableProxy*/ true));
+        objectServices[objectKind] = New<TObjectMapBoundService>(
+            this,
+            objectKind,
+            /*enableProxy*/ true);
+        ownedObjectServices[objectKind] = New<TObjectMapBoundService>(
+            this,
+            objectKind,
+            /*enableProxy*/ false);
+    }
 
-        OwnedObjectServiceNodes_[objectKind] = CreateVirtualNode(
-            New<TObjectMapBoundService>(
-                this,
-                objectKind,
-                /*enableProxy*/ false));
+    for (auto objectKind : TEnumTraits<EObjectKind>::GetDomainValues()) {
+        if (objectKind == EObjectKind::Consumer) {
+            ObjectServiceNodes_[objectKind] = CreateVirtualNode(CreateMergedVirtualMapService({
+                objectServices[EObjectKind::Consumer],
+                objectServices[EObjectKind::MultiConsumer],
+            }));
+            OwnedObjectServiceNodes_[objectKind] = CreateVirtualNode(CreateMergedVirtualMapService({
+                ownedObjectServices[EObjectKind::Consumer],
+                ownedObjectServices[EObjectKind::MultiConsumer],
+            }));
+        } else {
+            ObjectServiceNodes_[objectKind] = CreateVirtualNode(objectServices[objectKind]);
+            OwnedObjectServiceNodes_[objectKind] = CreateVirtualNode(ownedObjectServices[objectKind]);
+        }
     }
 }
 
@@ -587,6 +607,10 @@ void TQueueAgent::OnDynamicConfigChanged(
     PassExecutor_->SetPeriod(newConfig->PassPeriod);
 
     ControllerThreadPool_->SetThreadCount(newConfig->ControllerThreadCount);
+
+    QueueAgentChannelFactory_.Store(NRpc::CreateDefaultTimeoutChannelFactory(
+        BaseQueueAgentChannelFactory_,
+        newConfig->QueueAgentChannelRequestTimeout));
 
     {
         auto guard = ReaderGuard(ObjectLock_);
@@ -666,7 +690,7 @@ void TQueueAgent::Pass()
     PassProfiler_.OnStart(PassIndex_, PassInstant_);
 
     auto traceContextGuard = TTraceContextGuard(TTraceContext::NewRoot("QueueAgent"));
-    auto Logger = QueueAgentLogger().WithTag("PassIndex: %v", PassIndex_);
+    auto Logger = QueueAgentLogger().WithTag("PassIndex", PassIndex_);
 
     YT_LOG_INFO("Pass started");
 
@@ -709,7 +733,7 @@ void TQueueAgent::GuardedPass(const TLogger& Logger)
         asyncObjectMappingRows.AsVoid(),
     };
     if (auto error = WaitFor(AllSucceeded(futures)); !error.IsOK()) {
-        THROW_ERROR_EXCEPTION("Error while reading dynamic state") << error;
+        THROW_ERROR_EXCEPTION("Error while reading dynamic state").With(error);
     }
 
     auto queueRows = asyncQueueRows.AsUnique().GetOrCrash().Value();
@@ -958,7 +982,7 @@ void TQueueAgent::GuardedPass(const TLogger& Logger)
         auto guard = ReaderGuard(ObjectLock_);
 
         // NB(panesher): After swap we have here only old objects.
-        auto& oldObjects = freshObjects;
+        const auto& oldObjects = freshObjects;
 
         for (auto objectKind : TEnumTraits<EObjectKind>::GetDomainValues()) {
             for (const auto& [path, object] : oldObjects[objectKind]) {
@@ -968,7 +992,6 @@ void TQueueAgent::GuardedPass(const TLogger& Logger)
             }
         }
     }
-
 
     // Finally, update rows in the controllers. As best effort to prevent some inconsistencies (like enabling trimming
     // with obsolete list of vital registrations), we do that strictly after registration update.
@@ -1094,8 +1117,11 @@ NYTree::IYPathServicePtr TQueueAgent::RedirectYPathRequest(const std::string& ho
 {
     YT_ASSERT_THREAD_AFFINITY_ANY();
 
-    YT_LOG_DEBUG("Redirecting orchid request (QueueAgentHost: %v, RemoteRoot: %v)", host, remoteRoot);
-    auto leaderChannel = QueueAgentChannelFactory_->CreateChannel(host);
+    YT_LOG_DEBUG("Redirecting orchid request (QueueAgentHost: %v, RemoteRoot: %v)",
+        host,
+        remoteRoot);
+
+    auto leaderChannel = QueueAgentChannelFactory_.Acquire()->CreateChannel(host);
     return CreateOrchidYPathService({
         .Channel = std::move(leaderChannel),
         .RemoteRoot = std::string(remoteRoot),
@@ -1127,6 +1153,7 @@ bool TQueueAgent::UpdateMultiConsumerController(
         controller,
         row,
         replicatedTableMappingRow,
+        /*store*/ this,
         DynamicConfig_->Controller,
         QAClientDirectory_,
         ControllerThreadPool_->GetInvoker(),

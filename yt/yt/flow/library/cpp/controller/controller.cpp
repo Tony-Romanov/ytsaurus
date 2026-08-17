@@ -228,6 +228,16 @@ public:
             PartitionMemoryUsageAvgGauge_.Update(metrics->Avg->MemoryUsageCurrent);
         }
 
+        void ResetPerformanceMetrics()
+        {
+            CpuUsageTotalGauge_.Update(0);
+            MemoryUsageTotalGauge_.Update(0);
+            PartitionCpuUsageMaxGauge_.Update(0);
+            PartitionMemoryUsageMaxGauge_.Update(0);
+            PartitionCpuUsageAvgGauge_.Update(0);
+            PartitionMemoryUsageAvgGauge_.Update(0);
+        }
+
         void Apply(
             const TAggregatedNodeInputMetricsPtr& inputMetrics,
             const THashMap<TStreamId, TAggregatedStreamTraverseData>& aggregatedStreamTraverseDatas,
@@ -271,6 +281,11 @@ public:
                 streamMetrics.EventWatermarkMinMaxDifference.Update(streamTraverseDataMetrics->EventWatermarkMinMaxDifference);
             }
             DropMissingKeys(StreamMetrics_, streamIds);
+        }
+
+        void ResetInputMetrics()
+        {
+            StreamMetrics_.clear();
         }
 
     private:
@@ -397,6 +412,7 @@ public:
         : Connector_(std::move(connector))
         , PipelineAuthenticator_(std::move(authenticator))
         , TimeProvider_(CreateRetryingTimeProvider(Connector_->GetClient(), clockClusterTag, invoker, statusProfiler, ControllerLogger()))
+        , VersionProvider_(CreateVersionProvider(TimeProvider_))
         , Config_(std::move(config))
         , NodeInfo_(std::move(nodeInfo))
         , Profiler_(profiler)
@@ -413,6 +429,16 @@ public:
         , DynamicSpecVersion_(Profiler_.Gauge("/dynamic_spec_version"))
         , StatusProfiler_(std::move(statusProfiler))
     { }
+
+    const IVersionProviderPtr& GetVersionProvider() const
+    {
+        return VersionProvider_;
+    }
+
+    TFuture<void> InsertVersionBarrier()
+    {
+        return TimeProvider_->InsertSeqNoBarrier();
+    }
 
     void SyncWorkers(const TFlowViewPtr& flowView, const std::vector<TWorkerInfo>& workers)
     {
@@ -490,12 +516,13 @@ public:
             context->Invoker = Invoker_;
             context->MainCycleInvoker = MainCycleInvoker_;
             context->TimeProvider = TimeProvider_;
+            context->VersionProvider = VersionProvider_;
             context->StatusProfiler = StatusProfiler_->WithPrefix("/job_manager");
             JobManager_ = CreateJobManager(std::move(context), New<TPipelineSpec>(), New<TDynamicPipelineSpec>(), New<TJobManagerState>(), /*authenticator*/ nullptr);
             try {
                 auto pipelineState = flowState->ExecutionSpec->PipelineState->GetValue();
                 if (pipelineState != EPipelineState::Paused && pipelineState != EPipelineState::Stopped && pipelineState != EPipelineState::Completed) {
-                    flowState->ExecutionSpec->PipelineState->SetValue(EPipelineState::Pausing);
+                    flowState->ExecutionSpec->PipelineState->TrySetValue(EPipelineState::Pausing, VersionProvider_);
                 }
                 DoScheduling(flowView);
             } catch (const std::exception& ex) {
@@ -518,11 +545,11 @@ public:
             if (flowCoreTargetMatched != FlowCoreTargetMatched_) {
                 const auto& flowCoreTarget = flowView->State->ExecutionSpec->FlowCoreTarget->GetValue();
                 if (flowCoreTargetMatched) {
-                    YT_TLOG_EVENT_FLUENT(PublicControllerLogger(), NLogging::ELogLevel::Info, "Controller FlowCoreVersion matches FlowCoreTarget, resuming scheduling")
+                    YT_TLOG_EVENT(PublicControllerLogger(), NLogging::ELogLevel::Info, "Controller FlowCoreVersion matches FlowCoreTarget, resuming scheduling")
                         .With("FlowCoreVersion", NodeInfo_->FlowCoreVersion)
                         .With("FlowCoreTarget", flowCoreTarget);
                 } else {
-                    YT_TLOG_EVENT_FLUENT(PublicControllerLogger(), NLogging::ELogLevel::Info, "Controller FlowCoreVersion mismatches FlowCoreTarget, scheduling is paused")
+                    YT_TLOG_EVENT(PublicControllerLogger(), NLogging::ELogLevel::Info, "Controller FlowCoreVersion mismatches FlowCoreTarget, scheduling is paused")
                         .With("FlowCoreVersion", NodeInfo_->FlowCoreVersion)
                         .With("FlowCoreTarget", flowCoreTarget);
                 }
@@ -537,7 +564,7 @@ public:
                     YT_TLOG_WARNING("FlowCoreTarget mismatch, pausing pipeline")
                         .With("Target", flowView->State->ExecutionSpec->FlowCoreTarget->GetValue())
                         .With("Actual", NodeInfo_->FlowCoreVersion);
-                    flowView->State->ExecutionSpec->PipelineState->SetValue(EPipelineState::Pausing);
+                    flowView->State->ExecutionSpec->PipelineState->TrySetValue(EPipelineState::Pausing, VersionProvider_);
                 }
             }
 
@@ -624,13 +651,17 @@ public:
             DropMissingKeys(StreamMetrics_, THashSet<TStreamId>(streamIds.begin(), streamIds.end()));
         }
 
-        auto performanceMetrics = AggregatePerformanceMetrics(flowView);
-        auto inputMetrics = AggregateInputMetricsByComputation(flowView);
-        auto streamTraverseDatas = AggregateStreamTraverseData(flowView);
+        const auto minJobStatusUpdateTime = TInstant::Now() -
+            executionSpec->DynamicPipelineSpec->GetValue()->JobManager->LostJobTimeout;
+        auto performanceMetrics = AggregatePerformanceMetrics(flowView, minJobStatusUpdateTime);
+        auto inputMetrics = AggregateInputMetricsByComputation(flowView, minJobStatusUpdateTime);
+        auto streamTraverseDatas = AggregateStreamTraverseData(flowView, minJobStatusUpdateTime);
         for (const auto& [computationId, node] : traverseData->Computations) {
             auto& metrics = ComputationMetrics_.try_emplace(computationId, Profiler_, computationId).first->second;
             if (auto* computationPerformanceMetrics = performanceMetrics.FindPtr(computationId)) {
                 metrics.Apply(*computationPerformanceMetrics);
+            } else {
+                metrics.ResetPerformanceMetrics();
             }
             if (auto* computationInputMetrics = inputMetrics.FindPtr(computationId)) {
                 metrics.Apply(
@@ -638,6 +669,8 @@ public:
                     streamTraverseDatas[computationId],
                     flowView->EphemeralState->StreamTraverseDataMetrics[computationId],
                     GetOrCrash(pipelineSpec->Computations, computationId));
+            } else {
+                metrics.ResetInputMetrics();
             }
         }
         DropMissingKeys(ComputationMetrics_, traverseData->Computations);
@@ -676,6 +709,7 @@ private:
     const IYTConnectorPtr Connector_;
     const IPipelineAuthenticatorPtr PipelineAuthenticator_;
     const ITimeProviderPtr TimeProvider_;
+    const IVersionProviderPtr VersionProvider_;
     const TControllerConfigPtr Config_;
     const TNodeInfoPtr NodeInfo_;
     const TProfiler Profiler_;
@@ -709,8 +743,8 @@ private:
         const auto& executionSpec = flowState->ExecutionSpec;
         if (executionSpec->PipelineSpec->GetVersion() != spec->GetVersion() || !JobManager_) {
             executionSpec->PipelineSpec = spec;
-            executionSpec->ExtendedPipelineSpec->SetValue(BuildExtendedPipelineSpec(executionSpec->PipelineSpec->GetValue()));
-            UpdateStreamSpecStorageState(executionSpec->StreamSpecStorageState, *spec->GetValue(), TimeProvider_);
+            executionSpec->ExtendedPipelineSpec->TrySetValue(BuildExtendedPipelineSpec(executionSpec->PipelineSpec->GetValue()), VersionProvider_);
+            UpdateStreamSpecStorageState(executionSpec->StreamSpecStorageState, *spec->GetValue(), TimeProvider_, VersionProvider_);
             try {
                 auto context = New<TJobManagerContext>();
                 context->ClientsCache = Connector_->GetClientsCache();
@@ -718,10 +752,11 @@ private:
                 context->Invoker = Invoker_;
                 context->MainCycleInvoker = MainCycleInvoker_;
                 context->TimeProvider = TimeProvider_;
+                context->VersionProvider = VersionProvider_;
                 context->StatusProfiler = StatusProfiler_->WithPrefix("/job_manager");
                 JobManager_ = CreateJobManager(std::move(context), executionSpec->PipelineSpec->GetValue(), executionSpec->DynamicPipelineSpec->GetValue(), flowState->JobManagerState, PipelineAuthenticator_);
             } catch (const std::exception& ex) {
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Failed to create job manager")
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Failed to create job manager")
                     .With(ex);
                 JobManager_ = nullptr;
             }
@@ -760,17 +795,17 @@ private:
                 switch (dynamicSpec->TargetState) {
                     case EPipelineState::Completed:
                         if (executionSpec->PipelineState->GetValue() != EPipelineState::Working) {
-                            executionSpec->PipelineState->SetValue(EPipelineState::Working);
+                            executionSpec->PipelineState->TrySetValue(EPipelineState::Working, VersionProvider_);
                         }
                         break;
                     case EPipelineState::Stopped:
                         if (executionSpec->PipelineState->GetValue() != EPipelineState::Draining) {
-                            executionSpec->PipelineState->SetValue(EPipelineState::Draining);
+                            executionSpec->PipelineState->TrySetValue(EPipelineState::Draining, VersionProvider_);
                         }
                         break;
                     default:
                         if (executionSpec->PipelineState->GetValue() != EPipelineState::Pausing && executionSpec->PipelineState->GetValue() != EPipelineState::Stopped && executionSpec->PipelineState->GetValue() != EPipelineState::Completed) {
-                            executionSpec->PipelineState->SetValue(EPipelineState::Pausing);
+                            executionSpec->PipelineState->TrySetValue(EPipelineState::Pausing, VersionProvider_);
                         }
                         break;
                 }
@@ -778,7 +813,7 @@ private:
         } else {
             YT_TLOG_WARNING("Binary compatibility mismatch");
             if (executionSpec->PipelineState->GetValue() != EPipelineState::Completed && executionSpec->PipelineState->GetValue() != EPipelineState::Paused && executionSpec->PipelineState->GetValue() != EPipelineState::Stopped) {
-                executionSpec->PipelineState->SetValue(EPipelineState::Pausing);
+                executionSpec->PipelineState->TrySetValue(EPipelineState::Pausing, VersionProvider_);
             }
         }
     }
@@ -881,9 +916,10 @@ private:
         auto stopJobsAndResetState = [&] (EPipelineState newState) {
             JobManager_->StopAllJobs(flowView);
             LeaseManager_->TerminateStrayLeases(flowView);
-            flowView->State->ExecutionSpec->PipelineState->SetValue(newState);
+            flowView->State->ExecutionSpec->PipelineState->TrySetValue(newState, VersionProvider_);
         };
         auto manageJobs = [&] {
+            JobManager_->CancelInvalidGracefulRebalances(flowView);
             JobManager_->RemoveFailedJobs(flowView);
             JobManager_->RemoveLostJobs(flowView);
             JobManager_->DoPartitioning(flowView);
@@ -1001,7 +1037,7 @@ private:
         const auto pipelineState = flowView->IsSynced()
             ? flowView->State->ExecutionSpec->PipelineState->GetValue()
             : EPipelineState::Unknown;
-        YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Info, "Jobs status")
+        YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Info, "Jobs status")
             .With("PipelineState", pipelineState)
             .With("Workers", std::ssize(flowView->State->Workers))
             .With("WorkingOld", totalCounters.WorkingOld)
@@ -1013,7 +1049,7 @@ private:
             .With("FlowViewAge", TInstant::Now() - TInstant::Seconds(flowView->State->CurrentTimestamp.Underlying()));
 
         if (const auto& computations = flowView->EphemeralState->TraverseUncoveredComputations) {
-            YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Some computations has partial traverse coverage")
+            YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Some computations has partial traverse coverage")
                 .With("Computations", computations);
         }
     }
@@ -1036,21 +1072,19 @@ private:
         }
     }
 
-    static THashMap<TComputationId, TAggregatedNodePerformanceMetricsPtr> AggregatePerformanceMetrics(const TFlowViewPtr& flowView)
+    static THashMap<TComputationId, TAggregatedNodePerformanceMetricsPtr> AggregatePerformanceMetrics(
+        const TFlowViewPtr& flowView,
+        TInstant minJobStatusUpdateTime)
     {
         const auto& flowLayout = flowView->State->ExecutionSpec->Layout;
         THashMap<TComputationId, std::vector<TNodePerformanceMetricsPtr>> groupedMetrics;
         for (const auto& [partitionId, partition] : flowLayout->Partitions) {
             if (partition->State == EPartitionState::Executing || partition->State == EPartitionState::Completing || partition->State == EPartitionState::Interrupting) {
-                auto statusIt = flowView->Feedback->PartitionJobStatuses.find(partitionId);
-                if (statusIt == flowView->Feedback->PartitionJobStatuses.end()) {
+                const auto& status = flowView->Feedback->GetFreshCurrentJobStatus(partitionId, minJobStatusUpdateTime);
+                if (!status || !status->PerformanceMetrics) {
                     continue;
                 }
-                const auto& status = statusIt->second;
-                if (!status->CurrentJobStatus) {
-                    continue;
-                }
-                groupedMetrics[partition->ComputationId].push_back(status->CurrentJobStatus->PerformanceMetrics);
+                groupedMetrics[partition->ComputationId].push_back(status->PerformanceMetrics);
             }
         }
         THashMap<TComputationId, TAggregatedNodePerformanceMetricsPtr> result;
@@ -1060,17 +1094,15 @@ private:
         return result;
     }
 
-    static THashMap<TComputationId, THashMap<TStreamId, TAggregatedStreamTraverseData>> AggregateStreamTraverseData(const TFlowViewPtr& flowView)
+    static THashMap<TComputationId, THashMap<TStreamId, TAggregatedStreamTraverseData>> AggregateStreamTraverseData(
+        const TFlowViewPtr& flowView,
+        TInstant minJobStatusUpdateTime)
     {
         const auto& flowLayout = flowView->State->ExecutionSpec->Layout;
         THashMap<TComputationId, THashMap<TStreamId, std::vector<TStreamTraverseDataPtr>>> groupedMetrics;
         for (const auto& [partitionId, partition] : flowLayout->Partitions) {
             if (partition->State == EPartitionState::Executing || partition->State == EPartitionState::Completing || partition->State == EPartitionState::Interrupting) {
-                auto statusIt = flowView->Feedback->PartitionJobStatuses.find(partitionId);
-                if (statusIt == flowView->Feedback->PartitionJobStatuses.end()) {
-                    continue;
-                }
-                const auto& status = statusIt->second->CurrentJobStatus;
+                const auto& status = flowView->Feedback->GetFreshCurrentJobStatus(partitionId, minJobStatusUpdateTime);
                 if (!status || !status->FromPartitionTraverseData || !status->FromPartitionTraverseData->Node) {
                     continue;
                 }
@@ -1160,7 +1192,7 @@ private:
         std::vector<TPartitionId> interruptedPartitions;
         for (const auto& [partitionId, partition] : flowLayout->Partitions) {
             if (partition->State == EPartitionState::Interrupted) {
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Info, "Removing interrupted partition")
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Info, "Removing interrupted partition")
                     .With("PartitionId", partitionId)
                     .With("Partition", NYson::ConvertToYsonString(partition, EYsonFormat::Text));
                 interruptedPartitions.push_back(partitionId);
@@ -1248,6 +1280,14 @@ public:
     TNodeInfoPtr GetNodeInfo() const override
     {
         return NodeInfo_;
+    }
+
+    IVersionProviderPtr GetVersionProvider() const override
+    {
+        EnsureIsLeader();
+        auto leader = WeakLeader_.Lock();
+        THROW_ERROR_EXCEPTION_UNLESS(leader, "Controller leader is not running");
+        return leader->GetVersionProvider();
     }
 
     void RegisterJobStatus(const TJobId& jobId, TJobStatusPtr jobStatus) override
@@ -1383,6 +1423,12 @@ private:
                             .With("FlowCoreTarget", flowState->ExecutionSpec->FlowCoreTarget->GetValue());
                     }
 
+                    // The recovered state may carry versions minted by a newer leader (this
+                    // instance may already be fenced without knowing it); barrier the version
+                    // stream so local bumps stay above them.
+                    WaitFor(leader->InsertVersionBarrier())
+                        .ThrowOnError();
+
                     YT_TLOG_INFO("Initialized. Sleep to WarmUp")
                         .With("WarmUpTime", Config_->WarmUpTime);
 
@@ -1450,11 +1496,11 @@ private:
                             auto error = TError(ex);
                             if (!error.FindMatching(NFlow::EErrorCode::SpecVersionMismatch) && !error.FindMatching(NFlow::EErrorCode::FlowCoreTargetVersionMismatch)) {
                                 THROW_ERROR_EXCEPTION("Schedule iteration failed")
-                                    << error;
+                                    .With(error);
                             }
                             schedulerActivityContext.FailedIterations.Increment();
                             schedulerActivityContext.ErrorState->SetError(error);
-                            YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Schedule iteration failed")
+                            YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Schedule iteration failed")
                                 .With(error);
                         }
                         TDelayedExecutor::WaitForDuration(Config_->SchedulerPeriod);
@@ -1465,7 +1511,7 @@ private:
                     schedulerActivityContext.FailedIterations.Increment();
                     schedulerActivityContext.ErrorState->SetError(error);
                     DoCleanUp();
-                    YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Scheduler Executor thread failed and restarted")
+                    YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Scheduler Executor thread failed and restarted")
                         .With(error);
                     TDelayedExecutor::WaitForDuration(Config_->SchedulerPeriod);
                 }
@@ -1492,10 +1538,10 @@ private:
                             .With("Name", name);
                         activityContext.ErrorState->ClearError();
                     } catch (const std::exception& ex) {
-                        auto error = TError("Failed to execute %v iteration", name) << ex;
+                        auto error = TError("Failed to execute %v iteration", name).With(ex);
                         activityContext.FailedIterations.Increment();
                         activityContext.ErrorState->SetError(error);
-                        YT_TLOG_EVENT_FLUENT(Logger, getLogLevel(error), "")
+                        YT_TLOG_EVENT(Logger, getLogLevel(error), "")
                             .With(error);
                     }
                     TDelayedExecutor::WaitForDuration(period);
@@ -1541,7 +1587,7 @@ private:
                 for (const auto& [component, currentError] : currentStatus.Errors) {
                     TError* previousError = previousErrors.FindPtr(component);
                     if (!previousError || currentError != *previousError) {
-                        YT_TLOG_EVENT_FLUENT(PublicControllerLogger, getLogLevel(currentError), "Found new retryable errors in controller")
+                        YT_TLOG_EVENT(PublicControllerLogger, getLogLevel(currentError), "Found new retryable errors in controller")
                             .With("Component", component)
                             .With(currentError);
                     }
@@ -1654,7 +1700,7 @@ private:
                     TError* currentError = previousJobStatus ? previousJobStatus->RetryableErrors.FindPtr(component) : nullptr;
                     if (!currentError || *currentError != error) {
                         partitionJobStatus->LastRetryableErrorInstant = std::min(std::max(partitionJobStatus->LastRetryableErrorInstant, error.GetDatetime()), now);
-                        YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Received job retryable error")
+                        YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Received job retryable error")
                             .With("Component", component)
                             .With("JobId", jobId)
                             .With("PartitionId", partition->PartitionId)
@@ -1670,14 +1716,14 @@ private:
         for (const auto& [workerAddress, newWorkerStatus] : freshWorkerStatuses) {
             auto& workerStatus = feedback->WorkerStatuses[workerAddress];
             if (!newWorkerStatus->PreviousCrashError.IsOK() && (!workerStatus || workerStatus->PreviousCrashError != newWorkerStatus->PreviousCrashError)) {
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Received worker crash error")
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Received worker crash error")
                     .With("WorkerAddress", workerAddress)
                     .With(newWorkerStatus->PreviousCrashError);
             }
             for (const auto& [component, error] : newWorkerStatus->Errors) {
                 TError* currentError = workerStatus ? workerStatus->Errors.FindPtr(component) : nullptr;
                 if (!currentError || *currentError != error) {
-                    YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Received worker error")
+                    YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Received worker error")
                         .With("Component", component)
                         .With("WorkerAddress", workerAddress)
                         .With(error);

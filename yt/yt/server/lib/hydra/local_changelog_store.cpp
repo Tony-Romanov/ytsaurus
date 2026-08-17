@@ -336,7 +336,7 @@ public:
             profiler))
         , Invoker_(Dispatcher_->GetInvoker())
         , BoundedConcurrencyInvoker_(CreateBoundedConcurrencyInvoker(Invoker_, 1))
-        , Logger(HydraLogger().WithTag("Path: %v", Config_->Path))
+        , Logger(HydraLogger().WithTag("Path", Config_->Path))
     { }
 
     TFuture<void> WriteTerm(int term)
@@ -526,7 +526,7 @@ private:
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error locking local changelog store %v",
                 Config_->Path)
-                << ex;
+                .With(ex);
         }
     }
 

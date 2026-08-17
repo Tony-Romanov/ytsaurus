@@ -1,4 +1,5 @@
 #include "spec.h"
+#include "buffer_warmup.h"
 #include "registry.h"
 #include "schema.h"
 #include "state.h"
@@ -228,6 +229,10 @@ void TDynamicKeyVisitorStreamSpec::Register(TRegistrar registrar)
     registrar.Parameter("catchup_speedup_multiplier", &TThis::CatchupSpeedupMultiplier)
         .GreaterThan(1.0)
         .Default(1.2);
+    registrar.Parameter("finite", &TThis::Finite)
+        .Default(true);
+    registrar.Parameter("full_final_pass", &TThis::FullFinalPass)
+        .Default(true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -984,6 +989,7 @@ void TDynamicBufferStateManagerSpec::TOneSideBufferSpec::Register(TRegistrar reg
         .Default(NYTree::TSize(500_MB));
 
     registrar.Parameter("max_duration", &TThis::MaxDuration)
+        .GreaterThan(TDuration::Zero())
         .Default(TDuration::Seconds(60));
     registrar.Parameter("job_overrides", &TThis::JobOverrides)
         .Default();
@@ -994,14 +1000,44 @@ void TDynamicBufferStateManagerSpec::TOneSideBufferSpec::Register(TRegistrar reg
 void TDynamicBufferStateManagerSpec::Register(TRegistrar registrar)
 {
     registrar.Parameter("manage_period", &TThis::ManagePeriod)
+        .GreaterThan(TDuration::Zero())
         .Default(TDuration::MilliSeconds(1000));
     registrar.Parameter("demand_window", &TThis::DemandWindow)
         .Default(TDuration::Seconds(60));
+    registrar.Parameter("epoch_cycle_window_samples", &TThis::EpochCycleWindowSamples)
+        .InRange(1, 256)
+        .Default(16);
+    registrar.Parameter("max_rate_estimator_buckets", &TThis::MaxRateEstimatorBuckets)
+        .InRange(1, 256)
+        .Default(8);
+    registrar.Parameter("warmup_refresh_period", &TThis::WarmupRefreshPeriod)
+        .GreaterThan(TDuration::Zero())
+        .Default(DefaultWarmupRefreshPeriod);
 
     registrar.Parameter("input_buffer", &TThis::InputBuffer)
         .DefaultNew();
     registrar.Parameter("output_buffer", &TThis::OutputBuffer)
         .DefaultNew();
+
+    registrar.Parameter("enable_v2", &TThis::EnableV2)
+        .Default(false);
+    registrar.Parameter("v2_gain_epochs", &TThis::V2GainEpochs)
+        .GreaterThan(1.0)
+        .Default(2.0);
+    registrar.Parameter("v2_use_offered_rate", &TThis::V2UseOfferedRate)
+        .Default(true);
+    registrar.Parameter("v2_floor", &TThis::V2Floor)
+        .GreaterThan(NYTree::TSize(0))
+        .Default(NYTree::TSize(2_MB));
+    registrar.Parameter("v2_headroom_growth_factor", &TThis::V2HeadroomGrowthFactor)
+        .GreaterThan(1.0)
+        .Default(2.0);
+    registrar.Parameter("v2_high_utilization_threshold", &TThis::V2HighUtilizationThreshold)
+        .InRange(0.0, 1.0)
+        .Default(0.65);
+    registrar.Parameter("v2_publish_threshold", &TThis::V2PublishThreshold)
+        .InRange(0.0, 1.0)
+        .Default(0.25);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1238,8 +1274,8 @@ std::vector<TYTPathClaim> CollectAllYTPathClaims(const TPipelineSpecPtr& spec)
                 claims = TRegistry::Get()->CollectYTPathClaims(parameters);
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION(ex)
-                    << TErrorAttribute("computation_id", computationId)
-                    << TErrorAttribute(TString(kind), TString(name));
+                    .With("computation_id", computationId)
+                    .With(TString(kind), TString(name));
             }
             for (auto& claim : claims) {
                 claim.Origin = Format("computation %Qv / %v %Qv / parameter %Qv",
@@ -1350,7 +1386,7 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
             TRegistry::Get()->ValidateStreamSpec(streamSpec);
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION(ex)
-                << TErrorAttribute("stream_id", streamId);
+                .With("stream_id", streamId);
         }
     }
 
@@ -1374,7 +1410,7 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                                 ValidateStateName(name);
                             } catch (const std::exception& ex) {
                                 THROW_ERROR_EXCEPTION(ex)
-                                    << TErrorAttribute("key_visitor_stream", streamId);
+                                    .With("key_visitor_stream", streamId);
                             }
                         }
                     }
@@ -1384,7 +1420,7 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                                 ValidateStateName(name);
                             } catch (const std::exception& ex) {
                                 THROW_ERROR_EXCEPTION(ex)
-                                    << TErrorAttribute("key_visitor_stream", streamId);
+                                    .With("key_visitor_stream", streamId);
                             }
                             if (!computationSpec->ExternalStateManagers.contains(name) &&
                                 !computationSpec->ExternalStateJoiners.contains(name))
@@ -1415,9 +1451,9 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                     ValidateStateName(name);
                 } catch (const std::exception& ex) {
                     THROW_ERROR_EXCEPTION("Invalid %v key %Qv: state names must start with \"/\"",
-                            kind,
-                            name)
-                        << ex;
+                        kind,
+                        name)
+                        .With(ex);
                 }
             };
             for (const auto& name : GetKeys(computationSpec->ExternalStateManagers)) {
@@ -1430,9 +1466,9 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                         ValidateSchemaExpressions(joinerSpec->JoinOn->KeySchemaOverride);
                     } catch (const std::exception& ex) {
                         THROW_ERROR_EXCEPTION(
-                                "Invalid \"key_schema_override\" of external state joiner %Qv",
-                                name)
-                            << ex;
+                            "Invalid \"key_schema_override\" of external state joiner %Qv",
+                            name)
+                            .With(ex);
                     }
                 }
             }
@@ -1442,16 +1478,16 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                     ValidateStateName(joinerSpec->StateName);
                 } catch (const std::exception& ex) {
                     THROW_ERROR_EXCEPTION("Invalid \"state_name\" of state joiner %Qv", name)
-                        << ex;
+                        .With(ex);
                 }
                 if (joinerSpec->JoinOn->KeySchemaOverride) {
                     try {
                         ValidateSchemaExpressions(joinerSpec->JoinOn->KeySchemaOverride);
                     } catch (const std::exception& ex) {
                         THROW_ERROR_EXCEPTION(
-                                "Invalid \"key_schema_override\" of state joiner %Qv",
-                                name)
-                            << ex;
+                            "Invalid \"key_schema_override\" of state joiner %Qv",
+                            name)
+                            .With(ex);
                     }
                 }
                 // The joiner reads the target computation's state keyed by its group-by key, so the
@@ -1493,7 +1529,7 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
             }
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION(ex)
-                << TErrorAttribute("computation_id", computationId);
+                .With("computation_id", computationId);
         }
     }
 
@@ -1578,8 +1614,8 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                 ValidateIsGroupable(*streamSpec->Schema, *computationSpec->GroupBySchema);
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION(ex)
-                    << TErrorAttribute("computation_id", computationId)
-                    << TErrorAttribute("stream_id", streamId);
+                    .With("computation_id", computationId)
+                    .With("stream_id", streamId);
             }
         }
 
@@ -1588,6 +1624,21 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
             computationSpec->InputStreamIds.begin(),
             computationSpec->InputStreamIds.end());
         auto validateJoinerStreams = [&] (TStringBuf kind, const std::string& joinerName, const TStateJoinSpecPtr& joinOn) {
+            if (joinOn->KeySchemaOverride) {
+                for (const auto& streamId : GetKeys(computationSpec->KeyVisitorStreams)) {
+                    if (joinOn->KeyProviderStreams && !joinOn->KeyProviderStreams->contains(streamId)) {
+                        continue;
+                    }
+                    THROW_ERROR_EXCEPTION(
+                        "%v %Qv of computation %Qv sets \"key_schema_override\", but key visitor "
+                        "stream %Qv would feed it group-by keys; exclude the stream via "
+                        "\"key_provider_streams\"",
+                        kind,
+                        joinerName,
+                        computationId,
+                        streamId);
+                }
+            }
             if (!joinOn->KeyProviderStreams) {
                 return;
             }
@@ -1620,26 +1671,26 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
                         ValidateIsGroupable(*streamSpec->Schema, *joinOn->KeySchemaOverride);
                     } catch (const std::exception& ex) {
                         THROW_ERROR_EXCEPTION(
-                                "%v %Qv: input stream %Qv is not "
-                                "groupable into key_schema_override",
-                                kind,
-                                joinerName,
-                                streamId)
-                            << TErrorAttribute("computation_id", computationId)
-                            << ex;
+                            "%v %Qv: input stream %Qv is not "
+                            "groupable into key_schema_override",
+                            kind,
+                            joinerName,
+                            streamId)
+                            .With("computation_id", computationId)
+                            .With(ex);
                     }
                 } else if (timerStreamIds.contains(streamId)) {
                     try {
                         ValidateIsGroupable(*computationSpec->GroupBySchema, *joinOn->KeySchemaOverride);
                     } catch (const std::exception& ex) {
                         THROW_ERROR_EXCEPTION(
-                                "%v %Qv: timer stream %Qv key (= group-by) "
-                                "is not groupable into key_schema_override",
-                                kind,
-                                joinerName,
-                                streamId)
-                            << TErrorAttribute("computation_id", computationId)
-                            << ex;
+                            "%v %Qv: timer stream %Qv key (= group-by) "
+                            "is not groupable into key_schema_override",
+                            kind,
+                            joinerName,
+                            streamId)
+                            .With("computation_id", computationId)
+                            .With(ex);
                     }
                 }
                 // source_stream: silently allowed — the source schema is not materialized
@@ -1731,7 +1782,7 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
             TRegistry::Get()->ValidateResourceSpec(resourceSpec);
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION(ex)
-                << TErrorAttribute("resource_id", resourceId);
+                .With("resource_id", resourceId);
         }
     }
 
@@ -1746,9 +1797,9 @@ void ValidateDynamicPipelineSpec(const TDynamicPipelineSpecPtr& dynamicSpec)
         auto checkThrottlerId = [&] (const std::optional<TThrottlerId>& throttlerId, TStringBuf field) {
             if (throttlerId && !dynamicSpec->Throttlers.contains(*throttlerId)) {
                 THROW_ERROR_EXCEPTION("Throttler %Qv referenced in %v is not declared in dynamic_spec/throttlers",
-                        *throttlerId,
-                        field)
-                    << TErrorAttribute("computation_id", computationId);
+                    *throttlerId,
+                    field)
+                    .With("computation_id", computationId);
             }
         };
         checkThrottlerId(computationSpec->InputRowsThrottlerId, "input_rows_throttler_id");
@@ -1759,10 +1810,10 @@ void ValidateDynamicPipelineSpec(const TDynamicPipelineSpecPtr& dynamicSpec)
                 ValidateStateName(name);
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Invalid %v key %Qv: state names must start with \"/\"",
-                        field,
-                        name)
-                    << TErrorAttribute("computation_id", computationId)
-                    << TError(ex);
+                    field,
+                    name)
+                    .With("computation_id", computationId)
+                    .With(TError(ex));
             }
         };
 

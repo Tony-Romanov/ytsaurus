@@ -20,7 +20,7 @@
 || `runtime_cluster` | **Тип**: `std::optional<std::string>`
 Кластер, на котором запускается vanilla-операция. По умолчанию совпадает с `cluster_url` пайплайна. ||
 || `runtime_proxy_role` | **Тип**: `std::optional<std::string>`
-Роль RPC-прокси для `runtime_cluster` (роль кластера пайплайна может не существовать на нём). ||
+Роль RPC-прокси для `runtime_cluster` (роль кластера пайплайна может не существовать на нём). Учитывается, только когда `runtime_cluster` отличается от кластера пайплайна. ||
 || `cache_path` | **Тип**: `TString`
 **Значение по умолчанию**: `//tmp/yt_wrapper/file_storage/new_cache`
 Content-addressed кэш, в который заливаются файлы джоб (общий для всех flow-операций на кластере). Долговременная копия в папке пайплайна — дешёвый `CopyNode` отсюда. ||
@@ -38,7 +38,7 @@ Content-addressed кэш, в который заливаются файлы дж
 || `title` | **Тип**: `std::optional<std::string>`
 Title vanilla-операции. ||
 || `network_project` | **Тип**: `std::optional<std::string>`
-Сетевой проект, в котором запускается vanilla-операция. ||
+Сетевой проект, в котором запускается vanilla-операция.{% if audience == "internal" %} Во внутренних сборках по умолчанию используется `yt_flow_common`; чтобы отключить дефолт, укажите `#`.{% else %} В open-source сборках дефолта нет.{% endif %} ||
 || `proxy_url_aliasing_rules` | **Тип**: `THashMap<std::string, std::string>`
 **Значение по умолчанию**: `{}`
 Алиасы прокси-URL, прокидываемые во flow-server внутри vanilla-джоб. ||

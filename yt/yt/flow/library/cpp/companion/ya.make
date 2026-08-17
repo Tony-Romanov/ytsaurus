@@ -4,9 +4,11 @@ INCLUDE(${ARCADIA_ROOT}/yt/yt/flow/flow.make.inc)
 
 SRCS(
     companion_client_detail.cpp
+    companion_computation_base.cpp
     companion_entrypoint.cpp
     companion_manager.cpp
     companion_model.cpp
+    companion_resource.cpp
     java_companion_manager.cpp
     java_process_manager.cpp
     companion_process_manager.cpp
@@ -19,6 +21,7 @@ SRCS(
     swift_map_companion_computation.cpp
     swift_ordered_source_companion_computation.cpp
     transform_companion_computation.cpp
+    transform_ordered_source_companion_computation.cpp
 )
 
 PEERDIR(
@@ -34,6 +37,10 @@ PEERDIR(
 )
 
 END()
+
+RECURSE(
+    server
+)
 
 RECURSE_FOR_TESTS(
     unittest

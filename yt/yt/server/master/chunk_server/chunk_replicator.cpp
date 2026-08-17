@@ -318,8 +318,11 @@ class TChunkStatisticsCalculatorCallbacks
     : public IChunkStatisticsCalculatorCallbacks
 {
 public:
-    explicit TChunkStatisticsCalculatorCallbacks(TBootstrap* bootstrap)
+    TChunkStatisticsCalculatorCallbacks(
+        TBootstrap* bootstrap,
+        TChunkPlacementPtr chunkPlacement)
         : Bootstrap_(bootstrap)
+        , ChunkPlacement_(std::move(chunkPlacement))
     { }
 
     TMedium* FindMediumByIndex(int mediumIndex) const override
@@ -347,8 +350,29 @@ public:
         return ::NYT::NChunkServer::GetChunkLogLevel(chunk, Bootstrap_->GetChunkManager());
     }
 
+    int GetMaxReplicasPerRack(int mediumIndex, const TChunk* chunk) const override
+    {
+        return ChunkPlacement_->GetMaxReplicasPerRack(mediumIndex, chunk);
+    }
+
+    int GetMaxReplicasPerDataCenter(
+        int mediumIndex,
+        const TChunk* chunk,
+        const TDataCenter* dataCenter) const override
+    {
+        return ChunkPlacement_->GetMaxReplicasPerDataCenter(mediumIndex, chunk, dataCenter);
+    }
+
+    TNodeList GetConsistentPlacementWriteTargets(
+        const TChunk* chunk,
+        int mediumIndex) const override
+    {
+        return ChunkPlacement_->GetConsistentPlacementWriteTargets(chunk, mediumIndex);
+    }
+
 private:
     TBootstrap* const Bootstrap_;
+    const TChunkPlacementPtr ChunkPlacement_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -367,8 +391,7 @@ TChunkReplicator::TChunkReplicator(
     , JobRegistry_(std::move(jobRegistry))
     , ChunkStatisticsCalculator_(std::make_unique<TChunkStatisticsCalculator>(
         Config_,
-        ChunkPlacement_,
-        New<TChunkStatisticsCalculatorCallbacks>(bootstrap)))
+        New<TChunkStatisticsCalculatorCallbacks>(Bootstrap_, ChunkPlacement_)))
     , BlobRefreshScanner_(std::make_unique<TChunkRefreshScanner>(
         Bootstrap_,
         EChunkScanKind::Refresh,
@@ -1882,13 +1905,13 @@ void TChunkReplicator::RefreshChunk(
                 "Chunk is lost (ChunkId: %v, WasLostVital: %v, ChunkReplicas: %v)",
                 chunk->GetId(),
                 wasLostVital,
-                chunkReplicas);
+                MakeFormattableView(chunkReplicas, TDefaultFormatter{}));
         }
     } else if (wasLostVital) {
         YT_LOG_DEBUG_IF(std::ssize(LostVitalChunks_) < maxLostVitalChunksToLog,
             "Chunk is no longer lost (ChunkId: %v, ChunkReplicas: %v)",
             chunk->GetId(),
-            chunkReplicas);
+            MakeFormattableView(chunkReplicas, TDefaultFormatter{}));
     }
 
     if (Any(allMediaStatistics.Status & ECrossMediumChunkStatus::DataMissing)) {
@@ -2058,7 +2081,7 @@ void TChunkReplicator::ScheduleNodeRefresh(TNode* node)
 
 void TChunkReplicator::ScheduleLocationRefreshSequoia(const TChunkLocation* location)
 {
-    const auto node = location->GetNode();
+    const auto* node = location->GetNode().Get();
     if (!IsObjectAlive(node)) {
         return;
     }

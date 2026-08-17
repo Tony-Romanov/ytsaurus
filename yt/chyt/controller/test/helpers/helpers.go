@@ -267,7 +267,7 @@ func PrepareMonitoring(t *testing.T) (*Env, *agent.Agent, *RequestClient) {
 	return env, agent, PrepareClient(t, env, proxy, server)
 }
 
-func PrepareSolomonMonitoring(t *testing.T) (*Env, *agent.Agent, *RequestClient) {
+func PrepareMetricsMonitoring(t *testing.T) (*Env, *agent.Agent, *RequestClient) {
 	env := PrepareEnv(t, "sleep")
 	proxy := os.Getenv("YT_PROXY")
 
@@ -277,9 +277,9 @@ func PrepareSolomonMonitoring(t *testing.T) (*Env, *agent.Agent, *RequestClient)
 		"stage":   "default",
 		"cluster": proxy,
 	})
-	agent := CreateAgentWithMetrics(env, "default", agent.NewAgentMetrics(subRegistry))
+	agent := CreateAgentWithMetrics(env, "default", agent.NewAgentMetrics(subRegistry, &agent.MetricsConfig{}))
 
-	server := monitoring.NewSolomonServer(":0", registry)
+	server := monitoring.NewMetricsServer(":0", registry)
 	return env, agent, PrepareClient(t, env, proxy, server)
 }
 

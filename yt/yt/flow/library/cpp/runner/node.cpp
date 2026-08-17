@@ -5,9 +5,12 @@
 #include "config.h"
 #include "debug_build_warning.h"
 #include "endpoint_provider.h"
+#include "network_bandwidth.h"
 #include "node_info.h"
+#include "porto_tracker.h"
 #include "private.h"
 #include "queue_log_writer.h"
+#include "root_clients_cache.h"
 
 #include <yt/yt/flow/library/cpp/companion/companion_proxy.h>
 #include <yt/yt/flow/library/cpp/companion/companion_singleton_state.h>
@@ -26,6 +29,7 @@
 #include <yt/yt/flow/library/cpp/worker/buffer_state_manager.h>
 #include <yt/yt/flow/library/cpp/worker/config.h>
 #include <yt/yt/flow/library/cpp/worker/controller_connector.h>
+#include <yt/yt/flow/library/cpp/worker/file_storage.h>
 #include <yt/yt/flow/library/cpp/worker/input_manager.h>
 #include <yt/yt/flow/library/cpp/worker/job.h>
 #include <yt/yt/flow/library/cpp/worker/job_tracker.h>
@@ -52,7 +56,6 @@
 #include <yt/yt/client/api/client.h>
 #include <yt/yt/client/api/options.h>
 #include <yt/yt/client/api/rpc_proxy/config.h>
-#include <yt/yt/client/cache/cache.h>
 
 #include <yt/yt/library/monitoring/http_integration.h>
 #include <yt/yt/library/monitoring/monitoring_manager.h>
@@ -80,6 +83,7 @@
 
 #include <yt/yt/core/https/client.h>
 
+#include <yt/yt/core/concurrency/action_queue.h>
 #include <yt/yt/core/concurrency/fair_share_action_queue.h>
 #include <yt/yt/core/concurrency/fair_share_thread_pool.h>
 #include <yt/yt/core/concurrency/thread_pool.h>
@@ -156,7 +160,7 @@ protected:
             auto error = TError(ex);
             YT_TLOG_ERROR("Flow node failed")
                 .With(error);
-            THROW_ERROR_EXCEPTION("Flow node failed") << error;
+            THROW_ERROR_EXCEPTION("Flow node failed").With(error);
         }
     }
 
@@ -199,6 +203,8 @@ private:
     NWorker::IInputManagerPtr InputManager_;
     NConcurrency::IThreadPoolPtr MessageServiceThreadPool_;
     NWorker::IMessageDistributorPtr MessageDistributor_;
+    NConcurrency::TActionQueuePtr FileStorageActionQueue_;
+    NFileStorage::IFileStoragePtr FileStorage_;
     NWorker::IJobTrackerPtr JobTracker_;
     NWorker::IControllerConnectorPtr ControllerConnector_;
 
@@ -232,7 +238,8 @@ private:
         // Ports come from the config by default. When the operation requests YT-allocated
         // ports (port_count > 0, e.g. on a shared-network host), YT exposes them via
         // YT_PORT_<i> — honor those over the config: YT_PORT_0 → rpc_port (and bus_server.port),
-        // YT_PORT_1 → monitoring_port, YT_PORT_2 → companion.port (python/java workers only).
+        // YT_PORT_1 → monitoring_port, YT_PORT_2 → companion.port (any worker running an
+        // out-of-process companion).
         if (const char* port0Env = std::getenv("YT_PORT_0")) {
             int rpcPort = FromString<int>(port0Env);
             Config_->RpcPort = rpcPort;
@@ -277,6 +284,12 @@ private:
         if (NodeInfo_->VcpuFactor.has_value()) {
             NProfiling::TResourceTracker::SetCpuToVCpuFactor(*NodeInfo_->VcpuFactor);
         }
+
+        if (Config_->EnablePortoResourceTracker) {
+            TryEnablePortoResourceTracker(NodeInfo_->VcpuFactor, Logger());
+        }
+
+        TryExportNetworkBandwidthGuarantee();
 
         ControlQueue_ = NConcurrency::CreateEnumIndexedFairShareActionQueue<NController::EControlQueue>("Control");
 
@@ -426,7 +439,13 @@ private:
             ControlQueue_->GetInvoker(NController::EControlQueue::Default),
             PipelineAuthenticator_->CreateSelfRpcAuthenticator()));
 
-        auto clientsCache = NClient::NCache::CreateClientsCache(clientsCacheConfig, PipelineAuthenticator_->GetClientOptions());
+        auto clientsCache = CreateRootClientsCache({
+            .PipelinePath = PipelinePath_,
+            .ClientsCacheConfig = clientsCacheConfig,
+            .ProxyRole = Config_->ProxyRole,
+            .ClientOptions = PipelineAuthenticator_->GetClientOptions(),
+            .Parameters = Config_->ClientsCacheFactory,
+        });
         CommonYTConnector_ = CreateCommonYTConnector(clientsCache, PipelinePath_);
         SetQueueLogWriterClient(CommonYTConnector_->GetClient());
 
@@ -469,6 +488,27 @@ private:
             {},
             NWorker::WorkerProfiler());
 
+        FileStorageActionQueue_ = New<TActionQueue>("FileStorage");
+        if (Config_->Worker->FileStorage) {
+            FileStorage_ = WaitFor(BIND([
+                config = Config_->Worker->FileStorage,
+                invoker = FileStorageActionQueue_->GetInvoker(),
+                statusProfiler = WorkerStatusProfiler_
+            ] {
+                return NWorker::CreateWorkerFileStorage(
+                    config,
+                    invoker,
+                    NWorker::WorkerLogger().WithTag("Component", "FileStorage"),
+                    NWorker::WorkerProfiler().WithPrefix("/file_storage"),
+                    statusProfiler->WithPrefix("/file_storage"));
+            })
+                    .AsyncVia(FileStorageActionQueue_->GetInvoker())
+                    .Run())
+                .ValueOrThrow();
+        } else {
+            FileStorage_ = NWorker::CreateThrowingFileStorage();
+        }
+
         const auto converterCache = CreatePayloadConverterCache(CreateFastColumnEvaluatorCache());
 
         const auto streamSpecStorage = New<TStreamSpecStorage>(converterCache);
@@ -506,6 +546,7 @@ private:
         for (const auto& group : workerGroups) {
             jobTrackerContext->WorkerGroups.push_back(TWorkerGroupId(group));
         }
+        jobTrackerContext->FileStorage = FileStorage_;
         // ControllerConnector_ is created just below; at call time it is always
         // initialized (jobs start running only after worker setup is complete).
         jobTrackerContext->DistributedThrottlerChannel = [this] () -> NRpc::IChannelPtr {
@@ -632,8 +673,8 @@ private:
             return ParseEnum<EFlowRunMode>(modeStr);
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error parsing %Qv variable",
-                    FlowModeEnvVarName)
-                << ex;
+                FlowModeEnvVarName)
+                .With(ex);
         }
     }
 

@@ -101,12 +101,17 @@ TKeyVisitor::TKeyVisitor(
     , PersistedCounter_(Context_->Profiler.Counter("/persisted_count"))
 {
     YT_VERIFY(Context_->Spec);
+    EmittedRate_.Update(0);
+    ProcessedRate_.Update(0);
 }
 
-TFuture<void> TKeyVisitor::Init()
+TFuture<void> TKeyVisitor::Init(bool upstreamCompleted)
 {
-    return BIND([this, strongThis = MakeStrong(this)] {
+    return BIND([this, strongThis = MakeStrong(this), upstreamCompleted] {
         WaitFor(Store_->Init()).ThrowOnError();
+        if (upstreamCompleted) {
+            SetUpstreamCompleted();
+        }
         BackgroundFillExecutor_ = New<TPeriodicExecutor>(
             Context_->SerializedInvoker,
             BIND(&TKeyVisitor::RunBackgroundFillIteration, MakeWeak(this)),
@@ -139,7 +144,25 @@ void TKeyVisitor::Reconfigure(TDynamicKeyVisitorContextPtr dynamicContext)
 void TKeyVisitor::SetUpstreamCompleted()
 {
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(Context_->SerializedInvoker);
+    if (!DynamicContext_->DynamicSpec->Finite) {
+        // Dropped, not just ignored: a rotation must not inherit a signal taken back.
+        UpstreamCompleted_ = false;
+        return;
+    }
+    if (UpstreamCompleted_) {
+        return;
+    }
     UpstreamCompleted_ = true;
+    // A pass that has swept nothing yet began at or after the completion moment, so it can
+    // be the final one; a pass already in flight is left to finish and the rotation marks
+    // the next one instead. A scan that is still awaiting its snapshot also counts as
+    // already in flight: it may have started before the last upstream write became visible.
+    const bool canFinalizeCurrentPass =
+        Store_->HasCurrentPassSweptNothing() &&
+        !BackgroundFillInProgress_;
+    if (canFinalizeCurrentPass || !DynamicContext_->DynamicSpec->FullFinalPass) {
+        Store_->MarkCurrentPassFinal();
+    }
     if (BackgroundFillExecutor_) {
         BackgroundFillExecutor_->ScheduleOutOfBand();
     }
@@ -181,9 +204,7 @@ std::vector<TVisit> TKeyVisitor::GetNextBatch(i64 batchSize)
         }
     }
     if (!result.empty()) {
-        const auto consumed = static_cast<double>(std::ssize(result));
-        ConsumedRate_.Inc(consumed);
-        PersistedCounter_.Increment(static_cast<i64>(consumed));
+        PendingProcessedCount_ += std::ssize(result);
     }
     return result;
 }
@@ -196,8 +217,10 @@ THashMap<TStreamId, TInflightStreamTraverseDataPtr> TKeyVisitor::BuildInflight()
     inflight->Empty =
         Store_->IsCurrentPassFinal() && Store_->IsAllCommitted() && Buffer_.empty();
     inflight->InflightMetrics->Count = inflight->Empty ? 0 : BufferRowCount_;
-    inflight->InflightMetrics->NewCountPerSec = EmittedRate_.GetRate().value_or(0);
-    inflight->InflightMetrics->ProcessedCountPerSec = ConsumedRate_.GetRate().value_or(0);
+    inflight->InflightMetrics->ReadyCount = BufferRowCount_;
+    inflight->InflightMetrics->NewCountPerSec = EmittedRate_.GetRate();
+    inflight->InflightMetrics->OfferedCountPerSec = inflight->InflightMetrics->NewCountPerSec;
+    inflight->InflightMetrics->ProcessedCountPerSec = ProcessedRate_.GetRate();
     if (!inflight->Empty && !Buffer_.empty() && !Buffer_.front().Visits.empty()) {
         const auto& head = Buffer_.front().Visits.front();
         inflight->MinSystemTimestamp = head.SystemTimestamp;
@@ -212,6 +235,17 @@ void TKeyVisitor::Sync(NApi::IDynamicTableTransactionPtr transaction)
 {
     YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(Context_->SerializedInvoker);
     Store_->Sync(std::move(transaction));
+}
+
+void TKeyVisitor::Commit()
+{
+    YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(Context_->SerializedInvoker);
+    if (PendingProcessedCount_ == 0) {
+        return;
+    }
+    ProcessedRate_.Inc(PendingProcessedCount_);
+    PersistedCounter_.Increment(PendingProcessedCount_);
+    PendingProcessedCount_ = 0;
 }
 
 NConcurrency::TThroughputThrottlerConfigPtr TKeyVisitor::BuildThrottlerConfig() const
@@ -263,8 +297,8 @@ TKeyVisitor::EIterationOutcome TKeyVisitor::DoRunBackgroundFillIteration()
         // Retry next tick: a transient backend error clears, a stable one stays
         // visible in the status profiler.
         BackgroundFillError_->SetError(TError(ex)
-            << TErrorAttribute("computation_id", Context_->ComputationId.Underlying())
-            << TErrorAttribute("stream_id", Context_->StreamId.Underlying()));
+                .With("computation_id", Context_->ComputationId.Underlying())
+                .With("stream_id", Context_->StreamId.Underlying()));
         return EIterationOutcome::Idle;
     }
 }
@@ -307,6 +341,12 @@ TKeyVisitor::EIterationOutcome TKeyVisitor::DoRunBackgroundFillIterationGuarded(
     const bool scanAll = !names && !externalNames;
     const bool scanInternal = scanAll || (names && !names->empty());
     const bool scanExternal = scanAll || (externalNames && !externalNames->empty());
+
+    YT_VERIFY(!BackgroundFillInProgress_);
+    BackgroundFillInProgress_ = true;
+    auto fillGuard = Finally([this] {
+        BackgroundFillInProgress_ = false;
+    });
 
     const i64 maxRows = DynamicContext_->DynamicSpec->MaxScanRowsPerIteration;
     YT_VERIFY(maxRows > 0);
@@ -360,7 +400,7 @@ TKeyVisitor::EIterationOutcome TKeyVisitor::DoRunBackgroundFillIterationGuarded(
                     YT_TLOG_WARNING(
                         "Joiner referenced by key_visitor_stream external_names is "
                         "not visitor-driven and will not be swept")
-                        .With("Joiner", name, "%Qv");
+                        .With("Joiner", name);
                 }
                 continue;
             }

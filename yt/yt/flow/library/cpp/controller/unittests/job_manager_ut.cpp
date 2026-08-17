@@ -1,4 +1,5 @@
 #include <yt/yt/core/test_framework/framework.h>
+#include <yt/yt/flow/library/cpp/common/unittests/mock/time_provider.h>
 
 #include <yt/yt/flow/library/cpp/common/flow_view.h>
 #include <yt/yt/flow/library/cpp/common/registry.h>
@@ -183,21 +184,23 @@ public:
     TPersistedStateControlPtr<std::string> PersistedControl;
     TFlowViewPtr FlowView;
     IJobManagerPtr JobManager;
+    IStatusProfilerPtr StatusProfiler;
     NConcurrency::IFairShareThreadPoolPtr ThreadPool;
 
     void Prepare(const TPipelineSpecPtr& spec, const TDynamicPipelineSpecPtr& dynamicSpec)
     {
-        FlowView->CurrentSpec->SetValue(spec);
-        FlowView->CurrentDynamicSpec->SetValue(dynamicSpec);
-        FlowView->State->ExecutionSpec->PipelineSpec->SetValue(spec);
-        FlowView->State->ExecutionSpec->DynamicPipelineSpec->SetValue(dynamicSpec);
-        FlowView->State->ExecutionSpec->ExtendedPipelineSpec->SetValue(BuildExtendedPipelineSpec(spec));
+        FlowView->CurrentSpec->TrySetValue(spec, TestVersionProvider());
+        FlowView->CurrentDynamicSpec->TrySetValue(dynamicSpec, TestVersionProvider());
+        FlowView->State->ExecutionSpec->PipelineSpec->TrySetValue(spec, TestVersionProvider());
+        FlowView->State->ExecutionSpec->DynamicPipelineSpec->TrySetValue(dynamicSpec, TestVersionProvider());
+        FlowView->State->ExecutionSpec->ExtendedPipelineSpec->TrySetValue(BuildExtendedPipelineSpec(spec), TestVersionProvider());
         auto context = New<TJobManagerContext>();
         ThreadPool = NConcurrency::CreateFairShareThreadPool(MaxThreads, "Balancer");
         context->Invoker = ThreadPool->GetInvoker("Balancer");
         context->MainCycleInvoker = GetCurrentInvoker();
         context->PipelinePath = NYPath::TRichYPath::Parse("<cluster=pipeline_cluster>//pipeline/path");
-        context->StatusProfiler = CreateSyncStatusProfiler();
+        StatusProfiler = CreateSyncStatusProfiler();
+        context->StatusProfiler = StatusProfiler;
         JobManager = CreateJobManager(context, spec, dynamicSpec, FlowView->State->JobManagerState, /*authenticator*/ nullptr);
     }
 
@@ -228,6 +231,80 @@ std::vector<typename TMap::mapped_type> MapValues(const TMap& map)
     }
     return values;
 }
+
+TEST_F(TJobManagerTest, ReportsAndClearsInsufficientWorkers)
+{
+    auto spec = New<TPipelineSpec>();
+    spec->Computations["computation"] = CreateGenericComputationSpec<TSimpleComputation>();
+    auto dynamicSpec = New<TDynamicPipelineSpec>();
+    dynamicSpec->JobManager->MinimumWorkerCount = 2;
+    Prepare(spec, dynamicSpec);
+
+    auto addWorker = [&] (const std::string& address) {
+        auto worker = New<NFlow::TWorker>();
+        worker->RpcAddress = address;
+        FlowView->State->Workers[address] = std::move(worker);
+    };
+    auto distributeJobs = [&] {
+        FlowView->State->StartMutation();
+        JobManager->DistributeJobs(FlowView);
+        FlowView->State->CommitMutation();
+    };
+
+    addWorker("worker-0");
+    distributeJobs();
+
+    auto errors = StatusProfiler->GetStatus().Errors;
+    ASSERT_EQ(errors.size(), 1u);
+    ASSERT_TRUE(errors.contains("/insufficient_workers/default"));
+    EXPECT_EQ(errors.at("/insufficient_workers/default").GetMessage(), "Too few workers (Count: 1, Required: 2)");
+
+    addWorker("worker-1");
+    distributeJobs();
+
+    EXPECT_TRUE(StatusProfiler->GetStatus().Errors.empty());
+}
+
+TEST_F(TJobManagerTest, ReportsEachWorkerGroupMinimum)
+{
+    const TWorkerGroupId workerGroup("gpu");
+    auto spec = New<TPipelineSpec>();
+    spec->Computations["default-computation"] = CreateGenericComputationSpec<TSimpleComputation>();
+    spec->Computations["gpu-computation"] = CreateGenericComputationSpec<TSimpleComputation>(workerGroup);
+    auto dynamicSpec = New<TDynamicPipelineSpec>();
+    dynamicSpec->JobManager->MinimumWorkerCount = 2;
+    auto groupOverride = New<TDynamicJobManagerSpec>();
+    groupOverride->MinimumWorkerCount = 3;
+    dynamicSpec->JobManager->WorkerGroupOverride[workerGroup] = groupOverride;
+    Prepare(spec, dynamicSpec);
+
+    auto defaultWorker = New<NFlow::TWorker>();
+    defaultWorker->RpcAddress = "default-worker";
+    FlowView->State->Workers[defaultWorker->RpcAddress] = std::move(defaultWorker);
+    for (int index = 0; index < 2; ++index) {
+        auto worker = New<NFlow::TWorker>();
+        worker->RpcAddress = Format("gpu-worker-%v", index);
+        worker->Groups.push_back(workerGroup);
+        FlowView->State->Workers[worker->RpcAddress] = std::move(worker);
+    }
+
+    FlowView->State->StartMutation();
+    JobManager->DistributeJobs(FlowView);
+    FlowView->State->CommitMutation();
+
+    const auto errors = StatusProfiler->GetStatus().Errors;
+    ASSERT_EQ(errors.size(), 2u);
+    ASSERT_TRUE(errors.contains("/insufficient_workers/default"));
+    EXPECT_EQ(
+        errors.at("/insufficient_workers/default").GetMessage(),
+        "Too few workers (Count: 1, Required: 2)");
+    ASSERT_TRUE(errors.contains("/insufficient_workers/groups/gpu"));
+    EXPECT_EQ(
+        errors.at("/insufficient_workers/groups/gpu").GetMessage(),
+        "Too few workers in worker group \"gpu\" (Count: 2, Required: 3)");
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 class TJobBalancerTest
     : public TJobManagerTest
@@ -640,6 +717,10 @@ public:
         auto spec = New<TPipelineSpec>();
         spec->Computations["healthy"] = CreateGenericComputationSpec<TSimpleComputation>();
         spec->Computations["broken"] = CreateGenericComputationSpec<TBrokenTraverseComputation>();
+        for (const auto& computationSpec : GetValues(spec->Computations)) {
+            computationSpec->InputStreamIds.clear();
+            computationSpec->KeyVisitorStreams["input"] = New<TKeyVisitorStreamSpec>();
+        }
 
         auto dynamicSpec = New<TDynamicPipelineSpec>();
         dynamicSpec->JobManager->AsyncBalancing = false;
@@ -700,6 +781,21 @@ TEST_F(TTraverseIsolationTest, FailingComputationWithoutPreviousDataAborts)
     PrepareTwoComputations();
 
     EXPECT_THROW(JobManager->AggregateTraverseData(FlowView), std::exception);
+}
+
+TEST_F(TTraverseIsolationTest, UnknownExecutionSpecComputationIsIgnored)
+{
+    PrepareTwoComputations();
+    FlowView->State->TraverseData->Computations[TComputationId("broken")] =
+        MakeInputNode(/*epoch*/ 0, TSystemTimestamp(50));
+    FlowView->State->ExecutionSpec->PipelineSpec->GetValue()->Computations["unknown"] =
+        CreateGenericComputationSpec<TSimpleComputation>();
+
+    JobManager->AggregateTraverseData(FlowView);
+
+    EXPECT_EQ(GetInputWatermark(FlowView, TComputationId("healthy")), TSystemTimestamp(100));
+    EXPECT_EQ(GetInputWatermark(FlowView, TComputationId("broken")), TSystemTimestamp(50));
+    EXPECT_FALSE(FlowView->State->TraverseData->Computations.contains(TComputationId("unknown")));
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1464,6 +1560,114 @@ TEST_F(TJobBalancerTest, GracefulShutdownErrorTargetWorkerGone)
             << "Partition must stay Executing when graceful target worker is gone (YTFLOW-538 regression)";
         EXPECT_FALSE(partition->CurrentJobId.has_value())
             << "Old job must be dropped (RemoveFailedJobs handles it) when graceful target worker is gone";
+    }
+
+    // The next scheduling iteration drops the now-invalid intent before it places the next
+    // job, so the rescheduled job does not inherit the graceful shutdown signal.
+    {
+        FlowView->State->StartMutation();
+        JobManager->CancelInvalidGracefulRebalances(FlowView);
+        JobManager->DistributeJobs(FlowView);
+        FlowView->State->CommitMutation();
+    }
+
+    for (const auto& partitionId : pendingPartitions) {
+        ASSERT_TRUE(layout->Partitions.at(partitionId)->CurrentJobId.has_value())
+            << "Partition must be rescheduled after the graceful rebalance is cancelled";
+
+        auto* ephemeralStatePtr = FlowView->EphemeralState->Partitions.FindPtr(partitionId);
+        ASSERT_TRUE(ephemeralStatePtr && *ephemeralStatePtr);
+        EXPECT_FALSE((*ephemeralStatePtr)->PendingGracefulRebalanceWorkerAddress.has_value())
+            << "Pending graceful rebalance must be cancelled when the target worker is gone";
+        EXPECT_FALSE((*ephemeralStatePtr)->DynamicPartitionSpec->FinishAfterCurrentEpoch)
+            << "Rescheduled job must not inherit the cancelled graceful shutdown signal";
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(TJobBalancerTest, InvalidGracefulRebalanceIsCancelledBeforeJobFinishes)
+{
+    // A pending move whose target worker has gone must be dropped as soon as the balancer
+    // notices, without waiting for the current job to finish. The worker re-reads
+    // FinishAfterCurrentEpoch from the spec delivered with every heartbeat, so cancelling
+    // early leaves the running job in place instead of costing a shutdown and a reschedule.
+
+    Reset();
+    constexpr int kWorkerCount = 2;
+    constexpr int kPartitionCount = 4;
+
+    std::vector<TComputationDescription> computationDescriptions;
+    computationDescriptions.push_back(TComputationDescription{kPartitionCount, {}});
+    PrepareBalancerTest(kWorkerCount, computationDescriptions, /*exceedCountAllowed*/ 1, TDuration::MilliSeconds(50));
+
+    {
+        auto dynamicSpec = FlowView->CurrentDynamicSpec->GetValue();
+        dynamicSpec->JobManager->GracefulMove = true;
+        JobManager->Reconfigure(dynamicSpec);
+    }
+
+    {
+        FlowView->State->StartMutation();
+        const auto& layout = FlowView->State->ExecutionSpec->Layout;
+        for (const auto& [partitionId, partition] : layout->Partitions) {
+            auto job = New<TJob>();
+            job->JobId = TJobId(TGuid::Create());
+            job->WorkerAddress = GetWorkerAddress(0);
+            job->WorkerIncarnationId = FlowView->State->Workers.at(GetWorkerAddress(0))->IncarnationId;
+            job->PartitionId = partitionId;
+            layout->CreateJob(job);
+        }
+        FlowView->State->CommitMutation();
+    }
+
+    SetCpuLoadUniform();
+
+    {
+        FlowView->State->StartMutation();
+        JobManager->DistributeJobs(FlowView);
+        FlowView->State->CommitMutation();
+    }
+
+    std::vector<TPartitionId> pendingPartitions;
+    for (const auto& [partitionId, ephemeralState] : FlowView->EphemeralState->Partitions) {
+        if (ephemeralState && ephemeralState->PendingGracefulRebalanceWorkerAddress.has_value()) {
+            pendingPartitions.push_back(partitionId);
+        }
+    }
+    ASSERT_GT(std::ssize(pendingPartitions), 0);
+
+    const auto& layout = FlowView->State->ExecutionSpec->Layout;
+    THashMap<TPartitionId, TJobId> jobsBeforeCancel;
+    for (const auto& partitionId : pendingPartitions) {
+        const auto& partition = layout->Partitions.at(partitionId);
+        ASSERT_TRUE(partition->CurrentJobId.has_value())
+            << "A gracefully stopped partition keeps its job until the job actually finishes";
+        jobsBeforeCancel[partitionId] = *partition->CurrentJobId;
+    }
+
+    // The move target goes away while the jobs are still running.
+    FlowView->State->Workers.erase(GetWorkerAddress(1));
+
+    {
+        FlowView->State->StartMutation();
+        JobManager->CancelInvalidGracefulRebalances(FlowView);
+        FlowView->State->CommitMutation();
+    }
+
+    for (const auto& partitionId : pendingPartitions) {
+        auto* ephemeralStatePtr = FlowView->EphemeralState->Partitions.FindPtr(partitionId);
+        ASSERT_TRUE(ephemeralStatePtr && *ephemeralStatePtr);
+        EXPECT_FALSE((*ephemeralStatePtr)->PendingGracefulRebalanceWorkerAddress.has_value())
+            << "A move to a worker that no longer exists must be dropped";
+        EXPECT_FALSE((*ephemeralStatePtr)->DynamicPartitionSpec->FinishAfterCurrentEpoch)
+            << "Cancelling the move must also withdraw the graceful shutdown signal";
+
+        const auto& partition = layout->Partitions.at(partitionId);
+        ASSERT_TRUE(partition->CurrentJobId.has_value())
+            << "The running job must survive the cancellation";
+        EXPECT_EQ(*partition->CurrentJobId, jobsBeforeCancel[partitionId])
+            << "Cancelling early must not restart the job";
     }
 }
 

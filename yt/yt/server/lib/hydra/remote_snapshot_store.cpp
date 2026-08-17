@@ -64,7 +64,7 @@ public:
         , Path_(std::move(path))
         , Client_(client)
         , PrerequisiteTransactionId_(prerequisiteTransactionId)
-        , Logger(HydraLogger().WithTag("Path: %v", Path_))
+        , Logger(HydraLogger().WithTag("Path", Path_))
         , SnapshotOutThrottlerProvider_(std::move(snapshotOutThrottlerProvider))
     { }
 
@@ -106,7 +106,7 @@ private:
             : Store_(store)
             , SnapshotId_(snapshotId)
             , Path_(Store_->GetSnapshotPath(SnapshotId_))
-            , Logger(HydraLogger().WithTag("Path: %v", Path_))
+            , Logger(HydraLogger().WithTag("Path", Path_))
         { }
 
         TFuture<void> Open() override
@@ -202,17 +202,17 @@ private:
             } catch (const TErrorException& ex) {
                 if (ex.Error().FindMatching(NYTree::EErrorCode::ResolveError)) {
                     THROW_ERROR_EXCEPTION(NHydra::EErrorCode::NoSuchSnapshot, "Error opening remote snapshot for reading")
-                        << TErrorAttribute("snapshot_path", Path_)
-                        << ex;
+                        .With("snapshot_path", Path_)
+                        .With(ex);
                 } else {
                     THROW_ERROR_EXCEPTION("Error opening remote snapshot for reading")
-                        << TErrorAttribute("snapshot_path", Path_)
-                        << ex;
+                        .With("snapshot_path", Path_)
+                        .With(ex);
                 }
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Error opening remote snapshot for reading")
-                    << TErrorAttribute("snapshot_path", Path_)
-                    << ex;
+                    .With("snapshot_path", Path_)
+                    .With(ex);
             }
         }
 
@@ -223,8 +223,8 @@ private:
                     .ValueOrThrow();
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Error reading remote snapshot")
-                    << TErrorAttribute("snapshot_path", Path_)
-                    << ex;
+                    .With("snapshot_path", Path_)
+                    .With(ex);
             }
         }
     };
@@ -238,7 +238,7 @@ private:
             , SnapshotId_(snapshotId)
             , Meta_(meta)
             , Path_(Store_->GetSnapshotPath(SnapshotId_))
-            , Logger(HydraLogger().WithTag("Path: %v", Path_))
+            , Logger(HydraLogger().WithTag("Path", Path_))
         { }
 
         TFuture<void> Open() override
@@ -375,8 +375,8 @@ private:
                 IsOpened_ = true;
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Error opening remote snapshot for writing")
-                    << TErrorAttribute("snapshot_path", Path_)
-                    << ex;
+                    .With("snapshot_path", Path_)
+                    .With(ex);
             }
         }
 
@@ -402,8 +402,8 @@ private:
                 IsClosed_ = true;
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Error closing remote snapshot")
-                    << TErrorAttribute("snapshot_path", Path_)
-                    << ex;
+                    .With("snapshot_path", Path_)
+                    .With(ex);
             }
         }
     };
@@ -440,8 +440,8 @@ private:
             return latestSnapshotId;
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error computing the latest snapshot id in remote store")
-                << TErrorAttribute("snapshot_path", Path_)
-                << ex;
+                .With("snapshot_path", Path_)
+                .With(ex);
         }
     }
 

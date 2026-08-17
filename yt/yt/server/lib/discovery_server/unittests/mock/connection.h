@@ -263,6 +263,11 @@ public:
         YT_UNIMPLEMENTED();
     }
 
+    const NSecurityClient::TQueryPoolPermissionCachePtr& GetQueryPoolPermissionCache() override
+    {
+        YT_UNIMPLEMENTED();
+    }
+
     const NSecurityClient::TUserAttributeCachePtr& GetUserAttributeCache() override
     {
         YT_UNIMPLEMENTED();
@@ -315,7 +320,7 @@ public:
         YT_UNIMPLEMENTED();
     }
 
-    const std::string& GetLoggingTag() const override
+    const NLogging::TLoggingTagList& GetLoggingTags() const override
     {
         YT_UNIMPLEMENTED();
     }
@@ -419,7 +424,12 @@ public:
         YT_UNIMPLEMENTED();
     }
 
-    const NRpc::IChannelPtr& GetOffshoreDataGatewayChannel() override
+    NRpc::IChannelPtr GetStickyOffshoreDataGatewayChannel() override
+    {
+        YT_UNIMPLEMENTED();
+    }
+
+    const NRpc::IChannelPtr& GetNonStickyOffshoreDataGatewayChannel() override
     {
         YT_UNIMPLEMENTED();
     }

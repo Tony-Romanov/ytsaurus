@@ -86,8 +86,8 @@ using namespace NNet;
 using namespace NTableClient;
 
 using NNodeTrackerClient::TNodeId;
-using NYT::ToProto;
 using NYT::FromProto;
+using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -316,8 +316,7 @@ public:
         , RpsThrottler_(chunkReaderHost->RpsThrottler)
         , MediumThrottler_(chunkReaderHost->MediumThrottler)
         , Networks_(Client_->GetNativeConnection()->GetNetworks())
-        , Logger(ChunkClientLogger().WithTag("ChunkId: %v",
-            ChunkId_))
+        , Logger(ChunkClientLogger().WithTag("ChunkId", ChunkId_))
         , RequestBatcher_(CreateRequestBatcher(MakeWeak(this)))
         , InitialSeeds_(std::move(seedReplicas))
     {
@@ -330,15 +329,13 @@ public:
                 ChunkId_);
         }
 
-        YT_LOG_DEBUG("Replication reader initialized "
-            "(InitialSeedReplicas: %v, FetchPromPeers: %v, LocalDescriptor: %v, PopulateCache: %v, "
-            "AllowFetchingSeedsFromMaster: %v, Networks: %v)",
-            MakeFormattableView(InitialSeeds_, TChunkReplicaAddressFormatter(NodeDirectory_)),
-            Config_->FetchNodeDescriptors,
-            LocalDescriptor_,
-            Config_->PopulateCache,
-            Options_->AllowFetchingSeedsFromMaster,
-            Networks_);
+        YT_TLOG_DEBUG("Replication reader initialized")
+            .With("InitialSeedReplicas", MakeFormattableView(InitialSeeds_, TChunkReplicaAddressFormatter(NodeDirectory_)))
+            .With("FetchPromPeers", Config_->FetchNodeDescriptors)
+            .With("LocalDescriptor", LocalDescriptor_)
+            .With("PopulateCache", Config_->PopulateCache)
+            .With("AllowFetchingSeedsFromMaster", Options_->AllowFetchingSeedsFromMaster)
+            .With("Networks", Networks_);
     }
 
     TFuture<std::vector<TBlock>> ReadBlocks(
@@ -521,7 +518,8 @@ private:
                         "Replica has unresolved node id %v",
                         replica.GetNodeId());
                 }
-                YT_LOG_WARNING("Skipping replica with unresolved node id (NodeId: %v)", nodeId);
+                YT_TLOG_WARNING("Skipping replica with unresolved node id")
+                    .With("NodeId", nodeId);
                 continue;
             }
             if (auto address = nodeDescriptor->FindAddress(Networks_)) {
@@ -678,8 +676,8 @@ protected:
             }
 
             const auto& Logger = Session_->Logger;
-            YT_LOG_DEBUG("Hedging deadline reached (Delay: %v)",
-                TInstant::Now() - StartTime_);
+            YT_TLOG_DEBUG("Hedging deadline reached")
+                .With("Delay", TInstant::Now() - StartTime_);
 
             StartRequest(/*isPrimaryRequest*/ false);
         }
@@ -990,20 +988,20 @@ protected:
         , MediumThrottler_(std::move(mediumThrottler))
         , CombinedDataByteThrottler_(CreateCombinedDataByteThrottler())
         , RequestBatcher_(reader->RequestBatcher_)
-        , Logger(ChunkClientLogger().WithTag("SessionId: %v, ReadSessionId: %v, ChunkId: %v",
-            TGuid::Create(),
-            SessionOptions_.ReadSessionId,
-            ChunkId_))
+        , Logger(ChunkClientLogger()
+            .WithTag("SessionId", TGuid::Create())
+            .WithTag("ReadSessionId", SessionOptions_.ReadSessionId)
+            .WithTag("ChunkId", ChunkId_))
     {
         YT_VERIFY(SessionInvoker_);
         YT_VERIFY(SessionInvoker_ != GetSyncInvoker());
 
         if (WorkloadDescriptor_.CompressionFairShareTag) {
-            Logger.AddTag("CompressionFairShareTag: %v", WorkloadDescriptor_.CompressionFairShareTag);
+            Logger.AddTag("CompressionFairShareTag", WorkloadDescriptor_.CompressionFairShareTag);
         }
 
         if (SessionOptions_.Cookie) {
-            Logger.AddTag("Cookie: %x", *SessionOptions_.Cookie);
+            Logger.AddTagFormat("Cookie", "%x", *SessionOptions_.Cookie);
         }
 
         SessionOptions_.ChunkReaderStatistics->RecordSession();
@@ -1030,7 +1028,7 @@ protected:
         YT_VERIFY(!throttlingError.IsOK());
         auto error = TError(NChunkClient::EErrorCode::ReaderThrottlingFailed,
             "Failed to apply throttling in reader")
-            << throttlingError;
+            .With(throttlingError);
         OnSessionFailed(true, error);
         return error;
     }
@@ -1068,9 +1066,9 @@ protected:
         }
 
         if (throttledBytes > DataBytesReceived_) {
-            YT_LOG_DEBUG("Releasing excess throttled bytes (ThrottledBytes: %v, ReceivedBytes: %v)",
-                throttledBytes,
-                DataBytesReceived_);
+            YT_TLOG_DEBUG("Releasing excess throttled bytes")
+                .With("ThrottledBytes", throttledBytes)
+                .With("ReceivedBytes", DataBytesReceived_);
 
             throttler->Release(throttledBytes - DataBytesReceived_);
         }
@@ -1100,9 +1098,9 @@ protected:
             return;
         }
 
-        YT_LOG_DEBUG("Accounting for extra medium bandwidth (TotalBytesReadFromDisk: %v, ThrottledBytes: %v)",
-            TotalBytesReadFromDisk_,
-            throttledBytes);
+        YT_TLOG_DEBUG("Accounting for extra medium bandwidth")
+            .With("TotalBytesReadFromDisk", TotalBytesReadFromDisk_)
+            .With("ThrottledBytes", throttledBytes);
 
         MediumThrottler_->Acquire(extraBytesToThrottle);
     }
@@ -1115,15 +1113,16 @@ protected:
         }
 
         if (forever && !reader->IsPeerBannedForever(peerId)) {
-            YT_LOG_DEBUG("Node is banned until seeds are re-fetched from master (PeerId: %v)", peerId);
+            YT_TLOG_DEBUG("Node is banned until seeds are re-fetched from master")
+                .With("PeerId", peerId);
             reader->BanPeerForever(peerId);
         }
 
         if (BannedPeers_.insert(peerId).second) {
             reader->OnPeerBanned(peerId);
-            YT_LOG_DEBUG("Node is banned for the current retry (PeerId: %v, BanCount: %v)",
-                peerId,
-                reader->GetBanCount(peerId));
+            YT_TLOG_DEBUG("Node is banned for the current retry")
+                .With("PeerId", peerId)
+                .With("BanCount", reader->GetBanCount(peerId));
         }
     }
 
@@ -1184,7 +1183,8 @@ protected:
             return;
         }
 
-        YT_LOG_DEBUG("Reinstall peer into peer queue (PeerId: %v)", peerId);
+        YT_TLOG_DEBUG("Reinstall peer into peer queue")
+            .With("PeerId", peerId);
 
         const auto& peer = GetOrCrash(Peers_, peerId);
         PeerQueue_.push(TPeerQueueEntry{
@@ -1216,7 +1216,7 @@ protected:
         }
 
         if (peerId.IsOffshore) {
-            return reader->Client_->GetNativeConnection()->GetOffshoreDataGatewayChannel();
+            return reader->Client_->GetNativeConnection()->GetNonStickyOffshoreDataGatewayChannel();
         }
 
         try {
@@ -1252,10 +1252,10 @@ protected:
             !peer.NodeSuspicionMarkTime &&
             NodeStatusDirectory_->ShouldMarkNodeSuspicious(rspOrError))
         {
-            YT_LOG_WARNING("Node is marked as suspicious (Replica: %v, PeerId: %v, Error: %v)",
-                peer.Replica,
-                peer.Id,
-                rspOrError);
+            YT_TLOG_WARNING("Node is marked as suspicious")
+                .With("Replica", peer.Replica)
+                .With("PeerId", peer.Id)
+                .With(rspOrError);
             NodeStatusDirectory_->UpdateSuspicionMarkTime(
                 peer.Replica.GetNodeId(),
                 *peer.Id.Address,
@@ -1263,12 +1263,13 @@ protected:
                 std::nullopt);
         }
 
-        auto error = wrappingError << rspOrError;
+        auto error = wrappingError.With(rspOrError);
         if (code == NRpc::EErrorCode::Unavailable ||
             code == NRpc::EErrorCode::RequestQueueSizeLimitExceeded ||
             code == NHydra::EErrorCode::InvalidChangelogState)
         {
-            YT_LOG_DEBUG(error);
+            YT_TLOG_DEBUG("Request to peer failed")
+                .With(error);
             return;
         }
 
@@ -1361,9 +1362,8 @@ protected:
 
         YT_VERIFY(!SeedsFuture_);
 
-        YT_LOG_DEBUG("Retry started (RetryIndex: %v/%v)",
-            RetryIndex_ + 1,
-            ReaderConfig_->RetryCount);
+        YT_TLOG_DEBUG("Retry started")
+            .WithFormat("RetryIndex", "%v/%v", RetryIndex_ + 1, ReaderConfig_->RetryCount);
 
         SessionOptions_.ChunkReaderStatistics->RecordRetry();
 
@@ -1382,9 +1382,8 @@ protected:
         DiscardSeeds();
 
         int retryCount = ReaderConfig_->RetryCount;
-        YT_LOG_DEBUG("Retry failed (RetryIndex: %v/%v)",
-            RetryIndex_ + 1,
-            retryCount);
+        YT_TLOG_DEBUG("Retry failed")
+            .WithFormat("RetryIndex", "%v/%v", RetryIndex_ + 1, retryCount);
 
         ++RetryIndex_;
         if (RetryIndex_ >= retryCount) {
@@ -1444,9 +1443,8 @@ protected:
             return false;
         }
 
-        YT_LOG_DEBUG("Pass started (PassIndex: %v/%v)",
-            PassIndex_ + 1,
-            ReaderConfig_->PassCount);
+        YT_TLOG_DEBUG("Pass started")
+            .WithFormat("PassIndex", "%v/%v", PassIndex_ + 1, ReaderConfig_->PassCount);
 
         SessionOptions_.ChunkReaderStatistics->RecordPass();
 
@@ -1544,9 +1542,8 @@ protected:
         }
 
         int passCount = ReaderConfig_->PassCount;
-        YT_LOG_DEBUG("Pass completed (PassIndex: %v/%v)",
-            PassIndex_ + 1,
-            passCount);
+        YT_TLOG_DEBUG("Pass completed")
+            .WithFormat("PassIndex", "%v/%v", PassIndex_ + 1, passCount);
 
         ++PassIndex_;
         if (PassIndex_ >= passCount) {
@@ -1560,8 +1557,8 @@ protected:
                 "Replication reader retry %v out of %v timed out",
                 RetryIndex_,
                 ReaderConfig_->RetryCount)
-                << TErrorAttribute("retry_start_time", RetryStartTime_)
-                << TErrorAttribute("retry_timeout", ReaderConfig_->RetryTimeout));
+                .With("retry_start_time", RetryStartTime_)
+                .With("retry_timeout", ReaderConfig_->RetryTimeout));
             OnRetryFailed();
             return;
         }
@@ -1576,7 +1573,8 @@ protected:
     void BanSeedIfIncomplete(const TResponsePtr& rsp, const TPeerId& peerId)
     {
         if (IsSeed(peerId) && !rsp->has_complete_chunk()) {
-            YT_LOG_DEBUG("Seed does not contain the chunk (PeerId: %v)", peerId);
+            YT_TLOG_DEBUG("Seed does not contain the chunk")
+                .With("PeerId", peerId);
             BanPeer(peerId, false);
         }
     }
@@ -1584,16 +1582,18 @@ protected:
     void RegisterError(const TError& error, bool raiseAlert = false)
     {
         if (raiseAlert) {
-            YT_LOG_ALERT(error);
+            YT_TLOG_ALERT("Chunk reader error")
+                .With(error);
         } else {
-            YT_LOG_ERROR(error);
+            YT_TLOG_ERROR("Chunk reader error")
+                .With(error);
         }
         InnerErrors_.push_back(error);
     }
 
     [[nodiscard]] TError BuildCombinedError(const TError& error)
     {
-        return error << InnerErrors_;
+        return error.With(InnerErrors_);
     }
 
     virtual void NextPass() = 0;
@@ -1789,14 +1789,12 @@ private:
 
             guard.Release();
 
-            YT_LOG_DEBUG("Probing session finished "
-                "(ResponseCount: %v, SuccessfulResponseCount: %v, TotalRequestCount: %v, "
-                "CurrentTimeoutIndex: %v, TimePassed: %v)",
-                results.size(),
-                successfulResponseCount,
-                TotalRequestCount_,
-                currentTimeoutIndex,
-                TInstant::Now() - ProbingStartTime_);
+            YT_TLOG_DEBUG("Probing session finished")
+                .With("ResponseCount", results.size())
+                .With("SuccessfulResponseCount", successfulResponseCount)
+                .With("TotalRequestCount", TotalRequestCount_)
+                .With("CurrentTimeoutIndex", currentTimeoutIndex)
+                .With("TimePassed", TInstant::Now() - ProbingStartTime_);
 
             ResultsPromise_.TrySet(std::move(results));
 
@@ -1825,7 +1823,7 @@ private:
 
         void OnTimeout()
         {
-            YT_LOG_DEBUG("Probing session timeout reached");
+            YT_TLOG_DEBUG("Probing session timeout reached");
 
             if (ResultsPromise_.IsSet()) {
                 return;
@@ -1967,7 +1965,7 @@ private:
                 RegisterError(TError(
                     NChunkClient::EErrorCode::MasterCommunicationFailed,
                     "Error requesting seeds from master")
-                    << resultOrError);
+                    .With(resultOrError));
             }
             OnSessionFailed(/*fatal*/ true);
             return;
@@ -2017,8 +2015,8 @@ private:
             RegisterError(TError(
                 NChunkClient::EErrorCode::ReaderTimeout,
                 "Replication reader session timed out")
-                << TErrorAttribute("session_start_time", StartTime_)
-                << TErrorAttribute("session_timeout", ReaderConfig_->SessionTimeout));
+                .With("session_start_time", StartTime_)
+                .With("session_timeout", ReaderConfig_->SessionTimeout));
             OnSessionFailed(/*fatal*/ false);
             return true;
         }
@@ -2029,7 +2027,7 @@ private:
                 NChunkClient::EErrorCode::ChunkReadSessionSlow,
                 "Read session of chunk %v is slow; may attempt repair",
                 ChunkId_)
-                << error);
+                .With(error));
             OnSessionFailed(/*fatal*/ false);
             return true;
         }
@@ -2117,9 +2115,9 @@ private:
             if (*peer.NodeSuspicionMarkTime + *ReaderConfig_->SuspiciousNodeGracePeriod < now) {
                 if (auto reader = Reader_.Lock()) {
                     // NB(akozhikhov): In order not to call DiscardSeeds too often, we implement additional delay.
-                    YT_LOG_WARNING("Discarding seeds due to node being suspicious (PeerId: %v, SuspicionTime: %v)",
-                        peer.Id,
-                        now - *peer.NodeSuspicionMarkTime);
+                    YT_TLOG_WARNING("Discarding seeds due to node being suspicious")
+                        .With("PeerId", peer.Id)
+                        .With("SuspicionTime", now - *peer.NodeSuspicionMarkTime);
                     reader->DiscardSeeds(allyReplicasFuture);
                 }
             }
@@ -2212,12 +2210,11 @@ private:
 
         auto maybeProbingSession = MaybeCreateAdaptiveProbingSession(asyncResults);
 
-        YT_LOG_DEBUG("Gathered candidate peers for probing "
-            "(PeerCandidates: %v, NodeCount: %v, SuspiciousNodeCount: %v, RunAdaptiveProbing: %v)",
-            candidates,
-            asyncResults.size(),
-            asyncSuspiciousResults.size(),
-            static_cast<bool>(maybeProbingSession));
+        YT_TLOG_DEBUG("Gathered candidate peers for probing")
+            .With("PeerCandidates", candidates)
+            .With("NodeCount", asyncResults.size())
+            .With("SuspiciousNodeCount", asyncSuspiciousResults.size())
+            .With("RunAdaptiveProbing", static_cast<bool>(maybeProbingSession));
 
         if (asyncResults.empty()) {
             return AllSucceeded(std::move(asyncSuspiciousResults));
@@ -2333,16 +2330,16 @@ private:
 
             // Exclude throttling peers from current pass.
             if (probingInfo.NetThrottling || probingInfo.DiskThrottling) {
-                YT_LOG_DEBUG("Peer is throttling (PeerId: %v, NetThrottling: %v, DiskThrottling: %v)",
-                    peer.Id,
-                    probingInfo.NetThrottling,
-                    probingInfo.DiskThrottling);
+                YT_TLOG_DEBUG("Peer is throttling")
+                    .With("PeerId", peer.Id)
+                    .With("NetThrottling", probingInfo.NetThrottling)
+                    .With("DiskThrottling", probingInfo.DiskThrottling);
                 continue;
             }
 
             if (!probingInfo.HasCompleteChunk && peer.Type == EPeerType::Seed) {
-                YT_LOG_DEBUG("Peer has no complete chunk (PeerId: %v)",
-                    peer.Id);
+                YT_TLOG_DEBUG("Peer has no complete chunk")
+                    .With("PeerId", peer.Id);
                 BanPeer(peer.Id, /*forever*/ false);
                 continue;
             }
@@ -2355,12 +2352,12 @@ private:
         YT_VERIFY(successfulProbingCount == std::ssize(successfulPeerAndProbingInfoList));
 
         if (successfulPeerAndProbingInfoList.empty()) {
-            YT_LOG_DEBUG("All peer candidates were discarded");
+            YT_TLOG_DEBUG("All peer candidates were discarded");
             return {};
         }
 
         if (receivedNewPeers) {
-            YT_LOG_DEBUG("P2P was activated");
+            YT_TLOG_DEBUG("P2P was activated");
             for (const auto& [peer, probingInfo] : successfulPeerAndProbingInfoList) {
                 ReinstallPeer(peer.Id);
             }
@@ -2463,8 +2460,8 @@ private:
             }
         }
 
-        YT_LOG_DEBUG("Best peers selected (Peers: %v)",
-            MakeFormattableView(
+        YT_TLOG_DEBUG("Best peers selected")
+            .With("Peers", MakeFormattableView(
                 TRange(successfulPeerAndProbingInfoList.begin(), successfulPeerAndProbingInfoList.begin() + count),
                 [] (auto* builder, const auto& peerAndProbingInfo) {
                     const auto& [peer, probingInfo] = peerAndProbingInfo;
@@ -2510,8 +2507,8 @@ public:
         , EnableP2P_(options.EnableP2P)
         , FetchNodeDescriptors_(options.FetchNodeDescriptors)
     {
-        YT_LOG_DEBUG("Will read block set (Blocks: %v)",
-            MakeCompactIntervalView(BlockIndexes_));
+        YT_TLOG_DEBUG("Will read block set")
+            .With("Blocks", MakeCompactIntervalView(BlockIndexes_));
     }
 
     ~TReadBlockSetSession()
@@ -2691,8 +2688,8 @@ private:
         const TAllyReplicasInfo& allyReplicas) override
     {
         if (!ReaderConfig_->FetchFromPeers && !peerDescriptors.empty()) {
-            YT_LOG_DEBUG("Peer suggestions received but ignored (SuggestorPeerId: %v)",
-                suggestorPeer.Id);
+            YT_TLOG_DEBUG("Peer suggestions received but ignored")
+                .With("SuggestorPeerId", suggestorPeer.Id);
             return false;
         }
 
@@ -2703,9 +2700,9 @@ private:
                 auto peerNodeId = NNodeTrackerClient::TNodeId(protoPeerNodeId);
                 auto maybeSuggestedDescriptor = NodeDirectory_->FindDescriptor(peerNodeId);
                 if (!maybeSuggestedDescriptor) {
-                    YT_LOG_DEBUG("Cannot resolve peer descriptor (SuggestedNodeId: %v, SuggestorPeer: %v)",
-                        peerNodeId,
-                        suggestorPeer);
+                    YT_TLOG_DEBUG("Cannot resolve peer descriptor")
+                        .With("SuggestedNodeId", peerNodeId)
+                        .With("SuggestorPeer", suggestorPeer);
                     continue;
                 }
 
@@ -2727,10 +2724,10 @@ private:
                     };
 
                     PeerBlocksMap_[suggestedPeerId].insert(blockIndex);
-                    YT_LOG_DEBUG("Block peer descriptor received (Block: %v, SuggestedAddress: %v, SuggestorPeer: %v)",
-                        blockIndex,
-                        *suggestedAddress,
-                        suggestorPeer);
+                    YT_TLOG_DEBUG("Block peer descriptor received")
+                        .With("Block", blockIndex)
+                        .With("SuggestedAddress", *suggestedAddress)
+                        .With("SuggestorPeer", suggestorPeer);
 
                     if (peerDescriptor.has_delivery_barrier()) {
                         P2PDeliveryBarrier_[peerNodeId].emplace(
@@ -2738,11 +2735,10 @@ private:
                             peerDescriptor.delivery_barrier());
                     }
                 } else {
-                    YT_LOG_WARNING("Peer suggestion ignored, required network is missing "
-                        "(SuggestedAddress: %v, Networks: %v, SuggestorPeerId: %v)",
-                        maybeSuggestedDescriptor->GetDefaultAddress(),
-                        Networks_,
-                        suggestorPeer.Id);
+                    YT_TLOG_WARNING("Peer suggestion ignored, required network is missing")
+                        .With("SuggestedAddress", maybeSuggestedDescriptor->GetDefaultAddress())
+                        .With("Networks", Networks_)
+                        .With("SuggestorPeerId", suggestorPeer.Id);
                 }
             }
         }
@@ -3019,7 +3015,7 @@ private:
                 wrappingError);
             CancelAllBlocks(
                 blocks,
-                wrappingError << rspOrError);
+                wrappingError.With(rspOrError));
             return true;
         }
 
@@ -3040,10 +3036,10 @@ private:
             FromProto<TAllyReplicasInfo>(rsp->ally_replicas()));
 
         if (netThrottling || diskThrottling) {
-            YT_LOG_DEBUG("Peer is throttling (RespondedPeerId: %v, NetThrottling: %v, DiskThrottling: %v)",
-                respondedPeer.Id,
-                netThrottling,
-                diskThrottling);
+            YT_TLOG_DEBUG("Peer is throttling")
+                .With("RespondedPeerId", respondedPeer.Id)
+                .With("NetThrottling", netThrottling)
+                .With("DiskThrottling", diskThrottling);
         }
 
         i64 bytesReceived = 0;
@@ -3088,9 +3084,9 @@ private:
                     TError(
                         NChunkClient::EErrorCode::BlockChecksumMismatch,
                         "Failed to validate received block checksum")
-                        << TErrorAttribute("block_id", ToString(blockId))
-                        << TErrorAttribute("peer_id", respondedPeer.Id)
-                        << error,
+                        .With("block_id", ToString(blockId))
+                        .With("peer_id", respondedPeer.Id)
+                        .With(error),
                     /*raiseAlert*/ true);
 
                 ++invalidBlockCount;
@@ -3121,16 +3117,14 @@ private:
             ReinstallPeer(respondedPeer.Id);
         }
 
-        YT_LOG_DEBUG("Finished processing block response "
-            "(RespondedPeerId: %v, RespondedPeerType: %v, Backup: %v, "
-            "BlocksReceived: %v, BytesReceived: %v, PeersSuggested: %v, InvalidBlockCount: %v)",
-            respondedPeer.Id,
-            respondedPeer.Type,
-            backup,
-            MakeCompactIntervalView(receivedBlockIndexes),
-            bytesReceived,
-            rsp->peer_descriptors_size(),
-            invalidBlockCount);
+        YT_TLOG_DEBUG("Finished processing block response")
+            .With("RespondedPeerId", respondedPeer.Id)
+            .With("RespondedPeerType", respondedPeer.Type)
+            .With("Backup", backup)
+            .With("BlocksReceived", MakeCompactIntervalView(receivedBlockIndexes))
+            .With("BytesReceived", bytesReceived)
+            .With("PeersSuggested", rsp->peer_descriptors_size())
+            .With("InvalidBlockCount", invalidBlockCount);
 
         i64 throttledBytesDelta = DataBytesReceived_ - DataBytesThrottled_;
         if (ShouldThrottle(respondedPeer.Id, throttledBytesDelta > 0)) {
@@ -3167,7 +3161,7 @@ private:
         //              we must forcefully request node descriptors (see YT-26951).
         bool fetchNodeDescriptors = FetchNodeDescriptors_;
         if (!fetchNodeDescriptors && EnableP2P_ && !reader->HasActiveNodeDirectorySynchronizer()) {
-            YT_LOG_DEBUG("Forcing node descriptor fetch because node directory synchronizer is inactive");
+            YT_TLOG_DEBUG("Forcing node descriptor fetch because node directory synchronizer is inactive");
             fetchNodeDescriptors = true;
         }
 
@@ -3308,9 +3302,9 @@ private:
         }
 
         if (fetchedBlockIndexes.size() > 0) {
-            YT_LOG_DEBUG("Fetched blocks from block cache (Count: %v, Blocks: %v)",
-                fetchedBlockIndexes.size(),
-                MakeCompactIntervalView(fetchedBlockIndexes));
+            YT_TLOG_DEBUG("Fetched blocks from block cache")
+                .With("Count", fetchedBlockIndexes.size())
+                .With("Blocks", MakeCompactIntervalView(fetchedBlockIndexes));
         }
     }
 
@@ -3324,13 +3318,12 @@ private:
             blocks.push_back(block);
         }
 
-        YT_LOG_DEBUG("All requested blocks are fetched "
-            "(BlockCount: %v, TotalSize: %v, DataThrottledSize: %v, ExtraThrottledSize: %v, EstimatedSize: %v)",
-            blocks.size(),
-            GetByteSize(blocks),
-            DataBytesThrottled_,
-            ExtraBytesThrottled_,
-            EstimatedSize_);
+        YT_TLOG_DEBUG("All requested blocks are fetched")
+            .With("BlockCount", blocks.size())
+            .With("TotalSize", GetByteSize(blocks))
+            .With("DataThrottledSize", DataBytesThrottled_)
+            .With("ExtraThrottledSize", ExtraBytesThrottled_)
+            .With("EstimatedSize", EstimatedSize_);
 
         AccountExtraMediumBandwidth(DataBytesThrottled_);
 
@@ -3348,7 +3341,9 @@ private:
 
     void OnSessionFailed(bool fatal, const TError& error) override
     {
-        YT_LOG_DEBUG(error, "Reader session failed (Fatal: %v)", fatal);
+        YT_TLOG_DEBUG("Reader session failed")
+            .With("Fatal", fatal)
+            .With(error);
 
         if (fatal) {
             SetReaderFailed();
@@ -3367,7 +3362,7 @@ private:
     void OnCanceled(const TError& error) override
     {
         auto wrappedError = TError(NYT::EErrorCode::Canceled, "ReadBlockSet session canceled")
-            << error;
+            .With(error);
         TSessionBase::OnCanceled(wrappedError);
         Promise_.TrySet(wrappedError);
     }
@@ -3433,8 +3428,8 @@ public:
         , BlockCount_(blockCount)
         , EstimatedSize_(options.EstimatedSize)
     {
-        YT_LOG_DEBUG("Will read block range (Blocks: %v)",
-            FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1));
+        YT_TLOG_DEBUG("Will read block range")
+            .With("Blocks", FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1));
     }
 
     TFuture<std::vector<TBlock>> Run()
@@ -3527,11 +3522,18 @@ private:
 
         auto req = proxy.GetBlockRange();
         req->SetResponseHeavy(true);
-        req->SetRequestInfo("Blocks: %v, EstimatedSize: %v, BytesThrottled: %v, Cookie: %x",
-            FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1),
-            EstimatedSize_,
-            DataBytesThrottled_,
-            SessionOptions_.Cookie);
+        if (SessionOptions_.Cookie) {
+            req->SetRequestInfo("Blocks: %v, EstimatedSize: %v, BytesThrottled: %v, Cookie: %x",
+                FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1),
+                EstimatedSize_,
+                DataBytesThrottled_,
+                *SessionOptions_.Cookie);
+        } else {
+            req->SetRequestInfo("Blocks: %v, EstimatedSize: %v, BytesThrottled: %v",
+                FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1),
+                EstimatedSize_,
+                DataBytesThrottled_);
+        }
         req->SetMultiplexingBand(SessionOptions_.MultiplexingBand);
         req->SetMultiplexingParallelism(SessionOptions_.MultiplexingParallelism);
         SetRequestWorkloadDescriptor(req, WorkloadDescriptor_);
@@ -3587,9 +3589,9 @@ private:
                     TError(
                         NChunkClient::EErrorCode::BlockChecksumMismatch,
                         "Failed to validate received block checksum")
-                        << TErrorAttribute("block_id", ToString(TBlockId(ChunkId_, FirstBlockIndex_ + blocksReceived)))
-                        << TErrorAttribute("peer", peerId)
-                        << error,
+                        .With("block_id", ToString(TBlockId(ChunkId_, FirstBlockIndex_ + blocksReceived)))
+                        .With("peer", peerId)
+                        .With(error),
                     /*raiseAlert*/ true);
 
                 BanPeer(peerId, false);
@@ -3608,20 +3610,22 @@ private:
         BanSeedIfIncomplete(rsp, peerId);
 
         if (rsp->net_throttling() || rsp->disk_throttling()) {
-            YT_LOG_DEBUG("Peer is throttling (PeerId: %v)", peerId);
+            YT_TLOG_DEBUG("Peer is throttling")
+                .With("PeerId", peerId);
         } else {
             if (blocksReceived == 0) {
-                YT_LOG_DEBUG("Peer has no relevant blocks (PeerId: %v)", peerId);
+                YT_TLOG_DEBUG("Peer has no relevant blocks")
+                    .With("PeerId", peerId);
                 BanPeer(peerId, false);
             } else {
                 ReinstallPeer(peerId);
             }
         }
 
-        YT_LOG_DEBUG("Finished processing block response (PeerId: %v, BlocksReceived: %v, BytesReceived: %v)",
-            peerId,
-            FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + blocksReceived - 1),
-            bytesReceived);
+        YT_TLOG_DEBUG("Finished processing block response")
+            .With("PeerId", peerId)
+            .With("BlocksReceived", FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + blocksReceived - 1))
+            .With("BytesReceived", bytesReceived);
 
         if (ShouldThrottle(peerId, DataBytesReceived_ > DataBytesThrottled_)) {
             i64 delta = DataBytesReceived_ - DataBytesThrottled_;
@@ -3640,8 +3644,8 @@ private:
 
     void OnSessionSucceeded()
     {
-        YT_LOG_DEBUG("Some blocks are fetched (Blocks: %v)",
-            FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1));
+        YT_TLOG_DEBUG("Some blocks are fetched")
+            .With("Blocks", FormatBlocks(FirstBlockIndex_, FirstBlockIndex_ + BlockCount_ - 1));
 
         AccountExtraMediumBandwidth(DataBytesThrottled_);
 
@@ -3659,8 +3663,9 @@ private:
 
     void OnSessionFailed(bool fatal, const TError& error) override
     {
-        YT_LOG_DEBUG(error, "Reader session failed (Fatal: %v)",
-            fatal);
+        YT_TLOG_DEBUG("Reader session failed")
+            .With("Fatal", fatal)
+            .With(error);
 
         if (fatal) {
             SetReaderFailed();
@@ -3674,7 +3679,7 @@ private:
     void OnCanceled(const TError& error) override
     {
         auto wrappedError = TError(NYT::EErrorCode::Canceled, "ReadBlockRange session canceled")
-            << error;
+            .With(error);
         TSessionBase::OnCanceled(wrappedError);
         Promise_.TrySet(wrappedError);
     }
@@ -3790,7 +3795,8 @@ private:
             RandomNumber<double>() < *ReaderConfig_->ChunkMetaCacheFailureProbability)
         {
             TError simulatedError("Simulated chunk meta fetch failure");
-            YT_LOG_ERROR(simulatedError);
+            YT_TLOG_ERROR("Simulated chunk meta fetch failure")
+                .With(simulatedError);
             Promise_.TrySet(simulatedError);
             return;
         }
@@ -3833,14 +3839,24 @@ private:
 
         auto req = proxy.GetChunkMeta();
         req->SetResponseHeavy(true);
-        req->SetRequestInfo(
-            "ChunkId: %v, ExtensionTags: %v, PartitionTags: %v, Workload: %v, EnableThrottling: %v, Cookie: %x",
-            ChunkId_,
-            ExtensionTags_,
-            PartitionTags_,
-            WorkloadDescriptor_,
-            true,
-            SessionOptions_.Cookie);
+        if (SessionOptions_.Cookie) {
+            req->SetRequestInfo(
+                "ChunkId: %v, ExtensionTags: %v, PartitionTags: %v, Workload: %v, EnableThrottling: %v, Cookie: %x",
+                ChunkId_,
+                ExtensionTags_,
+                PartitionTags_,
+                WorkloadDescriptor_,
+                true,
+                *SessionOptions_.Cookie);
+        } else {
+            req->SetRequestInfo(
+                "ChunkId: %v, ExtensionTags: %v, PartitionTags: %v, Workload: %v, EnableThrottling: %v",
+                ChunkId_,
+                ExtensionTags_,
+                PartitionTags_,
+                WorkloadDescriptor_,
+                true);
+        }
         req->SetMultiplexingBand(SessionOptions_.MultiplexingBand);
         req->SetMultiplexingParallelism(SessionOptions_.MultiplexingParallelism);
         SetRequestWorkloadDescriptor(req, WorkloadDescriptor_);
@@ -3849,15 +3865,10 @@ private:
         req->set_enable_throttling(true);
         ToProto(req->mutable_chunk_id(), ChunkId_);
         req->set_all_extension_tags(!ExtensionTags_);
-        // COMPAT(apollo1321): Remove in 26.2.
-        if (PartitionTags_.has_value() && PartitionTags_->size() == 1) {
-            req->set_partition_tag(PartitionTags_->Get()[0]);
-        } else {
-            if (PartitionTags_.has_value()) {
-                req->RequireServerFeature(EChunkClientFeature::MultiplePartitionTags);
-            }
-            YT_OPTIONAL_TO_PROTO(req, partition_tags, PartitionTags_);
+        if (PartitionTags_.has_value()) {
+            req->RequireServerFeature(EChunkClientFeature::MultiplePartitionTags);
         }
+        YT_OPTIONAL_TO_PROTO(req, partition_tags, PartitionTags_);
         YT_OPTIONAL_TO_PROTO(req, extension_tags, ExtensionTags_);
         req->set_supported_chunk_features(ToUnderlying(GetSupportedChunkFeatures()));
         ToProto(req->mutable_replica_spec(), peers[0].Replica);
@@ -3891,7 +3902,8 @@ private:
             std::memory_order::relaxed);
 
         if (rsp->net_throttling()) {
-            YT_LOG_DEBUG("Peer is throttling (PeerId: %v)", respondedPeer.Id);
+            YT_TLOG_DEBUG("Peer is throttling")
+                .With("PeerId", respondedPeer.Id);
             RequestMeta();
             return;
         }
@@ -3906,9 +3918,9 @@ private:
 
     void OnSessionSucceeded(NProto::TChunkMeta&& chunkMeta)
     {
-        YT_LOG_DEBUG("Chunk meta obtained (ThrottledBytes: %v, BytesReceived: %v)",
-            DataBytesThrottled_,
-            DataBytesReceived_);
+        YT_TLOG_DEBUG("Chunk meta obtained")
+            .With("ThrottledBytes", DataBytesThrottled_)
+            .With("BytesReceived", DataBytesReceived_);
 
         Promise_.TrySet(New<TRefCountedChunkMeta>(std::move(chunkMeta)));
     }
@@ -3924,7 +3936,9 @@ private:
 
     void OnSessionFailed(bool fatal, const TError& error) override
     {
-        YT_LOG_DEBUG(error, "Get meta session failed (Fatal: %v)", fatal);
+        YT_TLOG_DEBUG("Get meta session failed")
+            .With("Fatal", fatal)
+            .With(error);
 
         if (fatal) {
             SetReaderFailed();
@@ -3938,7 +3952,7 @@ private:
     void OnCanceled(const TError& error) override
     {
         auto wrappedError = TError(NYT::EErrorCode::Canceled, "GetMeta session canceled")
-            << error;
+            .With(error);
         TSessionBase::OnCanceled(wrappedError);
         Promise_.TrySet(wrappedError);
     }
@@ -4022,9 +4036,9 @@ public:
         , CodecId_(codecId)
         , EstimatedSize_(estimatedSize)
     {
-        Logger.AddTag("TableId: %v, Revision: %x",
-            Options_->TableId,
-            Options_->MountRevision);
+        Logger
+            .AddTag("TableId", Options_->TableId)
+            .AddTagFormat("Revision", "%x", Options_->MountRevision);
 
         auto writer = CreateWireProtocolWriter();
         writer->WriteUnversionedRowset(TRange(LookupKeys_));
@@ -4157,7 +4171,9 @@ private:
 
     void OnSessionFailed(bool fatal, const TError& error) override
     {
-        YT_LOG_DEBUG(error, "Lookup rows session failed (Fatal: %v)", fatal);
+        YT_TLOG_DEBUG("Lookup rows session failed")
+            .With("Fatal", fatal)
+            .With(error);
 
         if (fatal) {
             SetReaderFailed();
@@ -4336,15 +4352,26 @@ private:
 
         auto req = proxy.LookupRows();
         req->SetResponseHeavy(true);
-        req->SetRequestInfo("ChunkId: %v, ReadSessionId: %v, Workload: %v, "
-            "PopulateCache: %v, EnableHashChunkIndex: %v, ContainsSchema: %v, Cookie: %x",
-            ChunkId_,
-            SessionOptions_.ReadSessionId,
-            WorkloadDescriptor_,
-            true,
-            Options_->EnableHashChunkIndex,
-            schemaRequested,
-            SessionOptions_.Cookie);
+        if (SessionOptions_.Cookie) {
+            req->SetRequestInfo("ChunkId: %v, ReadSessionId: %v, Workload: %v, "
+                "PopulateCache: %v, EnableHashChunkIndex: %v, ContainsSchema: %v, Cookie: %x",
+                ChunkId_,
+                SessionOptions_.ReadSessionId,
+                WorkloadDescriptor_,
+                true,
+                Options_->EnableHashChunkIndex,
+                schemaRequested,
+                *SessionOptions_.Cookie);
+        } else {
+            req->SetRequestInfo("ChunkId: %v, ReadSessionId: %v, Workload: %v, "
+                "PopulateCache: %v, EnableHashChunkIndex: %v, ContainsSchema: %v",
+                ChunkId_,
+                SessionOptions_.ReadSessionId,
+                WorkloadDescriptor_,
+                true,
+                Options_->EnableHashChunkIndex,
+                schemaRequested);
+        }
         req->SetMultiplexingBand(SessionOptions_.MultiplexingBand);
         req->SetMultiplexingParallelism(SessionOptions_.MultiplexingParallelism);
         SetRequestWorkloadDescriptor(req, WorkloadDescriptor_);
@@ -4352,11 +4379,11 @@ private:
         SetRequestIoFairShareWeight(req, ReaderConfig_->IoFairShareWeight);
         ToProto(req->mutable_chunk_id(), ChunkId_);
         ToProto(req->mutable_read_session_id(), SessionOptions_.ReadSessionId);
-        req->set_timestamp(Options_->Timestamp);
+        req->set_timestamp(ToProto(Options_->Timestamp));
         req->set_compression_codec(ToProto(CodecId_));
         ToProto(req->mutable_column_filter(), Options_->ColumnFilter);
         req->set_produce_all_versions(Options_->ProduceAllVersions);
-        req->set_override_timestamp(Options_->OverrideTimestamp);
+        req->set_override_timestamp(ToProto(Options_->OverrideTimestamp));
         req->set_populate_cache(true);
         req->set_enable_hash_chunk_index(Options_->EnableHashChunkIndex);
         req->set_use_direct_io(ReaderConfig_->UseDirectIO);
@@ -4442,11 +4469,10 @@ private:
 
         // COMPAT(akozhikhov): Get rid of fetched_rows field.
         if (response->request_schema() || !response->fetched_rows()) {
-            YT_LOG_DEBUG("Sending schema upon data node request "
-                "(Backup: %v, SchemaRequested: %v, RowsFetched: %v)",
-                backup,
-                response->request_schema(),
-                response->fetched_rows());
+            YT_TLOG_DEBUG("Sending schema upon data node request")
+                .With("Backup", backup)
+                .With("SchemaRequested", response->request_schema())
+                .With("RowsFetched", response->fetched_rows());
 
             // NB: This time we do not create hedging session.
             auto future = SendLookupRowsRequest(
@@ -4463,15 +4489,13 @@ private:
         }
 
         if (response->net_throttling() || response->disk_throttling()) {
-            YT_LOG_DEBUG("Peer is throttling on lookup "
-                "(PeerId: %v, Backup: %v, "
-                "NetThrottling: %v, NetQueueSize: %v, DiskThrottling: %v, DiskQueueSize: %v)",
-                respondedPeer.Id,
-                backup,
-                response->net_throttling(),
-                response->net_queue_size(),
-                response->disk_throttling(),
-                response->disk_queue_size());
+            YT_TLOG_DEBUG("Peer is throttling on lookup")
+                .With("PeerId", respondedPeer.Id)
+                .With("Backup", backup)
+                .With("NetThrottling", response->net_throttling())
+                .With("NetQueueSize", response->net_queue_size())
+                .With("DiskThrottling", response->disk_throttling())
+                .With("DiskQueueSize", response->disk_queue_size());
         }
 
         auto result = response->Attachments()[0];
@@ -4488,12 +4512,11 @@ private:
 
     void OnSessionSucceeded(bool backup, TSharedRef result)
     {
-        YT_LOG_DEBUG("Finished processing rows response "
-            "(DataBytesReceived: %v, DataBytesThrottled: %v, ExtraBytesThrottled: %v, Backup: %v)",
-            DataBytesReceived_,
-            DataBytesThrottled_,
-            ExtraBytesThrottled_,
-            backup);
+        YT_TLOG_DEBUG("Finished processing rows response")
+            .With("DataBytesReceived", DataBytesReceived_)
+            .With("DataBytesThrottled", DataBytesThrottled_)
+            .With("ExtraBytesThrottled", ExtraBytesThrottled_)
+            .With("Backup", backup);
 
         AccountExtraMediumBandwidth(DataBytesThrottled_);
 
@@ -4520,7 +4543,7 @@ private:
     void OnCanceled(const TError& error) override
     {
         auto wrappedError = TError(NYT::EErrorCode::Canceled, "LookupRows session canceled")
-            << error;
+            .With(error);
         TSessionBase::OnCanceled(wrappedError);
         Promise_.TrySet(wrappedError);
     }
@@ -4873,12 +4896,20 @@ private:
         SetRequestIoConsumed(req, queuedBatch.Session->SessionOptions_, ReaderConfig_->IoConsumedReportWindow);
         SetRequestIoFairShareWeight(req, ReaderConfig_->IoFairShareWeight);
         req->SetResponseHeavy(true);
-        req->SetRequestInfo("ChunkId: %v, Blocks: %v, BlockCount: %v, Workload: %v, Cookie: %x",
-            ChunkId_,
-            MakeCompactIntervalView(blockIndexes),
-            blockIndexes.size(),
-            queuedBatch.Session->SessionOptions_.WorkloadDescriptor,
-            queuedBatch.Session->SessionOptions_.Cookie);
+        if (queuedBatch.Session->SessionOptions_.Cookie) {
+            req->SetRequestInfo("ChunkId: %v, Blocks: %v, BlockCount: %v, Workload: %v, Cookie: %x",
+                ChunkId_,
+                MakeCompactIntervalView(blockIndexes),
+                blockIndexes.size(),
+                queuedBatch.Session->SessionOptions_.WorkloadDescriptor,
+                *queuedBatch.Session->SessionOptions_.Cookie);
+        } else {
+            req->SetRequestInfo("ChunkId: %v, Blocks: %v, BlockCount: %v, Workload: %v",
+                ChunkId_,
+                MakeCompactIntervalView(blockIndexes),
+                blockIndexes.size(),
+                queuedBatch.Session->SessionOptions_.WorkloadDescriptor);
+        }
         ToProto(req->mutable_chunk_id(), ChunkId_);
         ToProto(req->mutable_block_indexes(), std::move(blockIndexes));
         req->SetAcknowledgementTimeout(std::nullopt);
@@ -4908,13 +4939,22 @@ private:
         auto blockIndexes = std::vector(queuedBatch.BlockIds.begin(), queuedBatch.BlockIds.end());
         std::sort(blockIndexes.begin(), blockIndexes.end());
 
-        req->SetRequestInfo("ChunkId: %v, Blocks: %v, "
-            "PopulateCache: %v, Workload: %v, Cookie: %x",
-            ChunkId_,
-            MakeCompactIntervalView(blockIndexes),
-            ReaderConfig_->PopulateCache,
-            queuedBatch.Session->SessionOptions_.WorkloadDescriptor,
-            queuedBatch.Session->SessionOptions_.Cookie);
+        if (queuedBatch.Session->SessionOptions_.Cookie) {
+            req->SetRequestInfo("ChunkId: %v, Blocks: %v, "
+                "PopulateCache: %v, Workload: %v, Cookie: %x",
+                ChunkId_,
+                MakeCompactIntervalView(blockIndexes),
+                ReaderConfig_->PopulateCache,
+                queuedBatch.Session->SessionOptions_.WorkloadDescriptor,
+                *queuedBatch.Session->SessionOptions_.Cookie);
+        } else {
+            req->SetRequestInfo("ChunkId: %v, Blocks: %v, "
+                "PopulateCache: %v, Workload: %v",
+                ChunkId_,
+                MakeCompactIntervalView(blockIndexes),
+                ReaderConfig_->PopulateCache,
+                queuedBatch.Session->SessionOptions_.WorkloadDescriptor);
+        }
 
         ToProto(req->mutable_block_indexes(), blockIndexes);
         req->set_populate_cache(ReaderConfig_->PopulateCache);
@@ -4967,11 +5007,10 @@ private:
     {
         YT_ASSERT_SPINLOCK_AFFINITY(Lock_);
 
-        YT_LOG_DEBUG(
-            "Start new batch request (PrimaryPeerId: %v, RequestType: %v, Blocks: %v)",
-            request.PrimaryPeer.Id,
-            GetRequestLogName<TResponse>(),
-            MakeCompactIntervalView(request.BlockIndexes));
+        YT_TLOG_DEBUG("Start new batch request")
+            .With("PrimaryPeerId", request.PrimaryPeer.Id)
+            .With("RequestType", GetRequestLogName<TResponse>())
+            .With("Blocks", MakeCompactIntervalView(request.BlockIndexes));
 
         auto batch = BuildRequestBatch<TResponse>(request);
 
@@ -4993,11 +5032,10 @@ private:
     {
         YT_ASSERT_SPINLOCK_AFFINITY(Lock_);
 
-        YT_LOG_DEBUG(
-            "Add blocks to next batch request (PrimaryPeerId: %v, RequestType: %v, Blocks: %v)",
-            request.PrimaryPeer.Id,
-            GetRequestLogName<TResponse>(),
-            MakeCompactIntervalView(request.BlockIndexes));
+        YT_TLOG_DEBUG("Add blocks to next batch request")
+            .With("PrimaryPeerId", request.PrimaryPeer.Id)
+            .With("RequestType", GetRequestLogName<TResponse>())
+            .With("Blocks", MakeCompactIntervalView(request.BlockIndexes));
 
         nextBatch.Channel = request.Channel;
         nextBatch.Session = request.Session;
@@ -5053,12 +5091,11 @@ private:
             state.Current = std::move(state.Next);
             auto& nextBatch = state.Current;
 
-            YT_LOG_DEBUG(
-                "Start next batch request (PeerId: %v, RequestType: %v, Blocks: %v, RequestCount: %v)",
-                peerId,
-                GetRequestLogName<TResponse>(),
-                MakeCompactIntervalView(nextBatch.BlockIds),
-                nextBatch.RequestCount);
+            YT_TLOG_DEBUG("Start next batch request")
+                .With("PeerId", peerId)
+                .With("RequestType", GetRequestLogName<TResponse>())
+                .With("Blocks", MakeCompactIntervalView(nextBatch.BlockIds))
+                .With("RequestCount", nextBatch.RequestCount);
 
             auto requestFuture = ExecuteBatchRequest(nextBatch);
             nextBatch.RequestResult.SetFrom(requestFuture);

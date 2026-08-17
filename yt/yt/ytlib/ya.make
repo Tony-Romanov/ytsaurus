@@ -385,6 +385,7 @@ SRCS(
     push_based_shuffle_client/partition_reader.cpp
     push_based_shuffle_client/shuffle_writer.cpp
     push_based_shuffle_client/sort_reader.cpp
+    push_based_shuffle_client/sorted_merging_reader.cpp
 
     query_client/executor.cpp
     query_client/explain.cpp
@@ -424,6 +425,7 @@ SRCS(
     security_client/helpers.cpp
     security_client/permission_cache.cpp
     security_client/public.cpp
+    security_client/query_pool_permission_cache.cpp
     security_client/user_attribute_cache.cpp
 
     security_client/proto/account_ypath.proto

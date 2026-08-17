@@ -124,7 +124,8 @@ public:
         TResourceManagerContextPtr managerContext,
         const THashMap<TResourceId, TResourceSpecPtr>& resources,
         const THashMap<TResourceId, TDynamicResourceSpecPtr>& dynamicResourceSpecs,
-        const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions)
+        const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions,
+        const THashMap<TResourceId, TResourceInstanceState>& predecessorInstanceStates)
         : ManagerContext_(std::move(managerContext))
         , Invoker_(ManagerContext_->Invoker)
         , Logger(ManagerContext_->Logger)
@@ -132,6 +133,8 @@ public:
         ResourceSpecs_ = resources;
         DynamicResourceSpecs_ = dynamicResourceSpecs;
         TargetRevisions_ = targetRevisions;
+
+        ResourceInstanceStates_ = predecessorInstanceStates;
 
         // Create resources in order of their resourceId. It's only needed by tests now but it's a good practice anyway.
         std::map<TResourceId, TResourceSpecPtr> resourceSpecs(ResourceSpecs_.begin(), ResourceSpecs_.end());
@@ -272,27 +275,24 @@ public:
     THashMap<TResourceId, TWorkerResourceStatusPtr> CollectResourceStatuses() override
     {
         THashMap<TResourceId, TWorkerResourceStatusPtr> result;
-        THashMap<TResourceId, IResourcePtr> loadedResources;
+        THashMap<TResourceId, IResourcePtr> scheduledResources;
         {
             auto guard = Guard(Lock_);
 
             for (const auto& [resourceId, resourceStatus] : ResourceStatuses_) {
                 EmplaceOrCrash(result, resourceId, resourceStatus.Collect());
             }
-            // Applied revisions are reported only for successfully loaded resources: every
-            // resource in the spec is constructed and receives targets, but an unloaded
-            // instance does not serve anything.
+            // Report resources whose load was scheduled, including a pending initial load.
             for (const auto& [resourceId, future] : ResourcesInitializationFutures_) {
-                if (auto error = future.TryGet(); error && error->IsOK()) {
-                    loadedResources.emplace(resourceId, GetOrCrash(Resources_, resourceId));
-                }
+                Y_UNUSED(future);
+                scheduledResources.emplace(resourceId, GetOrCrash(Resources_, resourceId));
             }
         }
 
         // Revision states are queried outside the lock: GetRevisionState is overridable.
-        for (const auto& [resourceId, resource] : loadedResources) {
+        for (const auto& [resourceId, resource] : scheduledResources) {
             auto revisionState = resource->GetRevisionState();
-            if (!revisionState.AppliedRevisionId && !revisionState.TargetRevisionId) {
+            if (!revisionState.AppliedRevisionId && !revisionState.TargetRevisionId && !revisionState.UpdateState) {
                 continue;
             }
             auto& status = result[resourceId];
@@ -301,6 +301,7 @@ public:
             }
             status->AppliedRevisionId = revisionState.AppliedRevisionId;
             status->TargetRevisionId = revisionState.TargetRevisionId;
+            status->UpdateState = revisionState.UpdateState;
         }
 
         return result;
@@ -394,6 +395,13 @@ public:
         return result;
     }
 
+    THashMap<TResourceId, TResourceInstanceState> GetResourceInstanceStates() const override
+    {
+        auto guard = Guard(Lock_);
+
+        return ResourceInstanceStates_;
+    }
+
 private:
     const TResourceManagerContextPtr ManagerContext_;
     const IInvokerPtr Invoker_;
@@ -406,6 +414,8 @@ private:
     THashMap<TResourceId, TResourceStatus> ResourceStatuses_;
 
     YT_DECLARE_SPIN_LOCK(TSpinLock, Lock_);
+    // Protected by Lock_.
+    THashMap<TResourceId, TResourceInstanceState> ResourceInstanceStates_;
     THashMap<TResourceId, TFuture<void>> ResourcesInitializationFutures_;
     THashMap<TResourceId, TResourcePreloadStatePtr> PreloadStatus_;
 
@@ -482,13 +492,28 @@ private:
     {
         const auto& resourceSpec = GetOrCrash(ResourceSpecs_, resourceId);
 
+        ui64 incarnationGeneration = 0;
+        if (auto it = ResourceInstanceStates_.find(resourceId); it != ResourceInstanceStates_.end()) {
+            incarnationGeneration = it->second.IncarnationGeneration + 1;
+        }
+        auto resourceInstanceId = TResourceInstanceId(TGuid::Create());
+        ResourceInstanceStates_[resourceId] = {
+            .InstanceId = resourceInstanceId,
+            .IncarnationGeneration = incarnationGeneration,
+        };
+
         auto context = New<TResourceContext>();
         context->ResourceId = resourceId;
+        context->ResourceInstanceId = resourceInstanceId;
+        context->ResourceIncarnationGeneration = incarnationGeneration;
         context->ResourceSpec = resourceSpec;
         context->ResourceManager = MakeWeak(this);
         context->PipelineAuthenticator = ManagerContext_->PipelineAuthenticator;
+        context->ClientsCache = ManagerContext_->ClientsCache;
+        context->PipelinePath = ManagerContext_->PipelinePath;
+        context->FileStorage = ManagerContext_->FileStorage;
         context->Invoker = Invoker_;
-        context->Logger = Logger.WithTag("Resource: %v", resourceId.Underlying());
+        context->Logger = Logger.WithTag("Resource", resourceId);
         context->Profiler = ManagerContext_->Profiler.WithTag("resource", resourceId.Underlying()).WithPrefix("/resource");
         context->StatusProfiler = ManagerContext_->StatusProfiler->WithPrefix(Format("/resources/%v", resourceId));
 
@@ -514,9 +539,15 @@ IResourceManagerPtr CreateResourceManager(
     TResourceManagerContextPtr managerContext,
     const THashMap<TResourceId, TResourceSpecPtr>& resources,
     const THashMap<TResourceId, TDynamicResourceSpecPtr>& dynamicResourceSpecs,
-    const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions)
+    const THashMap<TResourceId, TResourceRevisionPtr>& targetRevisions,
+    const THashMap<TResourceId, TResourceInstanceState>& predecessorInstanceStates)
 {
-    return New<TResourceManager>(std::move(managerContext), resources, dynamicResourceSpecs, targetRevisions);
+    return New<TResourceManager>(
+        std::move(managerContext),
+        resources,
+        dynamicResourceSpecs,
+        targetRevisions,
+        predecessorInstanceStates);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

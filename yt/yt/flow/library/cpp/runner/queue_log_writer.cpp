@@ -38,7 +38,7 @@ namespace {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-YT_DEFINE_GLOBAL(const TLogger, Logger, "Logging");
+YT_DEFINE_LEAKY_GLOBAL(const TLogger, Logger, "Logging");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -52,10 +52,9 @@ static const auto QueueLogSchema = New<TTableSchema>(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TQueueLogWriterConfig
+struct TQueueLogWriterConfig
     : public NLogging::TLogWriterConfig
 {
-public:
     static constexpr TStringBuf WriterType = "queue";
 
     NYPath::TRichYPath QueuePath;
@@ -181,7 +180,7 @@ private:
     void OnException(const std::exception& ex) override
     {
         YT_TLOG_ERROR("Queue write failed")
-            .With("Queue", Stream_->QueuePath(), "%Qv")
+            .With("Queue", Stream_->QueuePath())
             .With(ex);
 
         Stream_->Truncate();

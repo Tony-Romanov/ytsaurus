@@ -724,7 +724,7 @@ private:
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error updating operation %v node",
                 operationId)
-                << ex;
+                .With(ex);
         }
 
         YT_LOG_DEBUG("Finished updating operation node (OperationId: %v)",
@@ -765,10 +765,9 @@ private:
 
         auto controller = operation->GetController();
 
-        if (!Config_->EnableControllerFeaturesArchivation ||
-            !DoesOperationsArchiveExist() ||
-            !TryUpdateControllerFeaturesInArchive(operationId, featureYson))
-        {
+        if (Config_->EnableControllerFeaturesArchivation && DoesOperationsArchiveExist()) {
+            TryUpdateControllerFeaturesInArchive(operationId, featureYson);
+        } else {
             auto proxy = CreateObjectServiceWriteProxy(Bootstrap_->GetClient());
 
             auto path = GetOperationPath(operationId) + "/@controller_features";
@@ -780,7 +779,7 @@ private:
         }
     }
 
-    bool TryUpdateControllerFeaturesInArchive(TOperationId operationId, const TYsonString& featureYson)
+    void TryUpdateControllerFeaturesInArchive(TOperationId operationId, const TYsonString& featureYson)
     {
         const auto& client = Bootstrap_->GetClient();
         auto transaction = WaitFor(client->StartTransaction(ETransactionType::Tablet, TTransactionStartOptions{}))
@@ -821,7 +820,6 @@ private:
                 orderedByIdRowsDataWeight,
                 operationId);
         }
-        return error.IsOK();
     }
 
     void UpdateOperationProgress(TOperationId operationId)
@@ -837,7 +835,11 @@ private:
         auto controller = operation->GetController();
         bool shouldUpdateLightOperationAttributes = controller->ShouldUpdateLightOperationAttributes();
 
-        UpdateProgressAndLightAttributes(operationId, controller, controller->HasProgress(), shouldUpdateLightOperationAttributes);
+        UpdateProgressAndLightAttributes(
+            operationId,
+            controller,
+            controller->HasProgress(),
+            shouldUpdateLightOperationAttributes);
         if (shouldUpdateLightOperationAttributes) {
             controller->SetLightOperationAttributesUpdated();
         }
@@ -876,12 +878,19 @@ private:
             ValidateYson(progress, GetYsonNestingLevelLimit());
             ValidateYson(briefProgress, GetYsonNestingLevelLimit());
 
-            bool archiveUpdated = false;
             if (Config_->EnableOperationProgressArchivation && DoesOperationsArchiveExist()) {
-                archiveUpdated = TryUpdateOperationProgressInArchive(operationId, progress, briefProgress);
-            }
+                // While the operation is running, we only attempt to write brief progress to the archive.
+                // Once the operation finishes, persist brief progress in Cypress to ensure it is always available.
+                if (controller->IsFinished()) {
+                    hasSubrequests = true;
 
-            if (!archiveUpdated) {
+                    auto briefProgressReq = multisetReq->add_subrequests();
+                    briefProgressReq->set_attribute("brief_progress");
+                    briefProgressReq->set_value(ToProto(briefProgress));
+                }
+
+                TryUpdateOperationProgressInArchive(operationId, progress, briefProgress);
+            } else {
                 hasSubrequests = true;
 
                 auto progressReq = multisetReq->add_subrequests();
@@ -913,7 +922,7 @@ private:
             operationId);
     }
 
-    bool TryUpdateOperationProgressInArchive(
+    void TryUpdateOperationProgressInArchive(
         TOperationId operationId,
         const TYsonString& progress,
         const TYsonString& briefProgress)
@@ -960,7 +969,6 @@ private:
                 orderedByIdRowsDataWeight,
                 operationId);
         }
-        return error.IsOK();
     }
 
     void AttachLivePreviewChunks(
@@ -1161,7 +1169,7 @@ private:
             }
 
             THROW_ERROR_EXCEPTION("Error getting snapshot version")
-                << rspOrError;
+                .With(rspOrError);
         }
 
         const auto& rsp = rspOrError.Value();
@@ -1185,7 +1193,7 @@ private:
                 operationId);
             snapshot.Blocks = downloader->Run();
         } catch (const std::exception& ex) {
-            THROW_ERROR_EXCEPTION("Error downloading snapshot") << ex;
+            THROW_ERROR_EXCEPTION("Error downloading snapshot").With(ex);
         }
         return snapshot;
     }
@@ -1204,7 +1212,7 @@ private:
         auto batchRspOrError = WaitFor(batchReq->Invoke());
         auto error = GetCumulativeError(batchRspOrError);
         if (!error.IsOK()) {
-            Bootstrap_->GetControllerAgent()->Disconnect(TError("Failed to remove snapshot") << error);
+            Bootstrap_->GetControllerAgent()->Disconnect(TError("Failed to remove snapshot").With(error));
         }
     }
 
@@ -1277,7 +1285,7 @@ private:
     {
         YT_ASSERT_THREAD_AFFINITY(ControlThread);
 
-        Bootstrap_->GetControllerAgent()->Disconnect(TError("Failed to update operation node") << error);
+        Bootstrap_->GetControllerAgent()->Disconnect(TError("Failed to update operation node").With(error));
     }
 
     void DoAddChunkTreesToUnstageList(std::vector<TChunkTreeId> chunkTreeIds, bool recursive)
@@ -1369,7 +1377,7 @@ private:
                 SetControllerAgentAlert(
                     EControllerAgentAlertType::UnrecognizedConfigOptions,
                     TError("Controller agent config contains unrecognized options")
-                        << TErrorAttribute("unrecognized", unrecognized));
+                        .With("unrecognized", unrecognized));
             }
         }
 
@@ -1411,7 +1419,7 @@ private:
                 newConfig = ConvertTo<TControllerAgentConfigPtr>(newConfigNode);
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Error loading controller agent configuration")
-                    << ex;
+                    .With(ex);
             }
 
             SetControllerAgentAlert(EControllerAgentAlertType::UpdateConfig, TError());
@@ -1715,4 +1723,3 @@ void TMasterConnector::SetControllerAgentAlert(EControllerAgentAlertType alertTy
 ////////////////////////////////////////////////////////////////////////////////
 
 } // namespace NYT::NControllerAgent
-

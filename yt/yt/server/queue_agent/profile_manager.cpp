@@ -65,8 +65,8 @@ TError GetSnapshotError(const TError& previousSnapshotError, const TError& curre
 {
     if (!previousSnapshotError.IsOK() || !currentSnapshotError.IsOK()) {
         return TError("At least one of the snapshots contains errors")
-            << TErrorAttribute("previous_snapshot_error", previousSnapshotError)
-            << TErrorAttribute("current_snapshot_error", currentSnapshotError);
+            .With("previous_snapshot_error", previousSnapshotError)
+            .With("current_snapshot_error", currentSnapshotError);
     }
 
     return {};
@@ -510,7 +510,7 @@ private:
             partitionProfiler.Counters,
             profiler,
             subConsumerSnapshot->PartitionCount,
-            Logger().WithTag("Queue: %v", queuePath));
+            Logger().WithTag("Queue", queuePath));
     }
 
     TError CheckSnapshotCompatibility(const TConsumerSnapshotPtr& previousConsumerSnapshot, const TConsumerSnapshotPtr& currentConsumerSnapshot) const

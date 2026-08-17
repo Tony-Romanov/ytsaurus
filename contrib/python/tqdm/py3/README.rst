@@ -23,7 +23,7 @@ iterable with ``tqdm(iterable)``, and you're done!
 
 ``76%|████████████████████████        | 7568/10000 [00:33<00:10, 229.00it/s]``
 
-``trange(N)`` can be also used as a convenient shortcut for
+``trange(N)`` can also be used as a convenient shortcut for
 ``tqdm(range(N))``.
 
 |Screenshot|
@@ -1485,7 +1485,7 @@ Citation information: |DOI|
    :target: https://cdcl.ml/sponsor
 .. |Versions| image:: https://img.shields.io/pypi/v/tqdm.svg
    :target: https://tqdm.github.io/releases
-.. |PyPI-Downloads| image:: https://img.shields.io/pypi/dm/tqdm.svg?label=pypi%20downloads&logo=PyPI&logoColor=white
+.. |PyPI-Downloads| image:: https://static.pepy.tech/personalized-badge/tqdm?left_text=downloads%2Fmonth
    :target: https://pepy.tech/project/tqdm
 .. |Py-Versions| image:: https://img.shields.io/pypi/pyversions/tqdm.svg?logo=python&logoColor=white
    :target: https://pypi.org/project/tqdm

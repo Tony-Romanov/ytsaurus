@@ -156,7 +156,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            TabletServerLogger().WithTag("Cache: BundleHealth"))
+            TabletServerLogger().WithTag("Cache", "BundleHealth"))
     { }
 
 protected:
@@ -185,7 +185,7 @@ public:
         : TAsyncExpiringCache(
             std::move(config),
             NRpc::TDispatcher::Get()->GetHeavyInvoker(),
-            TabletServerLogger().WithTag("Cache: ClusterLivenessCheck"))
+            TabletServerLogger().WithTag("Cache", "ClusterLivenessCheck"))
     { }
 
 protected:
@@ -561,8 +561,8 @@ private:
             return lag < SyncReplicaLagThreshold_
                 ? TError()
                 : TError("Replica lag time is over the threshold ")
-                    << TErrorAttribute("replica_lag_time", lag)
-                    << TErrorAttribute("replica_lag_threshold", SyncReplicaLagThreshold_);
+                    .With("replica_lag_time", lag)
+                    .With("replica_lag_threshold", SyncReplicaLagThreshold_);
         }
 
         TFuture<std::string> GetAsyncTabletCellBundleName()

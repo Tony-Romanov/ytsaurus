@@ -369,11 +369,10 @@ private:
         auto mode = store->GetInMemoryMode();
 
         auto Logger = TabletNodeLogger()
-            .WithTag("%v, StoreId: %v, Mode: %v, ReadSessionId: %v",
-                tablet->GetLoggingTag(),
-                store->GetId(),
-                mode,
-                readSessionId);
+            .WithTags(tablet->GetLoggingTags())
+            .WithTag("StoreId", store->GetId())
+            .WithTag("Mode", mode)
+            .WithTag("ReadSessionId", readSessionId);
 
         auto traceContext = TTraceContext::NewRoot("InMemoryManager");
         TTraceContextGuard traceContextGuard(traceContext);
@@ -444,8 +443,8 @@ private:
             storeManager->BackoffStorePreload(store);
 
             auto error = TError(ex)
-                << TErrorAttribute("tablet_id", tabletSnapshot->TabletId)
-                << TErrorAttribute("background_activity", ETabletBackgroundActivity::Preload);
+                .With("tablet_id", tabletSnapshot->TabletId)
+                .With("background_activity", ETabletBackgroundActivity::Preload);
 
             Bootstrap_->GetErrorManager()->HandleError(error, "Preload", tabletSnapshot);
 
@@ -517,11 +516,10 @@ TInMemoryChunkDataPtr PreloadInMemoryStore(
     auto mode = mountConfig->InMemoryMode;
 
     auto Logger = TabletNodeLogger()
-        .WithTag("%v, StoreId: %v, Mode: %v, ReadSessionId: %v",
-            tabletSnapshot->LoggingTag,
-            store->GetId(),
-            mode,
-            readSessionId);
+        .WithTags(tabletSnapshot->LoggingTags)
+        .WithTag("StoreId", store->GetId())
+        .WithTag("Mode", mode)
+        .WithTag("ReadSessionId", readSessionId);
 
     YT_LOG_INFO("Store preload started");
 
@@ -551,10 +549,10 @@ TInMemoryChunkDataPtr PreloadInMemoryStore(
         if (auto blockSizeLimit = mountConfig->MaxUnversionedBlockSize) {
             if (miscExt.max_data_block_size() > *blockSizeLimit) {
                 THROW_ERROR_EXCEPTION("Maximum block size limit violated")
-                    << TErrorAttribute("tablet_id", tabletSnapshot->TabletId)
-                    << TErrorAttribute("chunk_id", store->GetId())
-                    << TErrorAttribute("block_size", miscExt.max_data_block_size())
-                    << TErrorAttribute("block_size_limit", *blockSizeLimit);
+                    .With("tablet_id", tabletSnapshot->TabletId)
+                    .With("chunk_id", store->GetId())
+                    .With("block_size", miscExt.max_data_block_size())
+                    .With("block_size_limit", *blockSizeLimit);
             }
         }
     }
@@ -646,8 +644,8 @@ TInMemoryChunkDataPtr PreloadInMemoryStore(
         auto freeMemory = memoryTracker->GetFree(EMemoryCategory::TabletStatic);
         if (freeMemory < preallocatedMemory) {
             THROW_ERROR_EXCEPTION("Preload is cancelled due to memory pressure")
-                << TErrorAttribute("free_memory", freeMemory)
-                << TErrorAttribute("requested_memory", preallocatedMemory);
+                .With("free_memory", freeMemory)
+                .With("requested_memory", preallocatedMemory);
         }
     }
 
@@ -1158,7 +1156,7 @@ IRemoteInMemoryBlockCachePtr DoCreateRemoteInMemoryBlockCache(
         if (!rspOrError.IsOK()) {
             THROW_ERROR_EXCEPTION("Error starting in-memory session at node %v",
                 address)
-                << rspOrError;
+                .With(rspOrError);
         }
 
         const auto& rsp = rspOrError.Value();

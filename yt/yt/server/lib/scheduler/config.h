@@ -81,10 +81,9 @@ DEFINE_REFCOUNTED_TYPE(TStrategyTestingOptions)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TStrategyControllerThrottling
+struct TStrategyControllerThrottling
     : public virtual NYTree::TYsonStruct
 {
-public:
     TDuration ScheduleAllocationStartBackoffTime;
     TDuration ScheduleAllocationMaxBackoffTime;
     double ScheduleAllocationBackoffMultiplier;
@@ -552,6 +551,8 @@ struct TStrategyTreeConfig
     bool ConsiderSingleAllocationVanillaOperationsAsGang;
 
     bool UsePrecommitForPreemption;
+
+    bool EnableInfiniteResourceLimitsOvercommit;
 
     TGpuSchedulingPolicyConfigPtr GpuSchedulingPolicy;
     EPolicyKind PolicyKind;

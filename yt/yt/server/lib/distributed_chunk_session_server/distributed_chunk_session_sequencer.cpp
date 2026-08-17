@@ -47,14 +47,14 @@ public:
             std::move(targets),
             EChunkFormat::JournalDistributed,
             DistributedChunkSessionServiceLogger()))
-        , Logger(DistributedChunkSessionServiceLogger().WithTag("(SessionId: %v)", sessionId))
+        , Logger(DistributedChunkSessionServiceLogger().WithTag("SessionId", sessionId))
     { }
 
     TDistributedChunkSessionSequencer(
         TSessionId sessionId,
         IJournalChunkWriterPtr writer)
         : Writer_(std::move(writer))
-        , Logger(DistributedChunkSessionServiceLogger().WithTag("(SessionId: %v)", sessionId))
+        , Logger(DistributedChunkSessionServiceLogger().WithTag("SessionId", sessionId))
     { }
 
     TFuture<void> Open() final
@@ -65,7 +65,7 @@ public:
         result.Subscribe(BIND_NO_PROPAGATE(
             &TDistributedChunkSessionSequencer::OnWriterOpened,
             MakeWeak(this)));
-        return result;
+        return result.ToUncancelable();
     }
 
     TFuture<void> GetClosedFuture() final
@@ -91,7 +91,7 @@ public:
             &TDistributedChunkSessionSequencer::OnWriteFinished,
             MakeWeak(this),
             recordIndex));
-        return result;
+        return result.ToUncancelable();
     }
 
     TFuture<void> Close() final

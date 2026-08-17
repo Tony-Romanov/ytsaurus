@@ -105,7 +105,8 @@ void ProcessScheduleAllocationMailboxes(
     auto* response = &context->Response();
 
     const auto Logger = SchedulerLogger()
-        .WithTag("RequestId: %v, IncarnationId: %v", context->GetRequestId(), request->agent_id());
+        .WithTag("RequestId", context->GetRequestId())
+        .WithTag("IncarnationId", request->agent_id());
 
     YT_LOG_DEBUG("Processing schedule allocation mailboxes");
 
@@ -138,7 +139,8 @@ void ProcessScheduleAllocationResponses(
     const IInvokerPtr& dtorInvoker)
 {
     auto Logger = SchedulerLogger()
-        .WithTag("RequestId: %v, IncarnationId: %v", context->GetRequestId(), context->Request().agent_id());
+        .WithTag("RequestId", context->GetRequestId())
+        .WithTag("IncarnationId", context->Request().agent_id());
 
     YT_LOG_DEBUG("Processing schedule allocation responses");
 
@@ -490,7 +492,7 @@ public:
         return agent;
     }
 
-    template <CInvocable<void(THashMap<TAgentId, TControllerAgentPtr>&)> TMutator>
+    template <NMpl::CInvocable<void(THashMap<TAgentId, TControllerAgentPtr>&)> TMutator>
     void MutateAgentMappings(TMutator mutator)
     {
         YT_ASSERT_THREAD_AFFINITY(ControlThread);
@@ -592,8 +594,8 @@ public:
                             YT_UNUSED_FUTURE(scheduler->SetOperationAlert(operationId, EOperationAlertType::InvalidControllerRuntimeData, TError()));
                         } else {
                             auto error = TError("Controller agent reported invalid data for operation")
-                                << TErrorAttribute("operation_id", operation->GetId())
-                                << std::move(controllerRuntimeDataError);
+                                .With("operation_id", operation->GetId())
+                                .With(std::move(controllerRuntimeDataError));
                             YT_UNUSED_FUTURE(scheduler->SetOperationAlert(operationId, EOperationAlertType::InvalidControllerRuntimeData, error));
                         }
                     }
@@ -926,7 +928,8 @@ public:
             agent,
             [agent, nodeManager, request, response, context, config{Config_}] {
                 const auto Logger = SchedulerLogger()
-                    .WithTag("RequestId: %v, IncarnationId: %v", context->GetRequestId(), request->agent_id());
+                    .WithTag("RequestId", context->GetRequestId())
+                    .WithTag("IncarnationId", request->agent_id());
 
                 YT_LOG_DEBUG("Group running allocation updates by node shards");
 
@@ -981,7 +984,8 @@ public:
         if (request->exec_nodes_requested()) {
             RunInMessageOffloadInvoker(agent, [scheduler, context, request, response] {
                     const auto Logger = SchedulerLogger()
-                        .WithTag("RequestId: %v, IncarnationId: %v", context->GetRequestId(), request->agent_id());
+                        .WithTag("RequestId", context->GetRequestId())
+                        .WithTag("IncarnationId", request->agent_id());
                     YT_LOG_DEBUG("Filling exec node descriptors");
                     response->Attachments().push_back(scheduler->GetCachedProtoExecNodeDescriptors());
                     YT_LOG_DEBUG("Exec node descriptors filled");
@@ -997,7 +1001,8 @@ public:
                 dtorInvoker = MessageOffloadThreadPool_->GetInvoker()
             ] {
                 const auto Logger = SchedulerLogger()
-                    .WithTag("RequestId: %v, IncarnationId: %v", context->GetRequestId(), context->Request().agent_id());
+                    .WithTag("RequestId", context->GetRequestId())
+                    .WithTag("IncarnationId", context->Request().agent_id());
 
                 YT_LOG_DEBUG("Processing allocation events");
 
@@ -1121,7 +1126,7 @@ private:
 
         if (!transactionOrError.IsOK()) {
             Bootstrap_->GetScheduler()->Disconnect(transactionOrError);
-            THROW_ERROR_EXCEPTION("Failed to start incarnation transaction") << transactionOrError;
+            THROW_ERROR_EXCEPTION("Failed to start incarnation transaction").With(transactionOrError);
         }
 
         auto transaction = std::move(transactionOrError.Value());
@@ -1344,7 +1349,7 @@ private:
 
         TError error;
         if (!errors.empty()) {
-            error = TError{EErrorCode::WatcherHandlerFailed, "Too few matching agents"} << std::move(errors);
+            error = TError{EErrorCode::WatcherHandlerFailed, "Too few matching agents"}.With(std::move(errors));
             YT_LOG_WARNING(error);
         }
         Bootstrap_->GetScheduler()->GetMasterConnector()->SetSchedulerAlert(

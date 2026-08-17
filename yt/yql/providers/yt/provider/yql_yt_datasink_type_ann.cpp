@@ -300,8 +300,7 @@ private:
                         return false;
                     }
                     if (tableItemType->HasBareYson() && 0 != rowSpec.GetNativeYtTypeFlags()) {
-                        ctx.AddError(TIssue(pos, TStringBuilder() << "Strict Yson type is not allowed to write, please use Optional<Yson>, item type: "
-                            << *tableItemType));
+                        ReportNonWritableBareYsonError(pos, *tableItemType->Cast<TStructExprType>(), ctx);
                         return false;
                     }
 
@@ -329,8 +328,7 @@ private:
                     }
 
                     if (tableItemType->HasBareYson() && 0 != rowSpec.GetNativeYtTypeFlags()) {
-                        ctx.AddError(TIssue(pos, TStringBuilder() << "Strict Yson type is not allowed to write, please use Optional<Yson>, item type: "
-                            << *tableItemType));
+                        ReportNonWritableBareYsonError(pos, *tableItemType->Cast<TStructExprType>(), ctx);
                         return false;
                     }
 
@@ -357,8 +355,7 @@ private:
             }
 
             if (tableItemType->HasBareYson() && 0 != rowSpec.GetNativeYtTypeFlags()) {
-                ctx.AddError(TIssue(pos, TStringBuilder() << "Strict Yson type is not allowed to write, please use Optional<Yson>, item type: "
-                    << *tableItemType));
+                ReportNonWritableBareYsonError(pos, *tableItemType->Cast<TStructExprType>(), ctx);
                 return false;
             }
 
@@ -509,7 +506,7 @@ private:
                 }
             }
         }
-        if (mode == EYtWriteMode::Replace && !notFlowDynamic) {
+        if (mode == EYtWriteMode::Replace && !meta->IsDynamic && State_->Types->EngineType != EEngineType::Ytflow) {
             ctx.AddError(TIssue(pos, TStringBuilder() <<
                 "Modification of static table " << outTableInfo.Name.Quote() << " is supported only by INSERT"));
             return TStatus::Error;
@@ -735,6 +732,12 @@ private:
             }
 
             YQL_ENSURE(nextDescription.RowSpec);
+            // Strict Yson cannot be represented in native YT types. Reject it right here to avoid internal erros later
+            if (!nextDescription.RowSpec->HasPersistableYson()) {
+                ReportNonWritableBareYsonError(pos, *nextDescription.RowSpec->GetType(), ctx);
+                return TStatus::Error;
+            }
+
             if (contentRowSpecs) {
                 size_t from = 0;
                 if (initialWrite) {
@@ -1723,6 +1726,13 @@ private:
             return TStatus::Error;
         }
 
+        if (auto reserved = FindReservedColumnName(*itemType, *State_)) {
+            ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TStringBuilder()
+                << "Cannot write column " << TString{*reserved}.Quote() << " with reserved prefix "
+                << TString{SystemMemberPrefix}.Quote()));
+            return TStatus::Error;
+        }
+
         auto content =  writeTable.Content().Ptr();
         status = ValidateTableWrite(ctx.GetPosition(input->Pos()), table, content, itemType, {}, cluster, *settings, ctx);
         if (TStatus::Error == status.Level) {
@@ -1925,6 +1935,12 @@ private:
 
                 const TYtOutTableInfo outTable(rowType, GetNativeYtTypeCompatibility(create.DataSink().Cluster().StringValue(), *State_->Configuration), columnOrder);
 
+                // Strict Yson cannot be represented in native YT types. Reject it right here to avoid internal erros later
+                if (!outTable.RowSpec->HasPersistableYson()) {
+                    ReportNonWritableBareYsonError(ctx.GetPosition(create.Pos()), *rowType, ctx);
+                    return TStatus::Error;
+                }
+
                 const auto orderBySize = create.OrderBy().Size();
                 outTable.RowSpec->SortedBy.reserve(orderBySize);
                 outTable.RowSpec->SortMembers.reserve(orderBySize);
@@ -2023,22 +2039,25 @@ private:
             const TYtTableInfo tableInfo(drop.Table());
             YQL_ENSURE(tableInfo.Meta);
 
-            // Make sure we register the table state for the next epoch
-            if (const auto commitEpoch = tableInfo.CommitEpoch) {
-                auto& nextDescription = State_->TablesData->GetOrAddTable(drop.DataSink().Cluster().StringValue(), tableInfo.Name, commitEpoch);
+            const bool fixLoop =  State_->Configuration->_FixEndlessLoopInDropIfExists.Get().GetOrElse(DEFAULT_FIX_ENDLESS_LOOP_IN_DROP_IF_EXISTS);
+            if (fixLoop) {
+                // Make sure we register the table state for the next epoch
+                if (const auto commitEpoch = tableInfo.CommitEpoch) {
+                    auto& nextDescription = State_->TablesData->GetOrAddTable(drop.DataSink().Cluster().StringValue(), tableInfo.Name, commitEpoch);
 
-                auto& nextMetadata = nextDescription.Meta;
-                if (!nextMetadata) {
-                    nextDescription.RowType = nullptr;
-                    nextDescription.RawRowType = nullptr;
+                    auto& nextMetadata = nextDescription.Meta;
+                    if (!nextMetadata) {
+                        nextDescription.RowType = nullptr;
+                        nextDescription.RawRowType = nullptr;
 
-                    nextMetadata = MakeIntrusive<TYtTableMetaInfo>();
-                    nextMetadata->DoesExist = false;
-                }
-                else if (nextMetadata->DoesExist) {
-                    ctx.AddError(TIssue(ctx.GetPosition(drop.Table().Pos()), TStringBuilder() <<
-                        (isDropTable ? "Table" : "View") << ' ' << tableInfo.Name << " is modified and dropped in the same transaction"));
-                    return TStatus::Error;
+                        nextMetadata = MakeIntrusive<TYtTableMetaInfo>();
+                        nextMetadata->DoesExist = false;
+                    }
+                    else if (nextMetadata->DoesExist) {
+                        ctx.AddError(TIssue(ctx.GetPosition(drop.Table().Pos()), TStringBuilder() <<
+                            (isDropTable ? "Table" : "View") << ' ' << tableInfo.Name << " is modified and dropped in the same transaction"));
+                        return TStatus::Error;
+                    }
                 }
             }
 
@@ -2047,12 +2066,17 @@ private:
                     (isDropTable ? "Table" : "View") << ' ' << tableInfo.Name <<
                     " does not exist. 'DROP " << (isDropTable ? "TABLE" : "VIEW") << " IF EXISTS' statement will do nothing.";
 
-                // TODO: the object we are dropping is missing, but we cannot remove DropTable from graph
-                // (via output = drop.World().Ptr(); return TStatus::Repeat; )
-                // this will break epoch assigmnent and fail RunOnOpt test.
-                // Bot we can actually detect this situation later in exec transformer and don't even issue YT call
-                input->SetTypeAnn(drop.World().Ref().GetTypeAnn());
-                return TStatus::Ok;
+                if (fixLoop) {
+                    // TODO: the object we are dropping is missing, but we cannot remove DropTable from graph
+                    // (via output = drop.World().Ptr(); return TStatus::Repeat; )
+                    // this will break epoch assigmnent and fail RunOnOpt test.
+                    // Bot we can actually detect this situation later in exec transformer and don't even issue YT call
+                    input->SetTypeAnn(drop.World().Ref().GetTypeAnn());
+                    return TStatus::Ok;
+                } else {
+                    output = drop.World().Ptr();
+                    return TStatus::Repeat;
+                }
             }
 
             if (isDropTable) {
@@ -2074,6 +2098,26 @@ private:
                     << "Drop of " << tableInfo.Name.Quote() << ' ' << (isTable ? "table" : "view")
                     << " can not be done via DROP " << (isDropTable ? "TABLE" : "VIEW") << " statement."));
                 return TStatus::Error;
+            }
+
+            if (!fixLoop) {
+                if (const auto commitEpoch = tableInfo.CommitEpoch) {
+                    auto& nextDescription = State_->TablesData->GetOrAddTable(drop.DataSink().Cluster().StringValue(), tableInfo.Name, commitEpoch);
+
+                    auto& nextMetadata = nextDescription.Meta;
+                    if (!nextMetadata) {
+                        nextDescription.RowType = nullptr;
+                        nextDescription.RawRowType = nullptr;
+
+                        nextMetadata = MakeIntrusive<TYtTableMetaInfo>();
+                        nextMetadata->DoesExist = false;
+                    }
+                    else if (nextMetadata->DoesExist) {
+                        ctx.AddError(TIssue(ctx.GetPosition(drop.Table().Pos()), TStringBuilder() <<
+                            (isDropTable ? "Table" : "View") << ' ' << tableInfo.Name << " is modified and dropped in the same transaction"));
+                        return TStatus::Error;
+                    }
+                }
             }
         }
 

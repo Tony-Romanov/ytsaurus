@@ -360,8 +360,10 @@ void AttachToChunkList(
     }
 
     if (chunkList->HasChildToIndexMapping()) {
+        THashSet<TChunkTreeRawPtr> newChildren;
+        newChildren.reserve(children.size());
         for (auto child : children) {
-            if (chunkList->HasChild(child)) {
+            if (chunkList->HasChild(child) || !newChildren.insert(child).second) {
                 THROW_ERROR_EXCEPTION("Cannot append a duplicate child %v to chunk list %v",
                     child->GetId(),
                     chunkList->GetId());
@@ -392,6 +394,19 @@ void AttachToChunkList(
     chunkList->IncrementVersion();
 }
 
+EChunkDetachPolicy DeriveChunkTreeDetachPolicy(const TChunkList* chunkList)
+{
+    // TODO(babenko): Extend as needed.
+    switch (chunkList->GetKind()) {
+        case EChunkListKind::Scratch:
+            return EChunkDetachPolicy::Scratch;
+        default:
+            THROW_ERROR_EXCEPTION("Cannot derive detach policy for chunk list %v of kind %Qlv",
+                chunkList->GetId(),
+                chunkList->GetKind());
+    }
+}
+
 void DetachFromChunkList(
     TChunkList* chunkList,
     TRange<TChunkTreeRawPtr> children,
@@ -400,6 +415,24 @@ void DetachFromChunkList(
     // A shortcut.
     if (children.empty()) {
         return;
+    }
+
+    auto hasChildToIndexMapping = chunkList->HasChildToIndexMapping();
+    THashSet<TChunkTreeRawPtr> detachedChildren;
+    if (hasChildToIndexMapping) {
+        detachedChildren.reserve(children.size());
+    }
+    for (auto child : children) {
+        if (!HasParent(child, chunkList)) {
+            THROW_ERROR_EXCEPTION("Chunk list %v has no child %v",
+                chunkList->GetId(),
+                child->GetId());
+        }
+        if (hasChildToIndexMapping && !detachedChildren.insert(child).second) {
+            THROW_ERROR_EXCEPTION("Cannot detach a duplicate child %v from chunk list %v",
+                child->GetId(),
+                chunkList->GetId());
+        }
     }
 
     chunkList->IncrementVersion();
@@ -429,10 +462,14 @@ void DetachFromChunkList(
             ResetChunkTreeParent(chunkList, child);
         }
     } else {
-        statisticsDelta.emplace();
+        if (chunkList->HasStatistics()) {
+            statisticsDelta.emplace();
+        }
 
         for (auto child : children) {
-            statisticsDelta->Accumulate(GetChunkTreeStatistics(child));
+            if (statisticsDelta) {
+                statisticsDelta->Accumulate(GetChunkTreeStatistics(child));
+            }
             ResetChunkTreeParent(chunkList, child);
         }
     }
@@ -548,8 +585,26 @@ void DetachFromChunkList(
             break;
         }
 
-        default:
-            YT_ABORT();
+        case EChunkDetachPolicy::Scratch: {
+            YT_VERIFY(chunkList->GetKind() == EChunkListKind::Scratch);
+            YT_VERIFY(chunkList->HasChildToIndexMapping());
+
+            auto& childToIndex = chunkList->ChildToIndex();
+            for (auto child : children) {
+                auto indexIt = GetIteratorOrCrash(childToIndex, child);
+                int index = indexIt->second;
+
+                // A scratch list has no meaningful child order, so fill the hole with the last child.
+                if (index != std::ssize(existingChildren) - 1) {
+                    existingChildren[index] = existingChildren.back();
+                    childToIndex[existingChildren[index]] = index;
+                }
+
+                childToIndex.erase(indexIt);
+                existingChildren.pop_back();
+            }
+            break;
+        }
     }
 
     // Go upwards and recompute statistics.
@@ -557,9 +612,10 @@ void DetachFromChunkList(
         chunkList,
         [&] (TChunkList* current, TChunkTree* child) {
             TCumulativeStatisticsEntry cumulativeStatisticsDelta;
-            if (chunkList->IsHunkRelated()) {
+            if (hunkCumulativeStatisticsDelta) {
                 cumulativeStatisticsDelta -= *hunkCumulativeStatisticsDelta;
-            } else {
+            }
+            if (statisticsDelta) {
                 current->Statistics().Deaccumulate(*statisticsDelta);
                 cumulativeStatisticsDelta -= TCumulativeStatisticsEntry(*statisticsDelta);
             }
@@ -718,7 +774,7 @@ TCumulativeStatisticsEntry GetCumulativeStatisticsEntry(TChunkTree* chunkTree)
             return IsHunkChunkFormat(chunk->GetChunkFormat())
                 // NB: In hunk tree unsealed chunks will also be included into cumulative statistics.
                 ? TCumulativeStatisticsEntry(/*rowCount*/ 0, /*chunkCount*/ 1, /*dataSize*/ 0)
-                : TCumulativeStatisticsEntry(chunk->GetStatistics());
+                : TCumulativeStatisticsEntry(chunk->GetStatistics(/*includeReferencedHunkData*/ false));
         }
 
         case EObjectType::ChunkView:
@@ -1070,7 +1126,8 @@ namespace {
 
 TYsonString DoGetMulticellOwningNodes(
     NCellMaster::TBootstrap* bootstrap,
-    TChunkTreeId chunkTreeId)
+    TChunkTreeId chunkTreeId,
+    std::string userNameToForward)
 {
     std::vector<TVersionedObjectId> nodeIds;
 
@@ -1107,6 +1164,7 @@ TYsonString DoGetMulticellOwningNodes(
             TChunkServiceProxy proxy(channel);
 
             auto req = proxy.GetChunkOwningNodes();
+            req->SetUser(userNameToForward);
             ToProto(req->mutable_chunk_id(), chunkTreeId);
 
             requestFutures.emplace_back(cellTag, req->Invoke());
@@ -1168,7 +1226,10 @@ TFuture<TYsonString> GetMulticellOwningNodes(
     NCellMaster::TBootstrap* bootstrap,
     TChunkTree* chunkTree)
 {
-    return BIND(&DoGetMulticellOwningNodes, Unretained(bootstrap), chunkTree->GetId())
+    const auto& securityManager = bootstrap->GetSecurityManager();
+    auto userNameToForward = securityManager->GetAuthenticatedUserNameToForward();
+
+    return BIND(&DoGetMulticellOwningNodes, Unretained(bootstrap), chunkTree->GetId(), userNameToForward)
         .AsyncVia(GetCurrentInvoker())
         .Run();
 }
@@ -1254,9 +1315,9 @@ TLegacyOwningKey GetUpperBoundKeyOrThrow(const TChunkView* chunkView, std::optio
     } else {
         if (*keyColumnCount < upperLimitKey.GetCount()) {
             THROW_ERROR_EXCEPTION("Unexpected key shortening for chunk view")
-                << TErrorAttribute("chunk_view_id", chunkView->GetId())
-                << TErrorAttribute("key_column_count", *keyColumnCount)
-                << TErrorAttribute("key", ToString(upperLimitKey));
+                .With("chunk_view_id", chunkView->GetId())
+                .With("key_column_count", *keyColumnCount)
+                .With("key", ToString(upperLimitKey));
         }
         return std::min(chunkUpperBound, WidenKey(upperLimitKey, *keyColumnCount));
     }
@@ -1344,9 +1405,9 @@ TLegacyOwningKey GetMinKey(const TChunkView* chunkView, std::optional<int> keyCo
     } else {
         if (*keyColumnCount < lowerLimitKey.GetCount()) {
             THROW_ERROR_EXCEPTION("Unexpected key shortening for chunk view")
-                << TErrorAttribute("chunk_view_id", chunkView->GetId())
-                << TErrorAttribute("key_column_count", *keyColumnCount)
-                << TErrorAttribute("key", ToString(lowerLimitKey));
+                .With("chunk_view_id", chunkView->GetId())
+                .With("key_column_count", *keyColumnCount)
+                .With("key", ToString(lowerLimitKey));
         }
         return std::max(chunkMinKey, WidenKey(lowerLimitKey, *keyColumnCount));
     }
@@ -1511,9 +1572,9 @@ std::vector<TChunkViewMergeResult> MergeAdjacentChunkViewRanges(std::vector<TChu
             auto nextLowerLimit = lowerLimitOrEmptyKey(chunkView);
             if (nextLowerLimit < upperLimit) {
                 THROW_ERROR_EXCEPTION("Found intersecting chunk view ranges during merge")
-                    << TErrorAttribute("previous_upper_limit", upperLimit)
-                    << TErrorAttribute("lower_limit", lowerLimit)
-                    << TErrorAttribute("chunk_view_id", chunkView->GetId());
+                    .With("previous_upper_limit", upperLimit)
+                    .With("lower_limit", lowerLimit)
+                    .With("chunk_view_id", chunkView->GetId());
             } else if (nextLowerLimit == upperLimit) {
                 upperLimit = upperLimitOrMaxKey(chunkView);
             } else {
@@ -1767,7 +1828,7 @@ i64 ComputeDiskSpaceFromDataSize(i64 dataSize, NErasure::ECodec erasureCodec)
 void AccumulateNewlyReferencedHunkStatistics(TChunk* hunkChunk, i64 dataWeightDelta, i64 dataSizeDelta)
 {
     hunkChunk->AccumulateNewlyReferencedHunkStatistics(dataWeightDelta, dataSizeDelta);
-    VisitAllAncestorsInHunkTree(hunkChunk, [&] (TChunkList* chunkList, bool firstOccurrence) {
+    VisitHunkTreeAncestors(hunkChunk, [&] (TChunkList* chunkList, bool firstOccurrence) {
         if (firstOccurrence) {
             chunkList->AccumulateNewlyReferencedHunkDataSize(hunkChunk, dataSizeDelta);
         }

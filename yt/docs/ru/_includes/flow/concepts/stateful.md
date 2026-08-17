@@ -72,7 +72,7 @@ Read-only доступ к внешним стейтам через join по к�
 
 {% if audience == "internal" %}
 
-Как выбрать вариант хранения и репликации этих таблиц (обычные, реплицированные или хаосные) при запуске нового пайплайна — в статье [Выбор типа репликации для стейта](../../../flow/release/state-tables-choice.md).
+Как выбрать вариант хранения и репликации этих таблиц (обычные, реплицированные или хаосные) при запуске нового пайплайна — в статье [Выбор типа репликации для стейта](../../../flow/devops/state-tables-choice.md).
 
 {% endif %}
 
@@ -101,9 +101,11 @@ Flow предоставляет общий двухуровневый (uncompres
 - **C++**: клиент `TMutableStateKeyClient<TState>` (read-write) или `TJoinedStateKeyClient<TState>` (read-only) отдаёт аксессор `TStateAccessor<TState>` / `TConstStateAccessor<TState>`; один и тот же key-client работает и с внутренним, и с внешним стейтом. [Подробнее →](../../../flow/cpp/state.md)
 - **Java**: YsonStateAccessor, ProtoStateAccessor, ExternalStateAccessor. [Подробнее →](../../../flow/java/state.md)
 - **Python**: ctx.state(), ctx.external_state(), ctx.proto_state(). [Подробнее →](../../../flow/python/state.md)
+- **Go**: `flow.OpenYSONState`, `flow.OpenProtoState`, `flow.OpenExternalState`, `flow.OpenJoinedExternalState` открывают аксессор к стейту по ключу входа. [Подробнее →](../../../flow/go/state.md)
 
 ## См. также
 
 - [Работа со стейтами (C++)](../../../flow/cpp/state.md)
 - [Работа со стейтами (Java)](../../../flow/java/state.md)
 - [Работа со стейтами (Python)](../../../flow/python/state.md)
+- [Работа со стейтами (Go)](../../../flow/go/state.md)

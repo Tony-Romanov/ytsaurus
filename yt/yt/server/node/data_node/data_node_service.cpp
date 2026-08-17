@@ -10,6 +10,7 @@
 #include "location.h"
 #include "location_manager.h"
 #include "master_connector.h"
+#include "medium_aware_block_cache_manager.h"
 #include "network_statistics.h"
 #include "offloaded_chunk_read_session.h"
 #include "p2p.h"
@@ -100,7 +101,6 @@ using namespace NTracing;
 using NChunkClient::TChunkReaderStatistics;
 using NYT::FromProto;
 using NYT::ToProto;
-
 using TRefCountedColumnarStatisticsSubresponse = TRefCountedProto<TRspGetColumnarStatistics::TSubresponse>;
 using TRefCountedColumnarStatisticsSubresponsePtr = TIntrusivePtr<TRefCountedColumnarStatisticsSubresponse>;
 
@@ -685,7 +685,7 @@ private:
                         NChunkClient::EErrorCode::SendBlocksFailed,
                         "Error putting blocks to %v",
                         targetDescriptor.GetDefaultAddress())
-                        << rspOrError;
+                        .With(rspOrError);
                 }
             })));
     }
@@ -750,14 +750,14 @@ private:
         auto blocks = GetRpcAttachedBlocks(request, true /*validateChecksums*/);
         if (std::ssize(blocks) != request->block_indexes_size()) {
             THROW_ERROR_EXCEPTION("Number of attached blocks is different from blocks field length")
-                << TErrorAttribute("attached_block_count", blocks.size())
-                << TErrorAttribute("blocks_length", request->block_indexes_size());
+                .With("attached_block_count", blocks.size())
+                .With("blocks_length", request->block_indexes_size());
         }
 
         if (request->chunk_ids_size() != request->chunk_block_count_size()) {
             THROW_ERROR_EXCEPTION("Invalid block count")
-                << TErrorAttribute("chunk_count", request->chunk_ids_size())
-                << TErrorAttribute("block_count", request->chunk_block_count_size());
+                .With("chunk_count", request->chunk_ids_size())
+                .With("block_count", request->chunk_block_count_size());
         }
 
         int j = 0;
@@ -905,7 +905,7 @@ private:
             subresponse->set_disk_queue_size(diskThrottling.QueueSize);
 
             if (chunk) {
-                subresponse->set_medium_index(chunk->GetLocation()->GetMediumDescriptor()->GetIndex());
+                subresponse->set_medium_index(chunk->GetLocation()->GetMediumIndex());
             }
 
             YT_LOG_DEBUG_UNLESS(diskThrottling.Error.IsOK(), diskThrottling.Error);
@@ -983,7 +983,7 @@ private:
         response->set_disk_queue_size(diskThrottling.QueueSize);
 
         if (chunk) {
-            response->set_medium_index(chunk->GetLocation()->GetMediumDescriptor()->GetIndex());
+            response->set_medium_index(chunk->GetLocation()->GetMediumIndex());
         }
 
         YT_LOG_DEBUG_UNLESS(diskThrottling.Error.IsOK(), diskThrottling.Error);
@@ -1015,7 +1015,16 @@ private:
         auto cachedBlockSize = 0L;
 
         if (GetDynamicConfig()->PropagateCachedBlockInfosToProbing) {
-            auto cachedBlocks = Bootstrap_->GetBlockCache()->GetCachedBlocksByChunkId(chunkId, EBlockType::CompressedData);
+            THashSet<NChunkClient::TBlockInfo> cachedBlocks;
+            if (auto blockCache = Bootstrap_->GetBlockCache()) {
+                cachedBlocks = blockCache->GetCachedBlocksByChunkId(chunkId, EBlockType::CompressedData);
+            }
+            if (auto manager = Bootstrap_->GetMediumAwareBlockCacheManager()) {
+                auto perMediumCachedBlocks = manager->GetCachedBlocksByChunkId(
+                    chunkId,
+                    EBlockType::CompressedData);
+                cachedBlocks.insert(perMediumCachedBlocks.begin(), perMediumCachedBlocks.end());
+            }
             for (const auto& blockInfo : cachedBlocks) {
                 auto* protoBlockInfo = response->add_cached_blocks();
                 protoBlockInfo->set_block_index(blockInfo.BlockIndex);
@@ -1047,6 +1056,7 @@ private:
     TChunkReadOptions PrepareChunkReadOptions(
         const TIntrusivePtr<TContext>& context,
         const TRequest* request,
+        const IChunkPtr& chunk,
         bool fetchFromCache,
         bool fetchFromDisk,
         const TChunkReaderStatisticsPtr& chunkReaderStatistics)
@@ -1054,7 +1064,9 @@ private:
         TChunkReadOptions options;
         options.WorkloadDescriptor = GetRequestWorkloadDescriptor(context);
         options.PopulateCache = request->populate_cache();
-        options.BlockCache = Bootstrap_->GetBlockCache();
+        options.BlockCache = chunk
+            ? Bootstrap_->GetBlockCacheForMedium(chunk->GetLocation()->GetMediumIndex())
+            : Bootstrap_->GetBlockCache();
         options.FetchFromCache = fetchFromCache;
         options.FetchFromDisk = fetchFromDisk;
         options.EnableSequentialIORequests = GetDynamicConfig()->EnableSequentialIORequests.value_or(Config_->EnableSequentialIORequests);
@@ -1132,7 +1144,7 @@ private:
             "NetThrottling: %v, NetQueueSize: %v, "
             "DiskThrottling: %v, DiskQueueSize: %v, "
             "ThrottledLargeBlock: %v, "
-            "BlocksWithData: %v, BlocksSize: %v"
+            "BlocksWithData: %v, BlocksSize: %v, "
             "DataBytesReadFromDisk: %v, DataBytesReadFromCache: %v",
             responseTemplate.ChunkId,
             hasCompleteChunk,
@@ -1306,6 +1318,7 @@ private:
                 auto options = PrepareChunkReadOptions(
                     context,
                     request,
+                    chunk,
                     fetchFromCache && !netThrottling.Enabled,
                     fetchFromDisk && !netThrottling.Enabled && !diskThrottling.Enabled,
                     chunkReaderStatistics);
@@ -1430,6 +1443,7 @@ private:
         auto options = PrepareChunkReadOptions(
             context,
             request,
+            chunk,
             !netThrottling.Enabled,
             !netThrottling.Enabled && !diskThrottling.Enabled,
             chunkReaderStatistics);
@@ -1515,7 +1529,8 @@ private:
             options.PopulateCache = true;
             options.FetchFromCache = true;
             options.FetchFromDisk = true;
-            options.BlockCache = Bootstrap_->GetBlockCache();
+            options.BlockCache = Bootstrap_->GetBlockCacheForMedium(
+                chunkWithBlockRequests.Chunk->GetLocation()->GetMediumIndex());
             options.EnableSequentialIORequests =
                 GetDynamicConfig()->EnableSequentialIORequests.value_or(Config_->EnableSequentialIORequests);
             options.ChunkReaderStatistics = chunkReaderStatistics;
@@ -2032,11 +2047,11 @@ private:
         response->set_net_throttling(netThrottling.Enabled);
         response->set_net_queue_size(netThrottling.QueueSize);
 
-        auto timestamp = request->timestamp();
+        auto timestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
         auto columnFilter = FromProto<NTableClient::TColumnFilter>(request->column_filter());
         auto codecId = FromProto<NCompression::ECodec>(request->compression_codec());
         auto produceAllVersions = FromProto<bool>(request->produce_all_versions());
-        auto overrideTimestamp = request->has_override_timestamp() ? request->override_timestamp() : NullTimestamp;
+        auto overrideTimestamp = FromProto<NTransactionClient::TTimestamp>(request->override_timestamp());
         auto useDirectIO = request->use_direct_io();
 
         auto chunkReadSession = CreateOffloadedChunkReadSession(
@@ -2177,7 +2192,7 @@ private:
                     NChunkClient::EErrorCode::UnsupportedChunkFeature,
                     "Chunk %v has unknown features",
                     chunkId)
-                    << TErrorAttribute("chunk_features", meta->features());
+                    .With("chunk_features", meta->features());
             }
 
             ValidateChunkFeatures(chunkId, chunkFeatures, supportedChunkFeatures);
@@ -2912,7 +2927,7 @@ private:
 
             YT_LOG_DEBUG("Columnar statistics extracted from chunk meta (ChunkId: %v)", chunkId);
         } catch (const std::exception& ex) {
-            auto error = TError("Error fetching columnar statistics for chunk %v", chunkId) << ex;
+            auto error = TError("Error fetching columnar statistics for chunk %v", chunkId).With(ex);
             YT_LOG_WARNING(error);
             ToProto(subresponse->mutable_error(), error);
         }
@@ -2969,7 +2984,7 @@ private:
             THROW_ERROR_EXCEPTION(
                 NChunkClient::EErrorCode::WriteThrottlingActive,
                 "Pending network in throttling queue size exceeds throttling limit")
-                << TErrorAttribute("net_queue_size", netThrottling.QueueSize);
+                .With("net_queue_size", netThrottling.QueueSize);
         }
     }
 

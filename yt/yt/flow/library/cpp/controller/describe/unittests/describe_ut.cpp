@@ -1,3 +1,4 @@
+#include <yt/yt/flow/library/cpp/common/unittests/mock/time_provider.h>
 #include <yt/yt/flow/library/cpp/controller/describe/common.h>
 #include <yt/yt/flow/library/cpp/controller/describe/describe_computation.h>
 #include <yt/yt/flow/library/cpp/controller/describe/describe_computations.h>
@@ -41,6 +42,7 @@
 #include <library/cpp/testing/common/env.h>
 #include <library/cpp/testing/gtest/matchers.h>
 
+#include <util/system/sanitizers.h>
 #include <util/system/type_name.h>
 
 namespace NYT::NFlow::NDescribe {
@@ -209,9 +211,9 @@ public:
         Spec->Streams["output_stream"] = streamSpec;
         Spec->Postprocess();
 
-        FlowView->State->ExecutionSpec->PipelineSpec->SetValue(Spec);
-        FlowView->State->ExecutionSpec->DynamicPipelineSpec->SetValue(DynamicSpec);
-        FlowView->State->ExecutionSpec->ExtendedPipelineSpec->SetValue(BuildExtendedPipelineSpec(Spec));
+        FlowView->State->ExecutionSpec->PipelineSpec->TrySetValue(Spec, TestVersionProvider());
+        FlowView->State->ExecutionSpec->DynamicPipelineSpec->TrySetValue(DynamicSpec, TestVersionProvider());
+        FlowView->State->ExecutionSpec->ExtendedPipelineSpec->TrySetValue(BuildExtendedPipelineSpec(Spec), TestVersionProvider());
         ASSERT_EQ(FlowView->State->ExecutionSpec->Layout->Partitions.size(), 0u);
         auto context = New<TJobManagerContext>();
         context->Invoker = GetCurrentInvoker();
@@ -219,7 +221,7 @@ public:
         context->PipelinePath = NYPath::TRichYPath::Parse("<cluster=pipeline_cluster>//pipeline/path");
         context->StatusProfiler = CreateSyncStatusProfiler();
         JobManager = CreateJobManager(context, Spec, DynamicSpec, FlowView->State->JobManagerState, /*authenticator*/ nullptr);
-        FlowView->CurrentSpec->SetValue(Spec);
+        FlowView->CurrentSpec->TrySetValue(Spec, TestVersionProvider());
 
         FlowView->State->StartMutation();
         JobManager->DoPartitioning(FlowView);
@@ -283,13 +285,16 @@ public:
     }
 
     //! Runs DescribePipeline with .StatusOnly = true and the given controller FlowCoreVersion.
-    TPipelineDescription DescribeStatus(std::string controllerFlowCoreVersion = GetBinaryChecksum())
+    TPipelineDescription DescribeStatus(
+        std::string controllerFlowCoreVersion = GetBinaryChecksum(),
+        std::string deployStageUrl = {})
     {
         return DescribePipeline({
             .FlowView = FlowView,
             .Logger = TLogger("test"),
             .StatusOnly = true,
             .ControllerFlowCoreVersion = std::move(controllerFlowCoreVersion),
+            .DeployStageUrl = std::move(deployStageUrl),
         });
     }
 
@@ -428,6 +433,88 @@ TEST_W(TDescribeTest, MakeComputationDescriptions)
         computations = makeComputationDescriptions();
         EXPECT_EQ(computations["Computation_1"].Status, ELogLevel::Info);
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+//! Strips the job of one partition of |computationId| and returns its id.
+std::optional<TPartitionId> StripJobOfSomePartition(const TFlowViewPtr& flowView, const TComputationId& computationId)
+{
+    const auto& layout = flowView->State->ExecutionSpec->Layout;
+    for (const auto& [partitionId, partition] : layout->Partitions) {
+        if (partition->ComputationId != computationId || !partition->CurrentJobId.has_value()) {
+            continue;
+        }
+        flowView->State->StartMutation();
+        layout->RemoveJob(*partition->CurrentJobId, EJobFinishReason::Rebalanced);
+        flowView->State->CommitMutation();
+        return partitionId;
+    }
+    return std::nullopt;
+}
+
+i64 CountOfJobState(const THashMap<EPartitionJobState, i64>& countByJobState, EPartitionJobState jobState)
+{
+    auto it = countByJobState.find(jobState);
+    return it == countByJobState.end() ? 0 : it->second;
+}
+
+TEST_W(TDescribeTest, PartitionsStatsCountByJobState)
+{
+    Prepare();
+    for (const auto& [partitionId, partition] : FlowView->State->ExecutionSpec->Layout->Partitions) {
+        FlowView->Feedback->PartitionJobStatuses[partitionId]->CurrentJobStatus->InitedTime = TInstant::Now();
+    }
+
+    auto statsOf = [&] (const TComputationId& computationId) {
+        auto computations = MakeComputationDescriptions(FlowView, GetComputationPartitionIntermediateDescriptions(FlowView));
+        return GetOrCrash(computations, computationId).PartitionsStats;
+    };
+
+    {
+        auto stats = statsOf(TComputationId("Computation_1"));
+        EXPECT_EQ(stats.Count, 3);
+        EXPECT_EQ(CountOfJobState(stats.CountByJobState, EPartitionJobState::Working), 3);
+    }
+
+    ASSERT_TRUE(StripJobOfSomePartition(FlowView, TComputationId("Computation_1")).has_value());
+
+    {
+        auto stats = statsOf(TComputationId("Computation_1"));
+        auto executingIt = stats.CountByState.find(EPartitionDescribeState::Executing);
+        ASSERT_NE(executingIt, stats.CountByState.end());
+        EXPECT_EQ(executingIt->second, 3)
+            << "Partition state alone still reports every partition as executing, which is why job state is needed";
+        EXPECT_EQ(CountOfJobState(stats.CountByJobState, EPartitionJobState::Working), 2);
+        EXPECT_EQ(CountOfJobState(stats.CountByJobState, EPartitionJobState::Unknown), 1);
+    }
+}
+
+TEST_W(TDescribeTest, WarnsOnPartitionStuckWithoutJob)
+{
+    Prepare();
+
+    auto strandedPartitionId = StripJobOfSomePartition(FlowView, TComputationId("Computation_1"));
+    ASSERT_TRUE(strandedPartitionId.has_value());
+
+    auto describe = [&] {
+        auto computations = MakeComputationDescriptions(FlowView, GetComputationPartitionIntermediateDescriptions(FlowView));
+        return GetOrCrash(computations, TComputationId("Computation_1"));
+    };
+
+    // A partition that has just lost its job is mid-rebalance, not stuck.
+    FlowView->Feedback->UpdateTime = TInstant::Now();
+    FlowView->Feedback->PartitionJobStatuses[*strandedPartitionId]->CurrentJobStatusUpdateTime = FlowView->Feedback->UpdateTime;
+    EXPECT_EQ(describe().Status, ELogLevel::Info);
+
+    // Minutes later it is, and the computation must stop reporting itself as healthy.
+    FlowView->Feedback->PartitionJobStatuses[*strandedPartitionId]->CurrentJobStatusUpdateTime =
+        FlowView->Feedback->UpdateTime - TDuration::Minutes(5);
+    auto description = describe();
+    EXPECT_EQ(description.Status, ELogLevel::Warning)
+        << ConvertToYsonString(description, EYsonFormat::Text).ToString();
+    EXPECT_TRUE(MessagesContain(description.Messages, "have had no job"))
+        << ConvertToYsonString(description.Messages, EYsonFormat::Text).ToString();
 }
 
 TEST_W(TDescribeTest, RegisterStreams)
@@ -823,45 +910,6 @@ TEST_W(TDescribeTest, DescribePipelineNoFlowView)
     EXPECT_THROW(DescribePipeline({.FlowView = nullptr, .Logger = TLogger("test")}), TErrorException);
 }
 
-TEST_W(TDescribeTest, DescribePipelineWarnsOnTooFewWorkers)
-{
-    Prepare();
-
-    // Prepare() registers one worker (WorkerCount == 1) with no declared groups, so it belongs to
-    // the default (empty) worker group, which is also the group used by all computations.
-
-    // Requiring more workers than are available surfaces a top-level error message.
-    DynamicSpec->JobManager->MinimumWorkerCount = 5;
-    FlowView->State->ExecutionSpec->DynamicPipelineSpec->SetValue(DynamicSpec);
-    auto description = DescribeStatus();
-    EXPECT_TRUE(MessagesContain(description.Messages, "Too few workers (Count: 1, Required: 5)"))
-        << "Messages:" << ConvertToYsonString(description.Messages).ToString();
-
-    // When the requirement is met, no such message is emitted.
-    DynamicSpec->JobManager->MinimumWorkerCount = 1;
-    FlowView->State->ExecutionSpec->DynamicPipelineSpec->SetValue(DynamicSpec);
-    description = DescribeStatus();
-    EXPECT_FALSE(MessagesContain(description.Messages, "Too few workers"))
-        << "Messages:" << ConvertToYsonString(description.Messages).ToString();
-
-    // The minimum is enforced per used worker group: pointing a computation at a group with no
-    // workers warns about that group even though the overall worker count is sufficient.
-    Spec->Computations["Computation_1"]->WorkerGroup = TWorkerGroupId("gpu");
-    FlowView->State->ExecutionSpec->PipelineSpec->SetValue(Spec);
-    description = DescribeStatus();
-    EXPECT_TRUE(MessagesContain(description.Messages, "Too few workers in worker group \"gpu\" (Count: 0, Required: 1)"))
-        << "Messages:" << ConvertToYsonString(description.Messages).ToString();
-
-    // A per-group override sets the required count for that group independently of the top-level one.
-    auto gpuOverride = New<TDynamicJobManagerSpec>();
-    gpuOverride->MinimumWorkerCount = 3;
-    DynamicSpec->JobManager->WorkerGroupOverride[TWorkerGroupId("gpu")] = gpuOverride;
-    FlowView->State->ExecutionSpec->DynamicPipelineSpec->SetValue(DynamicSpec);
-    description = DescribeStatus();
-    EXPECT_TRUE(MessagesContain(description.Messages, "Too few workers in worker group \"gpu\" (Count: 0, Required: 3)"))
-        << "Messages:" << ConvertToYsonString(description.Messages).ToString();
-}
-
 TEST_W(TDescribeTest, DescribeComputations)
 {
     Prepare();
@@ -907,6 +955,30 @@ TEST_W(TDescribeTest, DescribeWorker)
     ASSERT_EQ(description.Partitions.size(), 9u);
     EXPECT_GE(description.Messages.size(), 1u);
     EXPECT_GE(description.CpuUsage, 1.0);
+}
+
+TEST_W(TDescribeTest, DescribeWorkerShowsDeployStageLink)
+{
+    Prepare();
+    auto workersDescription = DescribeWorkers(FlowView);
+    ASSERT_EQ(workersDescription.Workers.size(), 1u);
+    auto address = workersDescription.Workers[0].Address;
+
+    auto usefulLinks = [&] (const std::string& deployStageUrl) {
+        auto description = DescribeWorker(FlowView, address, deployStageUrl);
+        for (const auto& message : description.Messages) {
+            if (message.Text == "Useful links" && message.MarkdownText) {
+                return *message.MarkdownText;
+            }
+        }
+        ADD_FAILURE() << "Useful links message not found";
+        return std::string{};
+    };
+
+    EXPECT_THAT(usefulLinks(/*deployStageUrl*/ {}), Not(HasSubstr("Deploy stage pods")));
+
+    const std::string url = "https://deploy.example.com/stages/my-stage/status?tab=pods";
+    EXPECT_THAT(usefulLinks(url), HasSubstr("Deploy stage pods: [" + url + "](" + url + ")"));
 }
 
 TEST_W(TDescribeTest, MakeLinks)
@@ -1024,11 +1096,16 @@ TEST(TRegistryDescribeTraitsTest, DefaultTraitsHighlightYTPaths)
 // Expected execution time is about 10s.
 TEST_W(TDescribeTest, AdequatePerformance)
 {
+    // The full ~10s workload slows down enough under TSAN to trip the 300s TEST_W
+    // watchdog; keep the code paths covered there on a proportionally smaller view.
+    const int scale = NSan::TSanIsOn() ? 10 : 1;
+
     ComputationPrepareSpecs = {};
     for (int i = 0; i < 10; ++i) {
-        ComputationPrepareSpecs.push_back(TComputationPrepareSpec{.PartitionCount = 10000, .WithSource = (i % 2 == 0)});
+        ComputationPrepareSpecs.push_back(
+            TComputationPrepareSpec{.PartitionCount = 10000 / scale, .WithSource = (i % 2 == 0)});
     }
-    WorkerCount = 1000;
+    WorkerCount = 1000 / scale;
 
     Prepare();
 
@@ -1143,6 +1220,43 @@ TEST_W(TDescribeTest, FillPerformanceMessage)
     // SRC_ resolves golden files via the Arcadia source root, which is not available in opensource test runs.
     EXPECT_THAT(*message.MarkdownText, NGTest::GoldenFileEq(SRC_("canondata/fill_performance_message.md")));
 #endif
+}
+
+TEST_W(TDescribeTest, FillPerformanceMessageReportsPartitionsWithoutJobStatus)
+{
+    TExtendedComputationDescription description;
+
+    std::vector<TPartitionIntermediateDescription> intermediateDescriptions;
+    for (int i = 0; i < 3; ++i) {
+        auto& desc = intermediateDescriptions.emplace_back();
+        desc.Partition = New<TPartition>();
+        desc.Partition->PartitionId = TPartitionId(TGuid::FromString(Format("%v-0-0-0", i + 1)));
+        if (i == 2) {
+            // A partition that lost its job reports no buffer usage at all, however backlogged it
+            // is, so it silently drops out of the aggregation below.
+            continue;
+        }
+        desc.PartitionJobStatus = New<TPartitionJobStatus>();
+        desc.PartitionJobStatus->CurrentJobStatus = New<TJobStatus>();
+
+        NFlow::TJobEntityLimitStatus limit;
+        limit.Limit = 100;
+        limit.Used = 10;
+        limit.Pending = 200;
+        // Both sections must be non-empty, so that the note is the one rendered under a real
+        // table rather than the placeholder for a section with no data at all.
+        desc.PartitionJobStatus->CurrentJobStatus->InputLimits["buffer"][TStreamId("stream1")] = limit;
+        desc.PartitionJobStatus->CurrentJobStatus->OutputLimits["buffer"][TStreamId("stream1")] = limit;
+    }
+
+    FillPerformanceMessage(description, intermediateDescriptions);
+
+    ASSERT_EQ(description.Messages.size(), 1u);
+    const auto& message = description.Messages.back();
+    ASSERT_TRUE(message.MarkdownText.has_value());
+    EXPECT_THAT(*message.MarkdownText, HasSubstr("Input Limits (Max by Partition)")) << *message.MarkdownText;
+    EXPECT_THAT(*message.MarkdownText, HasSubstr("1 of 3 partitions have no live job status"))
+        << *message.MarkdownText;
 }
 
 TEST_W(TDescribeTest, FillStreamStateMessage)
@@ -1673,7 +1787,7 @@ TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetNotSet)
 TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetMatching)
 {
     Prepare();
-    FlowView->State->ExecutionSpec->FlowCoreTarget->SetValue(TFlowCoreTarget(GetBinaryChecksum()));
+    FlowView->State->ExecutionSpec->FlowCoreTarget->TrySetValue(TFlowCoreTarget(GetBinaryChecksum()), TestVersionProvider());
 
     auto description = DescribeStatus();
 
@@ -1684,7 +1798,7 @@ TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetMatching)
 TEST_W(TDescribeTest, DescribePipelineShowsControllerCommitInfo)
 {
     Prepare();
-    FlowView->State->ExecutionSpec->FlowCoreTarget->SetValue(TFlowCoreTarget(std::string("mismatched_version")));
+    FlowView->State->ExecutionSpec->FlowCoreTarget->TrySetValue(TFlowCoreTarget(std::string("mismatched_version")), TestVersionProvider());
 
     auto description = DescribeStatus();
     auto contains = [&] (const std::string& text) {
@@ -1725,7 +1839,7 @@ TEST_W(TDescribeTest, DescribePipelineShowsControllerCommitInfo)
 TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetMismatch)
 {
     Prepare();
-    FlowView->State->ExecutionSpec->FlowCoreTarget->SetValue(TFlowCoreTarget(std::string("mismatched_version")));
+    FlowView->State->ExecutionSpec->FlowCoreTarget->TrySetValue(TFlowCoreTarget(std::string("mismatched_version")), TestVersionProvider());
 
     auto description = DescribeStatus();
     auto dump = [&] {
@@ -1749,7 +1863,7 @@ TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetMismatch)
 TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetMismatchedWorkers)
 {
     Prepare();
-    FlowView->State->ExecutionSpec->FlowCoreTarget->SetValue(TFlowCoreTarget(GetBinaryChecksum()));
+    FlowView->State->ExecutionSpec->FlowCoreTarget->TrySetValue(TFlowCoreTarget(GetBinaryChecksum()), TestVersionProvider());
     FlowView->EphemeralState->FlowCoreTargetMismatchedWorkers["old_version_1"] = {
         .ExampleAddress = "worker-old-1.net:81",
         .Count = 1,
@@ -1774,6 +1888,18 @@ TEST_W(TDescribeTest, DescribePipelineShowsFlowCoreTargetMismatchedWorkers)
         }
     }
     EXPECT_TRUE(foundError) << "Worker binary mismatch error message not found";
+}
+
+TEST_W(TDescribeTest, DescribePipelineShowsDeployStageLink)
+{
+    Prepare();
+
+    EXPECT_FALSE(MessagesContain(DescribeStatus().Messages, "Deploy stage:"));
+
+    const std::string url = "https://deploy.example.com/stages/my-stage/status?tab=pods";
+    auto description = DescribeStatus(/*controllerFlowCoreVersion*/ GetBinaryChecksum(), url);
+    EXPECT_TRUE(MessagesContain(description.Messages, "Deploy stage: [" + url + "](" + url + ")"))
+        << "Messages:" << ConvertToYsonString(description.Messages).ToString();
 }
 
 TEST_W(TDescribeTest, DescribeWorkerShowsFlowCoreVersion)

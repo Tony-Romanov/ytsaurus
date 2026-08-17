@@ -993,6 +993,9 @@ private:
 
         auto isForeign = chunk->IsForeign();
 
+        const auto& securityManager = Bootstrap_->GetSecurityManager();
+        auto userNameToForward = securityManager->GetAuthenticatedUserNameToForward();
+
         auto requestAttributeFromAllPeers = [&] (const std::string& attributeSuffix) {
             std::vector<TFuture<TIntrusivePtr<TObjectYPathProxy::TRspGet>>> responseFutures;
             responseFutures.reserve(cellManager->GetTotalPeerCount());
@@ -1003,7 +1006,7 @@ private:
                 // TODO(nadya02): Set the correct timeout here.
                 proxy.SetDefaultTimeout(NRpc::HugeDoNotUseRpcRequestTimeout);
                 auto req = TYPathProxy::Get(FromObjectId(chunk->GetId()) + attributeSuffix);
-                responseFutures.push_back(proxy.Execute(req));
+                responseFutures.push_back(proxy.ExecuteAs(userNameToForward, req));
             }
 
             return responseFutures;
@@ -1013,7 +1016,7 @@ private:
             auto replicatorChannel = chunkManager->GetChunkReplicatorChannelOrThrow(chunk);
             auto proxy = TObjectServiceProxy::FromDirectMasterChannel(std::move(replicatorChannel));
             auto req = TYPathProxy::Get(FromObjectId(chunk->GetId()) + attributeSuffix);
-            return proxy.Execute(req)
+            return proxy.ExecuteAs(userNameToForward, req)
                 .Apply(BIND([] (const TIntrusivePtr<TObjectYPathProxy::TRspGet>& rsp) {
                     return MakeFuture(TYsonString{rsp->value()});
                 }));
@@ -1075,6 +1078,10 @@ private:
                                         .Item("parity_missing").Value(Any(status & EChunkStatus::ParityMissing))
                                         .Item("unsafely_placed").Value(Any(status & EChunkStatus::UnsafelyPlaced))
                                         .Item("temporarily_unavailable").Value(Any(status & EChunkStatus::TemporarilyUnavailable))
+                                        .Item("data_decommissioned").Value(Any(status & EChunkStatus::DataDecommissioned))
+                                        .Item("parity_decommissioned").Value(Any(status & EChunkStatus::ParityDecommissioned))
+                                        .Item("sealed_missing").Value(Any(status & EChunkStatus::SealedMissing))
+                                        .Item("inconsistently_placed").Value(Any(status & EChunkStatus::InconsistentlyPlaced))
                                     .EndMap();
                             });
                     })

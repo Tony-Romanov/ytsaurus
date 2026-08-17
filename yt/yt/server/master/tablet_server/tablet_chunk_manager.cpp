@@ -50,9 +50,8 @@ using namespace NTransactionClient;
 using namespace NTabletClient;
 
 using NChunkClient::NProto::TMiscExt;
-using NTableClient::NProto::THunkChunkRefsExt;
 using NTableClient::NProto::TBoundaryKeysExt;
-
+using NTableClient::NProto::THunkChunkRefsExt;
 using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -286,6 +285,7 @@ public:
         const std::vector<TTabletId>& oldTabletIds,
         const std::vector<TOwningKeyBound>& oldPivotKeyBounds,
         const std::vector<TLegacyOwningKey>& newPivotKeys,
+        const std::vector<i64>& newTabletCumulativeDataWeights,
         const THashSet<TStoreId>& oldEdenStoreIds) override
     {
         const auto& chunkManager = Bootstrap_->GetChunkManager();
@@ -642,12 +642,22 @@ public:
                 objectManager->UnrefObject(newTabletChunkLists[EChunkListContentType::Hunk].back());
                 newTabletChunkLists[EChunkListContentType::Hunk].back() = newLastHunkTabletChunkList;
             } else {
+                YT_VERIFY(
+                    newTabletCumulativeDataWeights.empty() ||
+                    ssize(newTabletCumulativeDataWeights) == newTabletCount - oldTabletCount);
+
                 for (int index = oldTabletCount; index < newTabletCount; ++index) {
                     auto* newMainChunkList = chunkManager->CreateChunkList(EChunkListKind::OrderedDynamicTablet);
                     auto* newHunkChunkList = chunkManager->CreateChunkList(EChunkListKind::Hunk);
 
                     auto* tablet = newTablets[index]->As<TTablet>();
-                    SetLogicalRowCount(newMainChunkList, tablet->GetTrimmedRowCount());
+                    auto cumulativeDataWeight = newTabletCumulativeDataWeights.empty()
+                        ? 0
+                        : newTabletCumulativeDataWeights[index - oldTabletCount];
+                    InitializeOrderedTabletChunkListStatistics(
+                        newMainChunkList,
+                        tablet->GetTrimmedRowCount(),
+                        cumulativeDataWeight);
 
                     newTabletChunkLists[EChunkListContentType::Main].push_back(newMainChunkList);
                     newTabletChunkLists[EChunkListContentType::Hunk].push_back(newHunkChunkList);
@@ -1103,7 +1113,7 @@ public:
             MakeFormattableView(chunksToMarkSealable, TObjectIdFormatter()));
     }
 
-    void MakeTableDynamic(NTableServer::TTableNode* table) override
+    void MakeTableDynamic(NTableServer::TTableNode* table, i64 cumulativeDataWeight) override
     {
         auto* oldChunkList = table->GetChunkList();
         auto* oldHunkChunkList = table->GetHunkChunkList();
@@ -1140,7 +1150,10 @@ public:
             tabletChunkList->SetPivotKey(EmptyKey());
         } else {
             auto* tablet = table->Tablets()[0]->As<TTablet>();
-            SetLogicalRowCount(tabletChunkList, tablet->GetTrimmedRowCount());
+            InitializeOrderedTabletChunkListStatistics(
+                tabletChunkList,
+                tablet->GetTrimmedRowCount(),
+                cumulativeDataWeight);
         }
         chunkManager->AttachToChunkList(newChunkList, {tabletChunkList});
 
@@ -1294,10 +1307,10 @@ public:
                 auto miscExt = chunk->ChunkMeta()->FindExtension<TMiscExt>();
                 if (miscExt) {
                     if (miscExt->has_min_timestamp()) {
-                        minTimestamp = miscExt->min_timestamp();
+                        minTimestamp = FromProto<NTransactionClient::TTimestamp>(miscExt->min_timestamp());
                     }
                     if (miscExt->has_max_timestamp()) {
-                        maxTimestamp = miscExt->max_timestamp();
+                        maxTimestamp = FromProto<NTransactionClient::TTimestamp>(miscExt->max_timestamp());
                     }
                 }
             };
@@ -1550,8 +1563,8 @@ private:
                 "dynamic store %v in tablet %v is not flushed",
                 dynamicStore->GetId(),
                 tablet->GetId())
-                << TErrorAttribute("original_table_path", originalTablePath)
-                << TErrorAttribute("table_id", tablet->GetTable()->GetId());
+                .With("original_table_path", originalTablePath)
+                .With("table_id", tablet->GetTable()->GetId());
         };
 
         auto children = EnumerateStoresInChunkTree(tablet->GetChunkList());
@@ -1587,10 +1600,10 @@ private:
                 "Cannot backup ordered tablet %v since it is trimmed "
                 "beyond cutoff row index",
                 tablet->GetId())
-                << TErrorAttribute("tablet_id", tablet->GetId())
-                << TErrorAttribute("table_id", tablet->GetTable()->GetId())
-                << TErrorAttribute("trimmed_row_count", tablet->GetTrimmedRowCount())
-                << TErrorAttribute("cutoff_row_index", descriptor.CutoffRowIndex);
+                .With("tablet_id", tablet->GetId())
+                .With("table_id", tablet->GetTable()->GetId())
+                .With("trimmed_row_count", tablet->GetTrimmedRowCount())
+                .With("cutoff_row_index", descriptor.CutoffRowIndex);
         }
 
         if (!descriptor.NextDynamicStoreId) {
@@ -1606,8 +1619,8 @@ private:
                             "Cannot backup ordered tablet %v since it is not fully flushed "
                             "and its origin was not mounted during the backup",
                             tablet->GetId())
-                            << TErrorAttribute("tablet_id", tablet->GetId())
-                            << TErrorAttribute("table_id", tablet->GetTable()->GetId());
+                            .With("tablet_id", tablet->GetId())
+                            .With("table_id", tablet->GetTable()->GetId());
                     }
                 }
             }
@@ -1624,13 +1637,13 @@ private:
 
         auto wrapInternalErrorAndLog = [&] (TError innerError) {
             innerError = innerError
-                << TErrorAttribute("table_id", tablet->GetTable()->GetId())
-                << TErrorAttribute("tablet_id", tablet->GetId())
-                << TErrorAttribute("cutoff_row_index", descriptor.CutoffRowIndex)
-                << TErrorAttribute("next_dynamic_store_id", descriptor.NextDynamicStoreId)
-                << TErrorAttribute("cutoff_child_index", cutoffChildIndex);
+                .With("table_id", tablet->GetTable()->GetId())
+                .With("tablet_id", tablet->GetId())
+                .With("cutoff_row_index", descriptor.CutoffRowIndex)
+                .With("next_dynamic_store_id", descriptor.NextDynamicStoreId)
+                .With("cutoff_child_index", cutoffChildIndex);
             auto error = TError("Cannot backup ordered tablet due to an internal error")
-                << innerError;
+                .With(innerError);
             YT_LOG_ALERT(error, "Failed to perform backup cutoff");
             return error;
         };
@@ -1645,7 +1658,7 @@ private:
                 if (cumulativeRowCount > descriptor.CutoffRowIndex) {
                     auto error = TError("Cumulative row count at the cutoff dynamic store "
                         "is greater than expected")
-                        << TErrorAttribute("cumulative_row_count", cumulativeRowCount);
+                        .With("cumulative_row_count", cumulativeRowCount);
                     return wrapInternalErrorAndLog(error);
                 }
 
@@ -1655,7 +1668,7 @@ private:
 
             if (cumulativeRowCount > descriptor.CutoffRowIndex) {
                 auto error = TError("Cumulative row count exceeded cutoff row index")
-                    << TErrorAttribute("cumulative_row_count", cumulativeRowCount);
+                    .With("cumulative_row_count", cumulativeRowCount);
                 return wrapInternalErrorAndLog(error);
             }
 
@@ -1670,7 +1683,7 @@ private:
             !hitDynamicStore)
         {
             auto error = TError("Row count at final cutoff child index does not match cutoff row index")
-                << TErrorAttribute("cumulative_row_count", statistics.GetPreviousSum(cutoffChildIndex).RowCount);
+                .With("cumulative_row_count", statistics.GetPreviousSum(cutoffChildIndex).RowCount);
             return wrapInternalErrorAndLog(error);
         }
 
@@ -2094,8 +2107,8 @@ private:
             auto firstDynamicStore = tabletChunkList->Children()[firstDynamicStoreIndex];
             if (firstDynamicStore->GetId() != storeId) {
                 THROW_ERROR_EXCEPTION("Attempted to flush ordered dynamic store out of order")
-                    << TErrorAttribute("first_dynamic_store_id", firstDynamicStore->GetId())
-                    << TErrorAttribute("flushed_store_id", storeId);
+                    .With("first_dynamic_store_id", firstDynamicStore->GetId())
+                    .With("flushed_store_id", storeId);
             }
         }
     }
@@ -2128,10 +2141,21 @@ private:
         chunkManager->AttachToChunkList(hunkChunkList, hunkChildren);
     }
 
-    void SetLogicalRowCount(TChunkList* chunkList, i64 trimmedRowCount)
+    //! Pretends that the freshly created chunk list of an ordered tablet already had
+    //! |trimmedRowCount| rows, all of which have been trimmed away, of total |cumulativeDataWeight| weight.
+    //! This way row indexes and the $cumulative_data_weight
+    //! column of the tablet start from the given offsets rather than from zero.
+    void InitializeOrderedTabletChunkListStatistics(
+        TChunkList* chunkList,
+        i64 trimmedRowCount,
+        i64 cumulativeDataWeight)
     {
         YT_VERIFY(chunkList->Children().empty());
         YT_VERIFY(!chunkList->IsHunkRelated());
+
+        // NB: Cumulative statistics do not track data weight, so it is enough
+        // to adjust the aggregated statistics of the chunk list.
+        chunkList->Statistics().LogicalDataWeight = cumulativeDataWeight;
 
         if (trimmedRowCount == 0) {
             return;

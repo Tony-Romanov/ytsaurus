@@ -38,6 +38,10 @@
 
 #include <yt/yt/core/logging/log.h>
 
+#include <yt/yt/core/ytree/convert.h>
+#include <yt/yt/core/ytree/node.h>
+#include <yt/yt/core/ytree/ypath_client.h>
+
 #include <yt/yt/core/rpc/helpers.h>
 
 #include <yt/yt/core/misc/finally.h>
@@ -125,10 +129,10 @@ protected:
     }
 
     IBlockDevicePtr CreateDevice(
-        i64 size,
+        i64 deviceSize,
         std::optional<NYPath::TYPath> snapshotPath = {})
     {
-        return CreateDevice(size, GetDeviceChunkList(), std::move(snapshotPath));
+        return CreateDevice(deviceSize, GetDeviceChunkList(), std::move(snapshotPath));
     }
 
     static NYPath::TYPath MakeSnapshotPath()
@@ -137,36 +141,40 @@ protected:
     }
 
     IBlockDevicePtr CreateDevice(
-        i64 size,
+        i64 deviceSize,
         TChunkListId chunkListId,
         std::optional<NYPath::TYPath> snapshotPath = {})
     {
         auto config = New<TJournalBlockDeviceConfig>();
-        config->BlockSize = BlockSize;
-        config->BlockStore->ReplicationFactor = 3;
         // Flush eagerly so the clean (flushed-to-store) read path is exercised quickly.
         config->BlockFlusher->FlushPeriod = TDuration::MilliSeconds(50);
         config->BlockFlusher->DirtyFractionThreshold = 0.0;
+        // One writable chunk, so writes do not scatter across the fan-out at random. Tests that count
+        // a chunk's superseded blocks need every record in the same chunk: a chunk left holding only
+        // superseded blocks is not referenced by the snapshot, so its records vanish from the counts.
+        config->BlockStore->WriteParallelism = 1;
 
-        auto options = New<TJournalBlockDeviceOptions>();
-        options->Size = size;
-        options->Account = NSecurityClient::TmpAccountName;
-        options->MediumName = NChunkClient::DefaultStoreMediumName;
-
-        std::optional<TSnapshotLoadSpec> snapshotReadSpec;
+        TDeviceCreationDescriptor creationDescriptor;
         if (snapshotPath) {
-            snapshotReadSpec = FetchSnapshotLoadSpec(NativeClient_, *snapshotPath);
+            creationDescriptor = TRestoredDeviceCreationDescriptor{.SnapshotPath = *snapshotPath};
+        } else {
+            auto options = New<TJournalBlockDeviceOptions>();
+            options->DeviceSize = deviceSize;
+            options->BlockSize = BlockSize;
+            options->Account = NSecurityClient::TmpAccountName;
+            options->MediumName = NChunkClient::DefaultStoreMediumName;
+            creationDescriptor = TFreshDeviceCreationDescriptor{.Options = std::move(options)};
         }
 
-        auto device = CreateJournalBlockDevice(
+        auto device = WaitFor(CreateJournalBlockDevice(
             NativeClient_,
             "test-device",
             std::move(config),
-            std::move(options),
+            std::move(creationDescriptor),
             Transaction_->GetId(),
             chunkListId,
-            snapshotReadSpec,
-            Logger);
+            Logger))
+            .ValueOrThrow();
         WaitFor(device->Initialize())
             .ThrowOnError();
         return device;
@@ -221,6 +229,12 @@ protected:
             .ThrowOnError();
     }
 
+    void Trim(const IBlockDevicePtr& device, i64 offset, i64 length)
+    {
+        WaitFor(device->Trim(offset, length))
+            .ThrowOnError();
+    }
+
     TSharedRef Read(const IBlockDevicePtr& device, i64 offset, i64 length)
     {
         return WaitFor(device->Read(offset, length))
@@ -235,13 +249,23 @@ protected:
         auto transaction = WaitFor(NativeClient_->StartTransaction(ETransactionType::Master))
             .ValueOrThrow();
 
+        // The geometry is persisted into @device_params, so a device restored from this snapshot
+        // reconstructs it; take it from the device being snapshotted.
+        auto deviceOptions = New<TJournalBlockDeviceOptions>();
+        deviceOptions->DeviceSize = journalDevice->GetTotalSize();
+        deviceOptions->BlockSize = journalDevice->GetBlockSize();
+        deviceOptions->Account = NSecurityClient::TmpAccountName;
+        deviceOptions->MediumName = NChunkClient::DefaultStoreMediumName;
+
         TCreateSnapshotTableOptions createOptions;
         createOptions.TransactionId = transaction->GetId();
-        CreateSnapshotTable(NativeClient_, path, externalCellTag, createOptions);
+        WaitFor(CreateSnapshotTable(NativeClient_, path, externalCellTag, deviceOptions, createOptions))
+            .ThrowOnError();
 
         TFetchSnapshotSaveTableSpecOptions fetchOptions;
         fetchOptions.TransactionId = transaction->GetId();
-        auto saveSpec = FetchSnapshotSaveSpec(NativeClient_, path, fetchOptions);
+        auto saveSpec = WaitFor(FetchSnapshotSaveSpec(NativeClient_, path, fetchOptions))
+            .ValueOrThrow();
 
         WaitFor(journalDevice->SaveSnapshot(saveSpec))
             .ThrowOnError();
@@ -273,6 +297,31 @@ protected:
             }
         }
         return result;
+    }
+
+    struct TRestoredChunkStats
+    {
+        int RestoredChunkCount = 0;
+        i64 TotalWrittenBlockCount = 0;
+        i64 TotalReferencedBlockCount = 0;
+    };
+
+    //! Aggregates the restored (snapshot-owned) chunks' block counts from the device orchid.
+    TRestoredChunkStats GetRestoredChunkStats(const IBlockDevicePtr& device)
+    {
+        auto yson = WaitFor(NYTree::AsyncYPathGet(device->GetOrchidService(), "/chunks"))
+            .ValueOrThrow();
+
+        TRestoredChunkStats stats;
+        for (const auto& [chunkId, node] : NYTree::ConvertToNode(yson)->AsMap()->GetChildren()) {
+            auto map = node->AsMap();
+            if (map->GetChildValueOrThrow<bool>("restored")) {
+                ++stats.RestoredChunkCount;
+                stats.TotalWrittenBlockCount += map->GetChildValueOrThrow<i64>("written_block_count");
+                stats.TotalReferencedBlockCount += map->GetChildValueOrThrow<i64>("referenced_block_count");
+            }
+        }
+        return stats;
     }
 };
 
@@ -412,6 +461,116 @@ TEST_P(TJournalBlockDeviceTest, RejectsOutOfBoundsWrite)
         .ThrowOnError();
 }
 
+TEST_P(TJournalBlockDeviceTest, TrimZeroesBlocks)
+{
+    auto device = CreateDevice(16 * BlockSize);
+    EXPECT_TRUE(device->IsTrimSupported());
+
+    for (int blockIndex = 0; blockIndex < 4; ++blockIndex) {
+        Write(device, blockIndex * BlockSize, MakeRandomBlock(BlockSize));
+    }
+
+    auto block0 = Read(device, 0, BlockSize);
+    auto block3 = Read(device, 3 * BlockSize, BlockSize);
+    Trim(device, BlockSize, 2 * BlockSize);
+
+    ExpectZero(Read(device, BlockSize, 2 * BlockSize));
+    EXPECT_TRUE(TRef::AreBitwiseEqual(Read(device, 0, BlockSize), block0));
+    EXPECT_TRUE(TRef::AreBitwiseEqual(Read(device, 3 * BlockSize, BlockSize), block3));
+
+    auto rewritten = MakeRandomBlock(BlockSize);
+    Write(device, BlockSize, rewritten);
+    EXPECT_TRUE(TRef::AreBitwiseEqual(Read(device, BlockSize, BlockSize), rewritten));
+
+    WaitFor(device->Finalize())
+        .ThrowOnError();
+}
+
+TEST_P(TJournalBlockDeviceTest, TrimAfterFlush)
+{
+    auto device = CreateDevice(16 * BlockSize);
+    auto journalDevice = DynamicPointerCast<IJournalBlockDevice>(device);
+    ASSERT_TRUE(journalDevice);
+
+    // Let the blocks reach the store first, so the trim discards stored (clean) payloads rather than
+    // dirty ones.
+    for (int blockIndex = 0; blockIndex < 4; ++blockIndex) {
+        Write(device, blockIndex * BlockSize, MakeRandomBlock(BlockSize));
+    }
+    WaitFor(journalDevice->FlushBlocks())
+        .ThrowOnError();
+
+    Trim(device, 0, 4 * BlockSize);
+    ExpectZero(Read(device, 0, 4 * BlockSize));
+
+    WaitFor(device->Finalize())
+        .ThrowOnError();
+}
+
+TEST_P(TJournalBlockDeviceTest, TrimSparesPartiallyCoveredBlocks)
+{
+    auto device = CreateDevice(16 * BlockSize);
+
+    for (int blockIndex = 0; blockIndex < 3; ++blockIndex) {
+        Write(device, blockIndex * BlockSize, MakeRandomBlock(BlockSize));
+    }
+    auto block0 = Read(device, 0, BlockSize);
+    auto block2 = Read(device, 2 * BlockSize, BlockSize);
+
+    // The range covers only the tail of block 0 and the head of block 2, so just block 1 is discarded:
+    // a trim may discard less than asked, never more.
+    Trim(device, BlockSize / 2, 2 * BlockSize);
+
+    EXPECT_TRUE(TRef::AreBitwiseEqual(Read(device, 0, BlockSize), block0));
+    ExpectZero(Read(device, BlockSize, BlockSize));
+    EXPECT_TRUE(TRef::AreBitwiseEqual(Read(device, 2 * BlockSize, BlockSize), block2));
+
+    WaitFor(device->Finalize())
+        .ThrowOnError();
+}
+
+TEST_P(TJournalBlockDeviceTest, RejectsOutOfBoundsTrim)
+{
+    auto device = CreateDevice(16 * BlockSize);
+
+    EXPECT_FALSE(WaitFor(device->Trim(16 * BlockSize, BlockSize)).IsOK());
+    EXPECT_FALSE(WaitFor(device->Trim(15 * BlockSize, 2 * BlockSize)).IsOK());
+
+    WaitFor(device->Finalize())
+        .ThrowOnError();
+}
+
+TEST_P(TJournalBlockDeviceTest, TrimmedBlocksAreAbsentFromSnapshot)
+{
+    auto device = CreateDevice(64 * BlockSize);
+
+    std::map<i64, std::string> written;
+    for (int blockIndex : {0, 1, 2, 5, 9}) {
+        auto block = MakeRandomBlock(BlockSize);
+        Write(device, blockIndex * BlockSize, block);
+        written[blockIndex] = std::string(block.ToStringBuf());
+    }
+
+    Trim(device, BlockSize, 2 * BlockSize);
+    written.erase(1);
+    written.erase(2);
+
+    auto journalDevice = DynamicPointerCast<IJournalBlockDevice>(device);
+    ASSERT_TRUE(journalDevice);
+
+    auto path = MakeSnapshotPath();
+    SaveSnapshot(journalDevice, path);
+    EXPECT_EQ(ReadSnapshotTable(path), written);
+
+    WaitFor(device->Finalize())
+        .ThrowOnError();
+    auto restored = CreateDevice(64 * BlockSize, path);
+    ExpectZero(Read(restored, BlockSize, 2 * BlockSize));
+
+    WaitFor(restored->Finalize())
+        .ThrowOnError();
+}
+
 TEST_P(TJournalBlockDeviceTest, SaveSnapshot)
 {
     auto device = CreateDevice(64 * BlockSize);
@@ -491,6 +650,51 @@ TEST_P(TJournalBlockDeviceTest, RestoreFromSnapshot)
             << "mismatch at block " << blockIndex;
     }
     ExpectZero(Read(restored, 3 * BlockSize, BlockSize));
+
+    // The restored chunks recover their written-block counts from the master (no pre-snapshot overwrites
+    // here, so written == the live block count).
+    auto stats = GetRestoredChunkStats(restored);
+    EXPECT_GT(stats.RestoredChunkCount, 0);
+    EXPECT_EQ(stats.TotalReferencedBlockCount, std::ssize(written));
+    EXPECT_EQ(stats.TotalWrittenBlockCount, std::ssize(written));
+
+    WaitFor(restored->Finalize())
+        .ThrowOnError();
+}
+
+TEST_P(TJournalBlockDeviceTest, RestoreRecoversSupersededBlockCount)
+{
+    auto device = CreateDevice(64 * BlockSize);
+    auto journalDevice = DynamicPointerCast<IJournalBlockDevice>(device);
+    ASSERT_TRUE(journalDevice);
+
+    // Write four blocks and let them reach the journal.
+    for (int blockIndex : {0, 1, 2, 3}) {
+        Write(device, blockIndex * BlockSize, MakeRandomBlock(BlockSize));
+    }
+    WaitFor(journalDevice->FlushBlocks())
+        .ThrowOnError();
+
+    // Overwrite three of them. The superseded versions are already in the append-only journal, so they
+    // become garbage there -- counted in written but not referenced.
+    for (int blockIndex : {0, 1, 2}) {
+        Write(device, blockIndex * BlockSize, MakeRandomBlock(BlockSize));
+    }
+    WaitFor(journalDevice->FlushBlocks())
+        .ThrowOnError();
+
+    auto path = MakeSnapshotPath();
+    SaveSnapshot(journalDevice, path);
+    WaitFor(device->Finalize())
+        .ThrowOnError();
+
+    auto restored = CreateDevice(64 * BlockSize, path);
+
+    // Four blocks survive into the snapshot; seven were ever written to it.
+    auto stats = GetRestoredChunkStats(restored);
+    EXPECT_EQ(stats.TotalReferencedBlockCount, 4);
+    EXPECT_EQ(stats.TotalWrittenBlockCount, 7);
+    EXPECT_GT(stats.TotalWrittenBlockCount, stats.TotalReferencedBlockCount);
 
     WaitFor(restored->Finalize())
         .ThrowOnError();

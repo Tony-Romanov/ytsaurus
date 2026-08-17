@@ -9,6 +9,7 @@
 #include "session.h"
 #include "session_manager.h"
 #include "master_connector.h"
+#include "medium_aware_block_cache_manager.h"
 
 #include <yt/yt/server/node/cluster_node/config.h>
 #include <yt/yt/server/node/cluster_node/master_connector.h>
@@ -46,7 +47,7 @@ class TChunkStoreHost
     : public IChunkStoreHost
 {
 public:
-    explicit TChunkStoreHost(NClusterNode::IBootstrapBase* bootstrap)
+    explicit TChunkStoreHost(IBootstrap* bootstrap)
         : Bootstrap_(bootstrap)
     { }
 
@@ -101,6 +102,9 @@ public:
         if (auto blockCache = Bootstrap_->GetBlockCache()) {
             blockCache->RemoveChunkBlocks(chunkId);
         }
+        if (auto manager = Bootstrap_->GetMediumAwareBlockCacheManager()) {
+            manager->RemoveChunkBlocks(chunkId);
+        }
     }
 
     const TFairShareHierarchicalSchedulerPtr<std::string>& GetFairShareHierarchicalScheduler() override
@@ -119,12 +123,12 @@ public:
     }
 
 private:
-    NClusterNode::IBootstrapBase* const Bootstrap_;
+    IBootstrap* const Bootstrap_;
 };
 
 DEFINE_REFCOUNTED_TYPE(TChunkStoreHost)
 
-IChunkStoreHostPtr CreateChunkStoreHost(NClusterNode::IBootstrapBase* bootstrap)
+IChunkStoreHostPtr CreateChunkStoreHost(IBootstrap* bootstrap)
 {
     return New<TChunkStoreHost>(bootstrap);
 }
@@ -185,6 +189,26 @@ void TChunkStore::Shutdown()
     YT_ASSERT_INVOKER_AFFINITY(ControlInvoker_);
 
     Locations_.clear();
+}
+
+void TChunkStore::SetMediumAwareBlockCacheManager(IMediumAwareBlockCacheManagerPtr manager)
+{
+    YT_ASSERT_THREAD_AFFINITY(ControlThread);
+    YT_VERIFY(manager);
+    YT_VERIFY(!MediumAwareBlockCacheManager_);
+
+    MediumAwareBlockCacheManager_ = std::move(manager);
+}
+
+TLocationCountPerMedium TChunkStore::GetLocationCountPerMedium() const
+{
+    YT_ASSERT_THREAD_AFFINITY(ControlThread);
+
+    TLocationCountPerMedium result;
+    for (const auto& location : Locations_) {
+        ++result[location->GetMediumName()];
+    }
+    return result;
 }
 
 void TChunkStore::ReconfigureLocation(const TChunkLocationPtr& location)
@@ -265,14 +289,14 @@ void TChunkStore::RegisterNewChunk(
         auto masterEpoch = ChunkStoreHost_->GetMasterEpoch();
         if (session && masterEpoch != session->GetMasterEpoch()) {
             THROW_ERROR_EXCEPTION("Node has reconnected to master during chunk upload")
-                << TErrorAttribute("session_master_epoch", session->GetMasterEpoch())
-                << TErrorAttribute("current_master_epoch", masterEpoch);
+                .With("session_master_epoch", session->GetMasterEpoch())
+                .With("current_master_epoch", masterEpoch);
         }
 
         if (auto oldChunk = DoFindExistingChunk(chunk).Chunk) {
             THROW_ERROR_EXCEPTION("Attempted to register duplicate chunk")
-                << TErrorAttribute("new_chunk_path", chunk->GetLocation()->GetChunkPath(chunk->GetId()))
-                << TErrorAttribute("old_chunk_path", oldChunk->GetLocation()->GetChunkPath(oldChunk->GetId()));
+                .With("new_chunk_path", chunk->GetLocation()->GetChunkPath(chunk->GetId()))
+                .With("old_chunk_path", oldChunk->GetLocation()->GetChunkPath(oldChunk->GetId()));
         }
 
         // NB: This is multimap.
@@ -333,7 +357,7 @@ IChunkPtr TChunkStore::FindChunk(TChunkId chunkId, int mediumIndex) const
     }
 
     for (auto it = itRange.first; it != itRange.second; ++it) {
-        if (it->second.Chunk->GetLocation()->GetMediumDescriptor()->GetIndex() == mediumIndex) {
+        if (it->second.Chunk->GetLocation()->GetMediumIndex() == mediumIndex) {
             return it->second.Chunk;
         }
     }
@@ -365,7 +389,7 @@ TChunkStore::TChunkEntry TChunkStore::DoUpdateChunk(const IChunkPtr& oldChunk, c
 {
     YT_ASSERT_SPINLOCK_AFFINITY(ChunkMapLock_);
     YT_ASSERT(oldChunk->GetId() == newChunk->GetId());
-    YT_ASSERT(oldChunk->GetLocation()->GetMediumDescriptor()->GetIndex() == newChunk->GetLocation()->GetMediumDescriptor()->GetIndex());
+    YT_ASSERT(oldChunk->GetLocation()->GetMediumIndex() == newChunk->GetLocation()->GetMediumIndex());
 
     auto itRange = ChunkMap_.equal_range(oldChunk->GetId());
     YT_VERIFY(itRange.first != itRange.second);
@@ -520,12 +544,18 @@ void TChunkStore::ChangeLocationMedium(const TChunkLocationPtr& location, int ol
 
     ReconfigureLocation(location);
 
-    auto guard = ReaderGuard(ChunkMapLock_);
-    for (const auto& [chunkId, chunkEntry] : ChunkMap_) {
-        const auto& chunk = chunkEntry.Chunk;
-        if (chunk->GetLocation() == location) {
-            ChunkMediumChanged_.Fire(chunk, oldMediumIndex);
+    {
+        auto guard = ReaderGuard(ChunkMapLock_);
+        for (const auto& [chunkId, chunkEntry] : ChunkMap_) {
+            const auto& chunk = chunkEntry.Chunk;
+            if (chunk->GetLocation() == location) {
+                ChunkMediumChanged_.Fire(chunk, oldMediumIndex);
+            }
         }
+    }
+
+    if (MediumAwareBlockCacheManager_) {
+        MediumAwareBlockCacheManager_->UpdateLocationCountPerMedium(GetLocationCountPerMedium());
     }
 }
 
@@ -879,7 +909,7 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
     int minCount = std::numeric_limits<int>::max();
     for (int index = 0; index < std::ssize(Locations_); ++index) {
         const auto& location = Locations_[index];
-        if (location->GetMediumDescriptor()->GetIndex() != sessionId.MediumIndex) {
+        if (location->GetMediumIndex() != sessionId.MediumIndex) {
             continue;
         }
 
@@ -893,9 +923,9 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
             if (!location->HasEnoughSpace(*options.MinLocationAvailableSpace)) {
                 throttledLocations.push_back(location);
                 throttledLocationErrors.push_back(TError("Session cannot be started due to lack of free space")
-                    << TErrorAttribute("location_id", location->GetId())
-                    << TErrorAttribute("needed_space", *options.MinLocationAvailableSpace)
-                    << TErrorAttribute("available_space", location->GetAvailableSpace()));
+                    .With("location_id", location->GetId())
+                    .With("needed_space", *options.MinLocationAvailableSpace)
+                    .With("available_space", location->GetAvailableSpace()));
                 continue;
             }
         }
@@ -909,9 +939,9 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
             {
                 throttledLocations.push_back(location);
                 throttledLocationErrors.push_back(TError("Session cannot be started due to lack of memory")
-                    << TErrorAttribute("location_id", location->GetId())
-                    << TErrorAttribute("used_memory", usedMemory)
-                    << TErrorAttribute("memory_limit", memoryLimit));
+                    .With("location_id", location->GetId())
+                    .With("used_memory", usedMemory)
+                    .With("memory_limit", memoryLimit));
                 continue;
             }
 
@@ -923,9 +953,9 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
             {
                 throttledLocations.push_back(location);
                 throttledLocationErrors.push_back(TError("Session cannot be started due to lack of memory")
-                    << TErrorAttribute("location_id", location->GetId())
-                    << TErrorAttribute("category_memory_used", trackedMemory)
-                    << TErrorAttribute("category_memory_limit", totalMemoryLimit));
+                    .With("location_id", location->GetId())
+                    .With("category_memory_used", trackedMemory)
+                    .With("category_memory_limit", totalMemoryLimit));
                 continue;
             }
         }
@@ -935,9 +965,9 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
         if (sessionCount >= sessionCountLimit) {
             throttledLocations.push_back(location);
             throttledLocationErrors.push_back(TError("Session cannot be started because of too many concurrent sessions")
-                << TErrorAttribute("location_id", location->GetId())
-                << TErrorAttribute("session_count", sessionCount)
-                << TErrorAttribute("session_count_limit", sessionCountLimit));
+                .With("location_id", location->GetId())
+                .With("session_count", sessionCount)
+                .With("session_count_limit", sessionCountLimit));
             continue;
         }
 
@@ -946,7 +976,7 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
             if (diskThrottlingResult.Enabled || diskThrottlingResult.MemoryOvercommit) {
                 throttledLocations.push_back(location);
                 throttledLocationErrors.push_back(TError("Session cannot be started because of disk throttling")
-                    << diskThrottlingResult.Error);
+                    .With(diskThrottlingResult.Error));
                 continue;
             }
         }
@@ -980,7 +1010,7 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
         auto error = TError(
             NChunkClient::EErrorCode::NoLocationAvailable,
             "No write location is available")
-            << TErrorAttribute("session_id", ToString(sessionId));
+            .With("session_id", ToString(sessionId));
 
         if (!throttledLocations.empty()) {
             auto size = throttledLocations.size();
@@ -1019,7 +1049,7 @@ std::tuple<TStoreLocationPtr, TLockedChunkGuard> TChunkStore::AcquireNewChunkLoc
             location->GetId(),
             location->GetUuid(),
             location->GetIndex(),
-            location->GetMediumDescriptor()->GetIndex(),
+            location->GetMediumIndex(),
             location->GetMediumName());
     }
 

@@ -15,9 +15,8 @@ namespace NYT::NNbd::NJournal {
 
 //! Moves dirty blocks from the pool to the store.
 /*!
- *  Drains the dirty pool down to the configured resident fraction and writes the excess to the
- *  store, keeping several flushes in flight so their store round-trips overlap. Completed flushes
- *  are retired in reservation order.
+ *  Drains the dirty pool down to the configured resident fraction, writing the excess to the store
+ *  one batch at a time.
  *
  *  Thread affinity: any
  */
@@ -27,16 +26,23 @@ struct IBlockFlusher
     //! Starts the periodic flush loop. Subscribe to the signals below before calling this.
     virtual void Start() = 0;
 
-    //! Stops the periodic flush loop. Store writes already in flight are not awaited.
+    //! Stops the periodic flush loop; the dirty pool and any pending flush barrier are failed
+    //! asynchronously. Store writes already in flight are not awaited.
     virtual void Stop() = 0;
 
-    //! Nudges the flusher to run immediately instead of waiting for the next periodic tick; used by
-    //! the write path when the pool fills up.
-    virtual void RequestFlush() = 0;
+    //! Nudges the flusher to run immediately instead of waiting for the next periodic tick. The write
+    //! path calls this after each put, so draining starts as soon as there is excess rather than up to
+    //! a full period later; #force skips the resident-target check for callers that must make progress
+    //! regardless (e.g. a put blocked on a full pool).
+    virtual void RequestFlush(bool force = false) = 0;
 
     //! Nudges the flusher to eagerly drain every block enqueued as of this call, down to the pool's
     //! current tail.
-    virtual void RequestFlushAll() = 0;
+    /*!
+     *  The future is set once every one of them is in the store; it fails if a flush fails or the
+     *  flusher is stopped, and a barrier requested after either is refused outright.
+     */
+    virtual TFuture<void> RequestFlushBarrier() = 0;
 
     //! Fired once per block a flush has durably written to the store, in reservation order.
     /*!
@@ -45,13 +51,6 @@ struct IBlockFlusher
      *  non-blocking.
      */
     DECLARE_INTERFACE_SIGNAL(void(const TDirtyBlockPtr& block, TStoredBlockId storedBlockId), BlockFlushed);
-
-    //! Fired once if flushing fails for good (the store is persistently unwritable).
-    /*!
-     *  The flusher then gives up permanently; the device uses this to fail itself so the error
-     *  surfaces to clients.
-     */
-    DECLARE_INTERFACE_SIGNAL(void(const TError& error), Failed);
 };
 
 DEFINE_REFCOUNTED_TYPE(IBlockFlusher)

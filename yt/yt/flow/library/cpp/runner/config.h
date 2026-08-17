@@ -30,6 +30,9 @@ struct TFlowNodeConfig
     std::optional<std::string> ProxyRole;
 
     NClient::NCache::TClientsCacheConfigPtr ClientsCache;
+    //! Parameters of the root clients cache factory installed by #SetRootClientsCacheFactory();
+    //! ignored by the built-in one.
+    NYTree::INodePtr ClientsCacheFactory;
 
     int RpcPort{};
     int MonitoringPort{};
@@ -60,6 +63,11 @@ struct TFlowNodeConfig
     // Should be disabled whenever computation uses shared objects
     // as it breaks exception handling.
     bool EnablePhdrCache{};
+
+    // Whether to look up porto in the node environment. If porto is found, exports
+    // yt.porto.* sensors of the node's containers; if it is not, no tracker is
+    // created. Set to false to skip the lookup entirely.
+    bool EnablePortoResourceTracker{};
 
     NYT::NHttp::TServerConfigPtr CreateMonitoringHttpServerConfig();
 

@@ -91,7 +91,8 @@ class Clique(object):
     tls_secrets = {}
     sql_udf_path = None
     query_log_table_path = None
-    dictionaries_path = None
+    storage_artifacts_path = None
+    materialized_views_path = None
     election_lock_path = None
 
     def __init__(self, instance_count,
@@ -101,6 +102,7 @@ class Clique(object):
                  alias=None,
                  export_query_log=False,
                  enable_object_repository=True,
+                 remove_storage_artifacts_on_exit=True,
                  **kwargs):
         """
         alias: str
@@ -180,12 +182,24 @@ class Clique(object):
         config["yt"]["user_defined_sql_objects_storage"]["path"] = self.sql_udf_path
         config["yt"]["user_defined_sql_objects_storage"]["enabled"] = True
 
+        self.remove_storage_artifacts_on_exit = remove_storage_artifacts_on_exit
         if enable_object_repository:
             config["yt"]["object_repository"] = dict()
-            self.dictionaries_path = "//sys/strawberry/chyt/{}/storage_artifacts".format(self.alias)
-            config["yt"]["object_repository"]["root_path"] = self.dictionaries_path
-            create("map_node", self.dictionaries_path, recursive=True, ignore_existing=True, attributes={
+            self.storage_artifacts_path = "//sys/strawberry/chyt/{}/storage_artifacts".format(self.alias)
+            self.materialized_views_path = "//sys/strawberry/chyt/{}/materialized_views".format(self.alias)
+            config["yt"]["object_repository"]["root_path"] = self.storage_artifacts_path
+            materialized_views_config = config["yt"].setdefault("materialized_views", {})
+            materialized_views_config.setdefault("root_path", self.materialized_views_path)
+            materialized_views_ace = make_ace(
+                "allow",
+                config["yt"]["user"],
+                ["read", "write", "remove"],
+            )
+            create("map_node", self.storage_artifacts_path, recursive=True, ignore_existing=True, attributes={
                 "acl": [ace],
+            })
+            create("map_node", self.materialized_views_path, recursive=True, ignore_existing=True, attributes={
+                "acl": [ace, materialized_views_ace],
             })
 
         spec = {"pool": None}
@@ -298,7 +312,7 @@ class Clique(object):
 
         self.instance_count = instance_count
 
-        create_access_control_object(name=self.alias, namespace="chyt")
+        create_access_control_object(name=self.alias, namespace="chyt", ignore_existing=True)
 
     def _upload_llvm_symbolizer(self, llvm_symbolizer_path):
         with open(yatest.common.binary_path("contrib/libs/llvm20/tools/llvm-symbolizer/llvm-symbolizer"), 'rb') as f:
@@ -455,11 +469,21 @@ class Clique(object):
         def check_all_instance_pairs():
             clique_size_per_instance = []
             for instance in self.get_active_instances():
-                clique_size = self.make_direct_query(instance, "select count(*) from system.clique", verbose=False)[0][
-                    "count()"
-                ]
+                try:
+                    clique_size = self.make_direct_query(instance, "select count(*) from system.clique", verbose=False)[0][
+                        "count()"
+                    ]
+                except YtError as err:
+                    if not err.contains_code(InstanceUnavailableCode):
+                        raise
+                    # The discovery group is shared between incarnations of a clique with
+                    # the same alias, so it may contain a stale member of a dead instance
+                    # until its lease expires.
+                    return False
                 clique_size_per_instance.append(clique_size)
             # print_debug("Clique sizes over all instances: {}".format(clique_size_per_instance))
+            if not clique_size_per_instance:
+                return False
             return min(clique_size_per_instance) == self.instance_count
 
         wait(check_all_instance_pairs)
@@ -474,8 +498,10 @@ class Clique(object):
 
             if self.sql_udf_path:
                 remove(self.sql_udf_path, recursive=True, force=True)
-            if self.dictionaries_path:
-                remove(self.dictionaries_path, recursive=True, force=True)
+            if self.storage_artifacts_path and self.remove_storage_artifacts_on_exit:
+                remove(self.storage_artifacts_path, recursive=True, force=True)
+            if self.materialized_views_path and self.remove_storage_artifacts_on_exit:
+                remove(self.materialized_views_path, recursive=True, force=True)
 
         except YtError as err:
             print_debug("Error while completing clique operation:", err)

@@ -4510,12 +4510,15 @@ class TestChaos(ChaosTestBase):
         ]
 
         # Trimmed row counts are required for strict row index validation.
+        # Cumulative data weights make the new replicas continue the counter of the old ones
+        # instead of starting it over from zero.
         self._create_replica_tables(
             replicas[-2:],
             new_replica_ids,
             ordered=True,
             schema=schema,
             trimmed_row_counts=[len(values)],
+            cumulative_data_weights=[18],
             tablet_count=1)
 
         self._sync_replication_era(card_id)
@@ -4523,10 +4526,8 @@ class TestChaos(ChaosTestBase):
         values = [{"$tablet_index": 0, "value": str(i)} for i in range(1, 2)]
         insert_rows("//tmp/t", values)
 
-        for replica in replicas[:-2]:
+        for replica in replicas:
             wait(lambda: _check(replica, 36))
-        for replica in replicas[-2:]:
-            wait(lambda: _check(replica, 18))
 
     @authors("osidorkin")
     def test_crt_creation_under_transaction(self):
@@ -6570,6 +6571,7 @@ class TestChaosMetaClusterNativeProxy(TestChaosMetaCluster):
 
         set("//sys/chaos_cell_bundles/c/@metadata_cell_id", cell_id)
         wait(lambda: len(get(f"#{cell_id}/@peers")) != 0)
+        wait(lambda: get(f"#{cell_id}/@peers/0/state") == "leading")
 
         sorted_schema = self._get_schemas_by_name(["sorted_simple"])[0]
         create("chaos_replicated_table", "//tmp/crt", attributes={"chaos_cell_bundle": "c", "schema": sorted_schema})
@@ -7065,18 +7067,11 @@ class TestChaosSingleCluster(ChaosTestBase):
 ##################################################################
 
 
-class TestChaosSingleClusterNativeProxyWithPortals(ChaosTestBase):
+class ChaosSingleClusterNativeProxyBase(ChaosTestBase):
     ENABLE_MULTIDAEMON = True
     NUM_REMOTE_CLUSTERS = 0
     NUM_NODES = 3
     NUM_CHAOS_NODES = 2
-    NUM_SECONDARY_MASTER_CELLS = 3
-
-    MASTER_CELL_DESCRIPTORS = {
-        "11": {"roles": ["cypress_node_host", "chunk_host"]},
-        "12": {"roles": ["cypress_node_host", "chunk_host"]},
-        "13": {"roles": ["chunk_host"]},
-    }
 
     DELTA_DRIVER_CONFIG = {
         "enable_read_from_async_replicas": True,
@@ -7090,11 +7085,14 @@ class TestChaosSingleClusterNativeProxyWithPortals(ChaosTestBase):
         },
     }
 
+    def _create_cross_shard_directory(self):
+        raise NotImplementedError()
+
     @authors("osidorkin")
     def test_move_chaos_replicas_through_portal(self):
         cell_id = self._sync_create_chaos_bundle_and_cell()
         set("//sys/chaos_cell_bundles/c/@metadata_cell_id", cell_id)
-        create("portal_entrance", "//tmp/p", attributes={"exit_cell_tag": 12})
+        self._create_cross_shard_directory()
 
         replicas = [
             {"cluster_name": "primary", "content_type": "data", "mode": "sync", "enabled": True, "replica_path": "//tmp/d1"},
@@ -7126,7 +7124,7 @@ class TestChaosSingleClusterNativeProxyWithPortals(ChaosTestBase):
     def test_move_non_owning_chaos_replicated_table_through_portal(self):
         cell_id = self._sync_create_chaos_bundle_and_cell()
         set("//sys/chaos_cell_bundles/c/@metadata_cell_id", cell_id)
-        create("portal_entrance", "//tmp/p", attributes={"exit_cell_tag": 12})
+        self._create_cross_shard_directory()
 
         replicas = [
             {"cluster_name": "primary", "content_type": "data", "mode": "sync", "enabled": True, "replica_path": "//tmp/d1"},
@@ -7165,6 +7163,38 @@ class TestChaosSingleClusterNativeProxyWithPortals(ChaosTestBase):
 ##################################################################
 
 
+class TestChaosSingleClusterNativeProxyWithPortals(ChaosSingleClusterNativeProxyBase):
+    NUM_SECONDARY_MASTER_CELLS = 3
+
+    MASTER_CELL_DESCRIPTORS = {
+        "11": {"roles": ["cypress_node_host", "chunk_host"]},
+        "12": {"roles": ["cypress_node_host", "chunk_host"]},
+        "13": {"roles": ["chunk_host"]},
+    }
+
+    def _create_cross_shard_directory(self):
+        create("portal_entrance", "//tmp/p", attributes={"exit_cell_tag": 12})
+
+
+class TestChaosSingleClusterNativeProxySequoia(ChaosSingleClusterNativeProxyBase):
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = True
+    NUM_SECONDARY_MASTER_CELLS = 2
+
+    MASTER_CELL_DESCRIPTORS = {
+        "10": {"roles": ["cypress_node_host", "sequoia_node_host"]},
+        "11": {"roles": ["chunk_host", "cypress_node_host"]},
+        "12": {"roles": ["chunk_host", "sequoia_node_host"]},
+    }
+
+    def _create_cross_shard_directory(self):
+        create("map_node", "//tmp/p")
+
+
+##################################################################
+
+
 @pytest.mark.enable_multidaemon
 class TestChaosWriteRetries(WriteRetriesBase, ChaosTestBase):
     NUM_CHAOS_NODES = 2
@@ -7178,11 +7208,13 @@ class TestChaosWriteRetries(WriteRetriesBase, ChaosTestBase):
         },
     }
 
-    def _prepare_test(self, path, failure_probability, retry_count):
+    def _prepare_test(self, path, failure_probability, retry_count, cell_count=4):
         self._configure_retries(failure_probability, retry_count)
 
         replica_path = f"{path}_replica"
+        queue_path = f"{path}_queue"
 
+        self.cell_count = cell_count
         cell_id = self._sync_create_chaos_bundle_and_cell()
         set("//sys/chaos_cell_bundles/c/@metadata_cell_id", cell_id)
 
@@ -7195,17 +7227,17 @@ class TestChaosWriteRetries(WriteRetriesBase, ChaosTestBase):
 
         replicas = [
             {"cluster_name": "primary", "content_type": "data", "mode": "sync", "enabled": True, "replica_path": replica_path},
-            {"cluster_name": "primary", "content_type": "queue", "mode": "sync", "enabled": True, "replica_path": "//tmp/q"},
+            {"cluster_name": "primary", "content_type": "queue", "mode": "sync", "enabled": True, "replica_path": queue_path},
             {"cluster_name": "remote_0", "content_type": "data", "mode": "sync", "enabled": True, "replica_path": replica_path},
-            {"cluster_name": "remote_0", "content_type": "queue", "mode": "sync", "enabled": True, "replica_path": "//tmp/q"}
+            {"cluster_name": "remote_0", "content_type": "queue", "mode": "sync", "enabled": True, "replica_path": queue_path},
         ]
         replica_ids = self._create_chaos_table_replicas(replicas, table_path=path)
-        self._create_replica_tables(replicas, replica_ids, schema=schema, mount_tables=False)
+        self._create_replica_tables(replicas, replica_ids, create_tablet_cells=False, schema=schema, mount_tables=False)
 
-        pivot_keys = [[]] + [[i * 10] for i in range(1, 4)]
+        pivot_keys = [[]] + [[i * 10] for i in range(1, self.cell_count)]
         for driver in self._get_drivers():
             tablet_cell_ids = sync_create_cells(len(pivot_keys), driver=driver)
-            for table in [replica_path, "//tmp/q"]:
+            for table in [replica_path, queue_path]:
                 reshard_table(table, pivot_keys, driver=driver)
                 sync_mount_table(table, target_cell_ids=tablet_cell_ids, driver=driver)
 
@@ -7220,6 +7252,10 @@ class TestChaosWriteRetries(WriteRetriesBase, ChaosTestBase):
 
     def _verify_rows(self, path, rows):
         replica_path = f"{path}_replica"
-        assert lookup_rows(path, [{"key": 10 * i + 1} for i in range(4)]) == rows
-        assert lookup_rows(replica_path, [{"key": 10 * i + 1} for i in range(4)], replica_consistency="sync") == rows
-        assert lookup_rows(replica_path, [{"key": 10 * i + 1} for i in range(4)], replica_consistency="sync", driver=self._get_data_driver()) == rows
+        assert lookup_rows(path, [{"key": 10 * i + 1} for i in range(self.cell_count)]) == rows
+        assert lookup_rows(replica_path, [{"key": 10 * i + 1} for i in range(self.cell_count)], replica_consistency="sync") == rows
+        assert lookup_rows(
+            replica_path,
+            [{"key": 10 * i + 1} for i in range(self.cell_count)],
+            replica_consistency="sync",
+            driver=self._get_data_driver()) == rows

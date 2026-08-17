@@ -1,10 +1,14 @@
 #include "cypress_object_repository.h"
 
+#include "materialized_view_coordinator.h"
+#include "storage_yt_materialized_view.h"
+
 #include "config.h"
 #include "host.h"
 #include "query_context.h"
 
 #include <yt/yt/client/api/cypress_client.h>
+#include <yt/yt/client/api/transaction.h>
 
 #include <yt/yt/core/concurrency/periodic_executor.h>
 
@@ -19,14 +23,78 @@
 
 #include <Interpreters/ExternalDictionariesLoader.h>
 
+#include <Parsers/ParserCreateQuery.h>
+#include <Parsers/parseQuery.h>
+
 namespace NYT::NClickHouseServer {
 
 using namespace NApi;
 using namespace NConcurrency;
+using namespace NCypressClient;
+using namespace NObjectClient;
+using namespace NTransactionClient;
 using namespace NYTree;
 using namespace NYPath;
+using namespace NYson;
 
 constinit const auto Logger = ClickHouseYtLogger;
+
+////////////////////////////////////////////////////////////////////////////////
+
+namespace {
+
+struct TPersistedMaterializedViewConfiguration
+    : public TYsonStruct
+{
+    std::string CreateStatement;
+    TYPath SourcePath;
+    TYPath TargetPath;
+    std::string Creator;
+    TObjectId SourceObjectId;
+    TObjectId TargetObjectId;
+
+    REGISTER_YSON_STRUCT(TPersistedMaterializedViewConfiguration);
+
+    static void Register(TRegistrar registrar)
+    {
+        registrar.Parameter("create_statement", &TThis::CreateStatement);
+        registrar.Parameter("source_path", &TThis::SourcePath);
+        registrar.Parameter("target_path", &TThis::TargetPath);
+        registrar.Parameter("creator", &TThis::Creator);
+        registrar.Parameter("source_object_id", &TThis::SourceObjectId);
+        registrar.Parameter("target_object_id", &TThis::TargetObjectId);
+    }
+};
+
+DEFINE_REFCOUNTED_TYPE(TPersistedMaterializedViewConfiguration)
+using TPersistedMaterializedViewConfigurationPtr = TIntrusivePtr<TPersistedMaterializedViewConfiguration>;
+
+DB::ASTPtr ParseMaterializedViewStatement(const std::string& statement)
+{
+    DB::ParserCreateQuery parser;
+    std::string errorMessage;
+    const char* data = statement.data();
+    auto ast = tryParseQuery(
+        parser,
+        data,
+        data + statement.size(),
+        errorMessage,
+        /*hilite*/ false,
+        "(n/a)",
+        /*allow_multi_statements*/ false,
+        /*max_query_size*/ 0,
+        DB::DBMS_DEFAULT_MAX_PARSER_DEPTH,
+        DB::DBMS_DEFAULT_MAX_PARSER_BACKTRACKS,
+        /*skip_insignificant*/ true);
+
+    if (!ast) {
+        THROW_ERROR_EXCEPTION("Error while parsing materialized view statement: %v", errorMessage);
+    }
+
+    return ast;
+}
+
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -73,13 +141,34 @@ struct TCypressObjectRepository::TObjectSnapshot
 {
     struct TEntry
     {
-        std::string Type;
+        ERepositoryObjectType Type;
         std::string Value;
+        TObjectId ObjectId;
         DBPoco::Timestamp UpdateTime;
+        NHydra::TRevision Revision;
     };
 
     THashMap<std::string, TEntry> Entries;
     std::set<std::string> DictionaryNames;
+
+    static TCypressObjectRepository::TMaterializedView BuildMaterializedView(
+        const std::string& objectName,
+        const TEntry& entry)
+    {
+        auto config = ConvertTo<TPersistedMaterializedViewConfigurationPtr>(TYsonString(entry.Value));
+
+        return {
+            .CreateQuery = ParseMaterializedViewStatement(config->CreateStatement),
+            .SourcePath = config->SourcePath,
+            .TargetPath = config->TargetPath,
+            .Creator = config->Creator,
+            .ObjectName = objectName,
+            .ObjectId = entry.ObjectId,
+            .SourceObjectId = config->SourceObjectId,
+            .TargetObjectId = config->TargetObjectId,
+            .Revision = entry.Revision,
+        };
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -110,7 +199,14 @@ TCypressObjectRepository::TObjectSnapshotPtr TCypressObjectRepository::GetSnapsh
 TCypressObjectRepository::TObjectSnapshotPtr TCypressObjectRepository::BuildSnapshot()
 {
     TListNodeOptions options;
-    options.Attributes = {"key", "value", "modification_time", "chyt_object_type"};
+    options.Attributes = {
+        "id",
+        "key",
+        "value",
+        "modification_time",
+        "revision",
+        "chyt_object_type",
+    };
 
     auto listYson = WaitFor(Client_->ListNode(RootPath_, options))
         .ValueOrThrow();
@@ -123,28 +219,30 @@ TCypressObjectRepository::TObjectSnapshotPtr TCypressObjectRepository::BuildSnap
 
         auto value = attributes.Find<std::string>("value");
         if (!value) {
-            YT_LOG_WARNING("Clique object node is missing \"value\" attribute, skipping (Name: %v)",
-                name);
+            YT_TLOG_WARNING("Clique object node is missing \"value\" attribute, skipping")
+                .With("Name", name);
             continue;
         }
 
         TObjectSnapshot::TEntry entry;
         // COMPAT(buyval01): Documents without the type attribute are dictionaries.
-        entry.Type = attributes.Find<std::string>("chyt_object_type").value_or(DictionaryObjectType);
+        entry.Type = attributes.Find<ERepositoryObjectType>("chyt_object_type").value_or(ERepositoryObjectType::Dictionary);
         entry.Value = std::move(*value);
+        entry.ObjectId = attributes.Get<TObjectId>("id");
+        entry.Revision = attributes.Get<NHydra::TRevision>("revision");
         if (auto modificationTime = attributes.Find<TInstant>("modification_time")) {
             entry.UpdateTime = DBPoco::Timestamp::fromEpochTime(modificationTime->TimeT());
         }
 
-        if (entry.Type == DictionaryObjectType) {
+        if (entry.Type == ERepositoryObjectType::Dictionary) {
             snapshot->DictionaryNames.insert(name);
         }
         snapshot->Entries.emplace(std::move(name), std::move(entry));
     }
 
-    YT_LOG_DEBUG("Cypress object snapshot built (RootPath: %v, ObjectCount: %v)",
-        RootPath_,
-        snapshot->Entries.size());
+    YT_TLOG_DEBUG("Cypress object snapshot built")
+        .With("RootPath", RootPath_)
+        .With("ObjectCount", snapshot->Entries.size());
 
     return snapshot;
 }
@@ -156,8 +254,9 @@ void TCypressObjectRepository::RefreshSnapshot()
         auto guard = WriterGuard(SnapshotLock_);
         Snapshot_ = std::move(snapshot);
     } catch (const std::exception& ex) {
-        YT_LOG_WARNING(ex, "Failed to refresh Cypress object snapshot (RootPath: %v)",
-            RootPath_);
+        YT_TLOG_WARNING("Failed to refresh Cypress object snapshot")
+            .With("RootPath", RootPath_)
+            .With(TError(ex));
     }
 }
 
@@ -178,9 +277,8 @@ bool TCypressObjectRepository::DictionaryExists(const std::string& dictionaryNam
 std::optional<DBPoco::Timestamp> TCypressObjectRepository::GetDictionaryUpdateTime(const std::string& dictionaryName)
 {
     if (auto snapshot = GetSnapshot()) {
-        if (auto it = snapshot->Entries.find(dictionaryName);
-            it != snapshot->Entries.end() && it->second.Type == DictionaryObjectType)
-        {
+        auto it = snapshot->Entries.find(dictionaryName);
+        if (it != snapshot->Entries.end() && it->second.Type == ERepositoryObjectType::Dictionary) {
             return it->second.UpdateTime;
         }
     }
@@ -194,7 +292,7 @@ DB::LoadablesConfigurationPtr TCypressObjectRepository::LoadDictionary(const std
         THROW_ERROR_EXCEPTION("Cypress object snapshot is not ready yet");
     }
     auto it = snapshot->Entries.find(dictionaryName);
-    if (it == snapshot->Entries.end() || it->second.Type != DictionaryObjectType) {
+    if (it == snapshot->Entries.end() || it->second.Type != ERepositoryObjectType::Dictionary) {
         THROW_ERROR_EXCEPTION("Dictionary %Qv is not found in Cypress object repository", dictionaryName);
     }
 
@@ -203,6 +301,30 @@ DB::LoadablesConfigurationPtr TCypressObjectRepository::LoadDictionary(const std
     DBPoco::AutoPtr<DBPoco::Util::XMLConfiguration> config(new DBPoco::Util::XMLConfiguration);
     config->load(configStream);
     return config;
+}
+
+std::optional<NHydra::TRevision> TCypressObjectRepository::TryGetDictionaryRevision(const DB::StorageID& storageId)
+{
+    auto objectName = GetObjectName(storageId);
+    if (auto snapshot = GetSnapshot()) {
+        auto it = snapshot->Entries.find(objectName);
+        if (it != snapshot->Entries.end() && it->second.Type == ERepositoryObjectType::Dictionary) {
+            return it->second.Revision;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<TCypressObjectRepository::TMaterializedView> TCypressObjectRepository::TryGetMaterializedView(const DB::StorageID& storageId)
+{
+    auto objectName = GetObjectName(storageId);
+    if (auto snapshot = GetSnapshot()) {
+        auto it = snapshot->Entries.find(objectName);
+        if (it != snapshot->Entries.end() && it->second.Type == ERepositoryObjectType::MaterializedView) {
+            return TObjectSnapshot::BuildMaterializedView(objectName, it->second);
+        }
+    }
+    return std::nullopt;
 }
 
 void TCypressObjectRepository::WriteDictionary(
@@ -215,7 +337,7 @@ void TCypressObjectRepository::WriteDictionary(
     const auto* host = queryContext->Host;
     host->ValidateCliquePermission(TString(context->getClientInfo().initial_user), EPermission::Manage);
 
-    auto configName = storageId.table_name;
+    auto configName = GetObjectName(storageId);
 
     std::stringstream parsedConfigStream;
     config.cast<DBPoco::Util::XMLConfiguration>()->save(parsedConfigStream);
@@ -223,11 +345,11 @@ void TCypressObjectRepository::WriteDictionary(
     NApi::TCreateNodeOptions options;
     options.Attributes = CreateEphemeralAttributes();
     options.Attributes->Set("value", parsedConfigStream.str());
-    options.Attributes->Set("chyt_object_type", DictionaryObjectType);
+    options.Attributes->Set("chyt_object_type", ERepositoryObjectType::Dictionary);
 
     auto resultOrError = WaitFor(client->CreateNode(path, NCypressClient::EObjectType::Document, options));
     if (!resultOrError.IsOK()) {
-        THROW_ERROR_EXCEPTION("Error while writing dictionary %Qv", configName) << resultOrError;
+        THROW_ERROR_EXCEPTION("Error while writing dictionary %Qv", configName).With(resultOrError);
     }
 
     RefreshSnapshot();
@@ -235,31 +357,143 @@ void TCypressObjectRepository::WriteDictionary(
     host->ReloadDictionaryGlobally(configName);
 }
 
-void TCypressObjectRepository::DeleteDictionary(
+void TCypressObjectRepository::WriteMaterializedView(
     const DB::ContextPtr& context,
-    const DB::StorageID& storageId)
+    const DB::StorageID& storageId,
+    const TMaterializedViewConfiguration& config)
 {
     const auto* queryContext = GetQueryContext(context);
     const auto& client = queryContext->Client();
     const auto* host = queryContext->Host;
     host->ValidateCliquePermission(context->getClientInfo().initial_user, EPermission::Manage);
 
-    const auto& externalDictionariesLoader = context->getExternalDictionariesLoader();
-    if (!externalDictionariesLoader.has(storageId.getInternalDictionaryName())) {
-        return;
+    auto objectName = GetObjectName(storageId);
+
+    auto persistedConfig = New<TPersistedMaterializedViewConfiguration>();
+    persistedConfig->CreateStatement = config.CreateStatement;
+    persistedConfig->SourcePath = config.SourcePath;
+    persistedConfig->TargetPath = config.TargetPath;
+    persistedConfig->Creator = context->getClientInfo().initial_user;
+    persistedConfig->SourceObjectId = config.SourceObjectId;
+    persistedConfig->TargetObjectId = config.TargetObjectId;
+
+    TCreateNodeOptions options;
+    options.Attributes = CreateEphemeralAttributes();
+    options.Attributes->Set("value", ConvertToYsonString(persistedConfig, EYsonFormat::Text).ToString());
+    options.Attributes->Set("chyt_object_type", ERepositoryObjectType::MaterializedView);
+
+    auto transaction = WaitFor(client->StartTransaction(ETransactionType::Master))
+        .ValueOrThrow();
+    try {
+        auto resultOrError = WaitFor(transaction->CreateNode(
+            GetObjectPath(objectName),
+            EObjectType::Document,
+            options));
+        if (!resultOrError.IsOK()) {
+            THROW_ERROR_EXCEPTION("Error while writing materialized view %Qv", storageId.getFullTableName())
+                .With(resultOrError);
+        }
+
+        host->GetMaterializedViewCoordinator()->InitializeProgress(
+            transaction,
+            resultOrError.Value(),
+            config.SourceObjectId);
+        WaitFor(transaction->Commit()).ThrowOnError();
+    } catch (const std::exception&) {
+        auto abortError = WaitFor(transaction->Abort());
+        if (!abortError.IsOK()) {
+            YT_TLOG_WARNING("Failed to abort materialized view creation transaction")
+                .With("View", storageId.getFullTableName())
+                .With(abortError);
+        }
+        throw;
     }
 
-    auto path = GetObjectPath(storageId.table_name);
-    auto resultOrError = WaitFor(client->RemoveNode(path));
-    if (!resultOrError.IsOK()) {
-        THROW_ERROR_EXCEPTION("Error while deleting dictionary %Qv", storageId.table_name) << resultOrError;
+    RefreshSnapshot();
+
+    host->RefreshCypressObjectRepositoryGlobally();
+}
+
+void TCypressObjectRepository::DeleteObject(
+    const DB::ContextPtr& context,
+    const TRepositoryObjectDescriptor& objectDescriptor)
+{
+    auto objectName = GetObjectName(objectDescriptor.StorageId);
+    if (objectDescriptor.Type == ERepositoryObjectType::Dictionary) {
+        DeleteDictionary(context, objectName, objectDescriptor.Revision);
+    } else if (objectDescriptor.Type == ERepositoryObjectType::MaterializedView) {
+        DeleteMaterializedView(context, objectName, objectDescriptor.Revision);
     }
+}
+
+void TCypressObjectRepository::DeleteDictionary(
+    const DB::ContextPtr& context,
+    const std::string& objectName,
+    NHydra::TRevision revision)
+{
+    const auto* queryContext = GetQueryContext(context);
+    const auto& client = queryContext->Client();
+    const auto* host = queryContext->Host;
+    host->ValidateCliquePermission(context->getClientInfo().initial_user, EPermission::Manage);
+
+    RemoveObject(client, objectName, revision);
 
     RefreshSnapshot();
 
     // Global reload may fail, but eventually all instances will notice that the dictionary has been deleted
     // due to periodic updates to ExternalLoader.
-    host->ReloadDictionaryGlobally(storageId.table_name);
+    host->ReloadDictionaryGlobally(objectName);
+}
+
+std::vector<TCypressObjectRepository::TMaterializedView> TCypressObjectRepository::GetAllMaterializedViews()
+{
+    std::vector<TMaterializedView> result;
+    if (auto snapshot = GetSnapshot()) {
+        for (const auto& [objectName, entry] : snapshot->Entries) {
+            if (entry.Type != ERepositoryObjectType::MaterializedView) {
+                continue;
+            }
+            auto view = TObjectSnapshot::BuildMaterializedView(objectName, entry);
+            result.push_back(std::move(view));
+        }
+    }
+    return result;
+}
+
+void TCypressObjectRepository::DeleteMaterializedView(
+    const DB::ContextPtr& context,
+    const std::string& objectName,
+    NHydra::TRevision revision)
+{
+    const auto* queryContext = GetQueryContext(context);
+    const auto& client = queryContext->Client();
+    const auto* host = queryContext->Host;
+    host->ValidateCliquePermission(context->getClientInfo().initial_user, EPermission::Manage);
+
+    RemoveObject(client, objectName, revision);
+
+    RefreshSnapshot();
+
+    host->RefreshCypressObjectRepositoryGlobally();
+}
+
+void TCypressObjectRepository::RemoveObject(
+    const IClientPtr& client,
+    const std::string& objectName,
+    NHydra::TRevision revision)
+{
+    auto path = GetObjectPath(objectName);
+    TRemoveNodeOptions options;
+    auto prerequisite = New<TPrerequisiteRevisionConfig>();
+    prerequisite->Path = path;
+    prerequisite->Revision = revision;
+    options.PrerequisiteRevisions.push_back(std::move(prerequisite));
+
+    auto resultOrError = WaitFor(client->RemoveNode(path, options));
+    if (!resultOrError.IsOK()) {
+        THROW_ERROR_EXCEPTION("Failed to remove clique object %Qv due to concurrent object overwrite", objectName)
+            .With(resultOrError);
+    }
 }
 
 TYPath TCypressObjectRepository::GetObjectPath(const std::string& objectName) const
@@ -267,8 +501,12 @@ TYPath TCypressObjectRepository::GetObjectPath(const std::string& objectName) co
     return TYPath(Format("%v/%v", RootPath_, ToYPathLiteral(objectName)));
 }
 
+std::string TCypressObjectRepository::GetObjectName(const DB::StorageID& storageId)
+{
+    return storageId.getFullTableName();
+}
+
 const std::string TCypressObjectRepository::CypressConfigRepositoryName = "YT_Cypress";
-const std::string TCypressObjectRepository::DictionaryObjectType = "dictionary";
 
 ////////////////////////////////////////////////////////////////////////////////
 

@@ -1325,6 +1325,12 @@ class TestMultipleAgents(TestQueueAgentBase):
             "lock_acquisition_period": 100,
             "leader_cache_update_period": 100,
         },
+        "multi_consumer_names_garbage_collector_election_manager": {
+            "transaction_timeout": 5000,
+            "transaction_ping_period": 100,
+            "lock_acquisition_period": 100,
+            "leader_cache_update_period": 100,
+        },
     }
 
     DELTA_QUEUE_AGENT_DYNAMIC_CONFIG = {
@@ -1731,6 +1737,11 @@ class TestOrchid(TestMultipleAgents):
 class TestMasterIntegration(TestQueueAgentBase):
     DELTA_QUEUE_AGENT_CONFIG = {
         "election_manager": {
+            "transaction_timeout": 5000,
+            "transaction_ping_period": 100,
+            "lock_acquisition_period": 100,
+        },
+        "multi_consumer_names_garbage_collector_election_manager": {
             "transaction_timeout": 5000,
             "transaction_ping_period": 100,
             "lock_acquisition_period": 100,
@@ -3251,6 +3262,14 @@ class TestDynamicConfig(TestQueueAgentBase):
 
 class TestQueueStaticExportBase(TestQueueAgentBase, QueueStaticExportHelpers):
     NUM_SECONDARY_MASTER_CELLS = 2
+    DELTA_QUEUE_AGENT_CONFIG = {
+        "multi_consumer_names_garbage_collector_election_manager": {
+            "transaction_timeout": 5000,
+            "transaction_ping_period": 100,
+            "lock_acquisition_period": 100,
+            "leader_cache_update_period": 100,
+        },
+    }
     DELTA_QUEUE_AGENT_DYNAMIC_CONFIG = {
         "cypress_synchronizer": {
             "policy": "watching",
@@ -3490,6 +3509,12 @@ class TestQueueStaticExportUser(TestQueueStaticExportBase):
             "lock_acquisition_period": 100,
             "leader_cache_update_period": 100,
         },
+        "multi_consumer_names_garbage_collector_election_manager": {
+            "transaction_timeout": 5000,
+            "transaction_ping_period": 100,
+            "lock_acquisition_period": 100,
+            "leader_cache_update_period": 100,
+        },
     }
 
     QUEUE_AGENT_CUSTOM_USER = "queue_agent_custom"
@@ -3591,7 +3616,10 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
     @authors("cherepashka", "achulkov2", "nadya73")
     @pytest.mark.parametrize("queue_external_cell_tag", [10, 11, 12])
     def test_multicell_export(self, queue_external_cell_tag):
-        if getattr(self, "ENABLE_TMP_PORTAL", False) and queue_external_cell_tag == 10:
+        if (
+            getattr(self, "ENABLE_TMP_PORTAL", False) or
+            getattr(self, "USE_SEQUOIA", False)
+        ) and queue_external_cell_tag == 10:
             pytest.skip()
 
         queue_agent_orchid = QueueAgentOrchid()
@@ -4154,7 +4182,7 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
             "default": {
                 "export_directory": export_dir,
                 "export_period": 3 * 1000,
-                "export_ttl":  3 * 1000,
+                "export_ttl": 6 * 1000,
             }
         })
 
@@ -4164,9 +4192,8 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
         # Something should be exported.
         wait(lambda: len(ls(export_dir)) == 1)
 
-        # And then deleted after 3 seconds (sleeping for 4 just in case).
-        time.sleep(4)
-        assert len(ls(export_dir)) == 0
+        # And then deleted.
+        wait(lambda: len(ls(export_dir)) == 0)
 
         self.remove_export_destination(export_dir)
 
@@ -4358,6 +4385,7 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
             pytest.skip()
 
         queue_agent_orchid = QueueAgentOrchid()
+        export_task_wait_timeout = 10 if getattr(self, "USE_SEQUOIA", False) else 5
 
         queue_path = self.create_queue_path()
         export_dir = queue_path + "-export"
@@ -4400,7 +4428,7 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
             "queue_agent_queue_controller_static_export_failed",
             text=f"Node {export_dir}/{exported_table_names[0]} already exist",
             attributes={"export_name": "default"}
-        ), timeout=5, ignore_exceptions=True)
+        ), timeout=export_task_wait_timeout, ignore_exceptions=True)
 
         export_progress = get(f"{export_dir}/@queue_static_export_progress")
         export_task_instant = datetime.datetime.fromisoformat(export_progress["last_export_task_instant"])
@@ -4418,7 +4446,7 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
             "queue_agent_queue_controller_static_export_failed",
             text=f"Node {export_dir}/{exported_table_names[1]} already exist",
             attributes={"export_name": "default"}
-        ), timeout=5, ignore_exceptions=True)
+        ), timeout=export_task_wait_timeout, ignore_exceptions=True)
 
         export_progress = get(f"{export_dir}/@queue_static_export_progress")
         new_export_task_instant = datetime.datetime.fromisoformat(export_progress["last_export_task_instant"])
@@ -4438,7 +4466,7 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
         remove(f"{export_dir}/{exported_table_names[1]}")
         remove(f"{export_dir}/{exported_table_names[0]}")
 
-        wait(lambda: len(queue_agent_orchid.get_queue_orchid(f"primary:{queue_path}").get_alerts()) == 0, timeout=5)
+        wait(lambda: len(queue_agent_orchid.get_queue_orchid(f"primary:{queue_path}").get_alerts()) == 0, timeout=export_task_wait_timeout)
 
         export_progress = get(f"{export_dir}/@queue_static_export_progress")
         new_export_task_instant = datetime.datetime.fromisoformat(export_progress["last_export_task_instant"])
@@ -4446,9 +4474,7 @@ class TestQueueStaticExport(TestQueueStaticExportBase):
 
         assert new_export_task_instant > export_task_instant
         assert new_last_successful_export_task_instant > last_successful_export_task_instant
-        last_successful_export_task_instant = new_last_successful_export_task_instant
-
-        assert (datetime.datetime.now(pytz.UTC) - last_successful_export_task_instant).seconds <= 2
+        assert new_export_task_instant == new_last_successful_export_task_instant
 
         # At this point there should be 2 exported tables from exported_table_names and nothing else in the export directory
         assert len(exported_table_names) == 2
@@ -4625,10 +4651,12 @@ class TestQueueStaticExportOldImpl(TestQueueStaticExport):
 
         self._create_export_destination(export_dir, queue_id)
 
+        export_period_seconds = 5
         set(f"{queue_path}/@static_export_config", {
             "default": {
                 "export_directory": export_dir,
-                "export_period": 2 * 1000,
+                # Keep the period above the expected duration of a Sequoia export iteration.
+                "export_period": export_period_seconds * 1000,
             },
         })
 
@@ -4643,8 +4671,16 @@ class TestQueueStaticExportOldImpl(TestQueueStaticExport):
         assert last_exported_fragment_iteration_instant == last_successful_export_iteration_instant
 
         previous_exported_fragment_iteration_instant = last_exported_fragment_iteration_instant
+        successful_export_iteration_instants = [last_successful_export_iteration_instant]
 
-        time.sleep(10)
+        def has_two_more_successful_export_iterations():
+            current_instant = datetime.datetime.fromisoformat(
+                get(f"{export_dir}/@queue_static_export_progress")["last_successful_export_iteration_instant"])
+            if current_instant > successful_export_iteration_instants[-1]:
+                successful_export_iteration_instants.append(current_instant)
+            return len(successful_export_iteration_instants) >= 3
+
+        wait(has_two_more_successful_export_iterations, timeout=3 * export_period_seconds)
 
         export_progress = get(f"{export_dir}/@queue_static_export_progress")
         last_exported_fragment_iteration_instant = datetime.datetime.fromisoformat(export_progress["last_exported_fragment_iteration_instant"])
@@ -4652,10 +4688,6 @@ class TestQueueStaticExportOldImpl(TestQueueStaticExport):
 
         assert last_exported_fragment_iteration_instant == previous_exported_fragment_iteration_instant
         assert last_exported_fragment_iteration_instant < last_successful_export_iteration_instant
-
-        # 2-second exports, comparing to 3 to account for edge-cases.
-        # time.sleep(10) above should be enough to check the required behavior.
-        assert (datetime.datetime.now(pytz.UTC) - last_successful_export_iteration_instant).seconds <= 3
 
         self.remove_export_destination(export_dir)
 
@@ -5522,43 +5554,74 @@ class TestAutomaticTrimmingWithExportsOldImpl(TestAutomaticTrimmingWithExports):
     ENABLE_MULTIDAEMON = True
 
 
-class TestQueueStaticExportPortals(TestQueueStaticExport):
+class QueueStaticExportCrossCellBase(TestQueueStaticExport):
+    QUEUE_PATH = None
+    EXPORT_DIR = None
+
+    @authors("achulkov2", "nadya73")
+    def test_different_native_cells(self):
+        _, queue_id = self._create_queue(self.QUEUE_PATH)
+
+        self._create_export_destination(self.EXPORT_DIR, queue_id)
+
+        assert get(f"{self.EXPORT_DIR}/@native_cell_tag") != get(f"{self.QUEUE_PATH}/@native_cell_tag")
+
+        insert_rows(self.QUEUE_PATH, [{"$tablet_index": 0, "data": "foo"}] * 6)
+        self._flush_table(self.QUEUE_PATH)
+
+        set(f"{self.QUEUE_PATH}/@static_export_config", {
+            "default": {
+                "export_directory": self.EXPORT_DIR,
+                "export_period": 3 * 1000,
+            }
+        })
+
+        wait(lambda: len(ls(self.EXPORT_DIR)) == 1)
+        self._check_export(self.EXPORT_DIR, [["foo"] * 6])
+
+        self.remove_export_destination(self.EXPORT_DIR)
+
+
+class TestQueueStaticExportPortals(QueueStaticExportCrossCellBase):
     ENABLE_TMP_PORTAL = True
 
     ENABLE_MULTIDAEMON = True
+
+    QUEUE_PATH = "//portals/q"
+    EXPORT_DIR = "//tmp/export"
 
     MASTER_CELL_DESCRIPTORS = {
         "11": {"roles": ["chunk_host", "cypress_node_host"]},
         "12": {"roles": ["chunk_host"]},
     }
 
-    @authors("achulkov2", "nadya73")
-    def test_different_native_cells(self):
-        _, queue_id = self._create_queue("//portals/q")
-
-        export_dir = "//tmp/export"
-        self._create_export_destination(export_dir, queue_id)
-
-        assert get(f"{export_dir}/@native_cell_tag") != get("//portals/q/@native_cell_tag")
-
-        insert_rows("//portals/q", [{"$tablet_index": 0, "data": "foo"}] * 6)
-        self._flush_table("//portals/q")
-
-        set("//portals/q/@static_export_config", {
-            "default": {
-                "export_directory": export_dir,
-                "export_period": 3 * 1000,
-            }
-        })
-
-        wait(lambda: len(ls(export_dir)) == 1)
-        self._check_export(export_dir, [["foo"] * 6])
-
-        self.remove_export_destination(export_dir)
-
 
 # COMPAT(apachee): Same tests, but use old implementation.
 class TestQueueStaticExportPortalsOldImpl(TestQueueStaticExportOldImpl, TestQueueStaticExportPortals):
+    USE_OLD_QUEUE_EXPORTER_IMPL = True
+
+    ENABLE_MULTIDAEMON = True
+
+
+class TestQueueStaticExportSequoia(QueueStaticExportCrossCellBase):
+    ENABLE_MULTIDAEMON = True
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_GROUND_TABLE_MOUNT_CACHE = False
+    ENABLE_TMP_ROOTSTOCK = True
+
+    QUEUE_PATH = "//tmp/q"
+    EXPORT_DIR = "//sys/queue_export"
+
+    MASTER_CELL_DESCRIPTORS = {
+        "10": {"roles": ["cypress_node_host"]},
+        "11": {"roles": ["chunk_host", "cypress_node_host", "sequoia_node_host"]},
+        "12": {"roles": ["chunk_host", "cypress_node_host", "sequoia_node_host"]},
+    }
+
+
+# COMPAT(apachee): Same tests, but use old implementation.
+class TestQueueStaticExportSequoiaOldImpl(TestQueueStaticExportOldImpl, TestQueueStaticExportSequoia):
     USE_OLD_QUEUE_EXPORTER_IMPL = True
 
     ENABLE_MULTIDAEMON = True

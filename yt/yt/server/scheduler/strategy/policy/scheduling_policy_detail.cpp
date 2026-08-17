@@ -852,9 +852,9 @@ TScheduleAllocationsContext::TScheduleAllocationsContext(
     , DynamicAttributesListSnapshot_(GetPoolTreeSnapshotState(TreeSnapshot_)->GetDynamicAttributesListSnapshot())
     , StrategyHost_(strategyHost)
     , ScheduleAllocationsDeadlineReachedCounter_(scheduleAllocationsDeadlineReachedCounter)
-    , Logger(logger.WithTag("NodeAddress: %v, NodeId: %v",
-        SchedulingHeartbeatContext_->GetNodeDescriptor()->GetDefaultAddress(),
-        SchedulingHeartbeatContext_->GetNodeDescriptor()->Id))
+    , Logger(logger
+        .WithTag("NodeAddress", SchedulingHeartbeatContext_->GetNodeDescriptor()->GetDefaultAddress())
+        .WithTag("NodeId", SchedulingHeartbeatContext_->GetNodeDescriptor()->Id))
     , DynamicAttributesManager_(GetPoolTreeSnapshotState(TreeSnapshot_))
 {
     YT_LOG_DEBUG_IF(
@@ -1790,8 +1790,11 @@ std::optional<EDeactivationReason> TScheduleAllocationsContext::TryStartSchedule
 
     // Do preliminary checks to avoid the overhead of updating and reverting precommit usage.
     bool allowLimitsOvercommit = StageState_->Preemptive;
+    bool skipResourceLimitsCheck = allowLimitsOvercommit && TreeSnapshot_->TreeConfig()->EnableInfiniteResourceLimitsOvercommit;
     if (TreeSnapshot_->TreeConfig()->EnablePreliminaryResourceLimitsCheck &&
-        !Dominates(GetHierarchicalAvailableResources(element, allowLimitsOvercommit), minNeededResources)) {
+        !skipResourceLimitsCheck &&
+        !Dominates(GetHierarchicalAvailableResources(element, allowLimitsOvercommit), minNeededResources))
+    {
         return EDeactivationReason::ResourceLimitsExceeded;
     }
     if (!element->CheckAvailableDemand(minNeededResources)) {
@@ -2685,7 +2688,7 @@ void TSchedulingPolicy::RegisterOperation(const TPoolTreeOperationElement* eleme
         New<TOperationSharedState>(
             StrategyHost_,
             element->Spec()->UpdatePreemptibleAllocationsListLoggingPeriod,
-            Logger().WithTag("OperationId: %v", operationId)));
+            Logger().WithTag("OperationId", operationId)));
 }
 
 void TSchedulingPolicy::UnregisterOperation(const TPoolTreeOperationElement* element)
@@ -2724,7 +2727,7 @@ TError TSchedulingPolicy::CheckOperationSchedulingInSeveralTreesAllowed(const TP
         return TError(
             "Scheduling in several trees is forbidden for operations in module-aware scheduling segments, "
             "specify a single tree or use the \"schedule_in_single_tree\" spec option")
-            << TErrorAttribute("segment", segment);
+            .With("segment", segment);
     }
 
     return TError();
@@ -3626,7 +3629,7 @@ void TSchedulingPolicy::UpdateSsdPriorityPreemptionMedia()
         }
     } else {
         auto error = TError("Config contains unknown SSD priority preemption media")
-            << TErrorAttribute("unknown_medium_names", std::move(unknownMediaNames));
+            .With("unknown_medium_names", std::move(unknownMediaNames));
         StrategyHost_->SetSchedulerAlert(ESchedulerAlertType::UpdateSsdPriorityPreemptionMedia, error);
     }
 }
@@ -4156,9 +4159,9 @@ void TSchedulingPolicy::CheckMinNodeResourceLimits()
         error = TError("Found violating nodes in tree %Qv", TreeId_);
         if (violatingNodes.size() > MaxViolatingNodesInError) {
             violatingNodes.resize(MaxViolatingNodesInError);
-            error = error << TErrorAttribute("violating_nodes_truncated", true);
+            error = error.With("violating_nodes_truncated", true);
         }
-        error = error << TErrorAttribute("violating_nodes", violatingNodes);
+        error = error.With("violating_nodes", violatingNodes);
     }
 
     TreeHost_->SetSchedulerTreeAlert(TreeId_, ESchedulerAlertType::NodesWithInsufficientResourceLimits, error);

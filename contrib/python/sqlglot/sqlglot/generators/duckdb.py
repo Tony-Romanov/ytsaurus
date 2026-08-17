@@ -32,9 +32,10 @@ from sqlglot.dialects.dialect import (
     rename_func,
     remove_from_array_using_filter,
     strposition_sql,
-    str_to_time_sql,
     timestrtotime_sql,
     unit_to_str,
+    week_unit_to_dow,
+    WEEK_START_DAY_TO_DOW,
 )
 from sqlglot.generator import unsupported_args
 from sqlglot.helper import find_new_name, is_date_unit, seq_get
@@ -67,18 +68,6 @@ WS_CONTROL_CHARS_TO_DUCK = {
     "\u001d": 29,
     "\u001e": 30,
     "\u001f": 31,
-}
-
-# Days of week to ISO 8601 day-of-week numbers
-# ISO 8601 standard: Monday=1, Tuesday=2, Wednesday=3, Thursday=4, Friday=5, Saturday=6, Sunday=7
-WEEK_START_DAY_TO_DOW = {
-    "MONDAY": 1,
-    "TUESDAY": 2,
-    "WEDNESDAY": 3,
-    "THURSDAY": 4,
-    "FRIDAY": 5,
-    "SATURDAY": 6,
-    "SUNDAY": 7,
 }
 
 MAX_BIT_POSITION = exp.Literal.number(32768)
@@ -906,33 +895,6 @@ def _implicit_datetime_cast(
     return arg
 
 
-def _week_unit_to_dow(unit: exp.Expr | None) -> int | None:
-    """
-    Compute the Monday-based day shift to align DATE_DIFF('WEEK', ...) coming
-    from other dialects, e.g BigQuery's WEEK(<day>) or ISOWEEK unit parts.
-
-    Args:
-        unit: The unit expression (Var for ISOWEEK or WeekStart)
-
-    Returns:
-        The ISO 8601 day number (Monday=1, Sunday=7 etc) or None if not a week unit or if day is dynamic (not a constant).
-
-        Examples:
-            "WEEK(SUNDAY)" -> 7
-            "WEEK(MONDAY)" -> 1
-            "ISOWEEK" -> 1
-    """
-    # Handle plain Var expressions for ISOWEEK only
-    if isinstance(unit, exp.Var) and unit.name.upper() in "ISOWEEK":
-        return 1
-
-    # Handle WeekStart expressions with explicit day
-    if isinstance(unit, exp.WeekStart):
-        return WEEK_START_DAY_TO_DOW.get(unit.name.upper())
-
-    return None
-
-
 def _build_week_trunc_expression(
     date_expr: exp.Expr,
     start_dow: int,
@@ -989,7 +951,7 @@ def _date_diff_sql(self: DuckDBGenerator, expression: exp.DateDiff | exp.Datetim
     date_part_boundary = expression.args.get("date_part_boundary")
 
     # Extract week start day; returns None if day is dynamic (column/placeholder)
-    week_start = _week_unit_to_dow(unit)
+    week_start = week_unit_to_dow(unit)
     if date_part_boundary and week_start and this and expr:
         expression.set("unit", exp.Literal.string("WEEK"))
 
@@ -1606,6 +1568,7 @@ class DuckDBGenerator(generator.Generator):
     ARRAY_SIZE_DIM_REQUIRED: bool | None = False
     NORMALIZE_EXTRACT_DATE_PARTS = True
     SUPPORTS_LIKE_QUANTIFIERS = False
+    HISTORICAL_DATA_POST_ALIAS = True
     SET_ASSIGNMENT_REQUIRES_VARIABLE_KEYWORD = True
 
     TRANSFORMS = {
@@ -2241,6 +2204,25 @@ class DuckDBGenerator(generator.Generator):
         """
     )
 
+    # BigQuery's `x IN UNNEST(arr)` NULL semantics:
+    #   NULL IN UNNEST([1, 2])  -> NULL
+    #   3 IN UNNEST([1, NULL])  -> NULL
+    #   3 IN UNNEST([1, 2])     -> FALSE
+    #   1 IN UNNEST(NULL)       -> FALSE (not NULL)
+    #   1 IN UNNEST([])         -> FALSE
+    # The default `IN (SELECT UNNEST(...))` rewrite creates a correlated subquery
+    # that DuckDB rejects inside non-inner joins, so a CASE expression is used instead.
+    IN_UNNEST_TEMPLATE: exp.Expr = exp.maybe_parse(
+        """
+        CASE
+            WHEN :arr IS NULL OR ARRAY_LENGTH(:arr) = 0 THEN FALSE
+            WHEN ARRAY_CONTAINS(:arr, :value) THEN TRUE
+            WHEN :value IS NULL OR ARRAY_LENGTH(:arr) <> LIST_COUNT(:arr) THEN NULL
+            ELSE FALSE
+        END
+        """
+    )
+
     STRTOK_TO_ARRAY_TEMPLATE: exp.Expr = exp.maybe_parse(
         """
         CASE WHEN :delimiter IS NULL THEN NULL
@@ -2751,14 +2733,13 @@ class DuckDBGenerator(generator.Generator):
             exp.DType.TIMESTAMPTZ,
         )
 
-        if expression.args.get("safe"):
-            formatted_time = self.format_time(expression)
-            cast_type = exp.DType.TIMESTAMPTZ if needs_tz else exp.DType.TIMESTAMP
-            return self.sql(
-                exp.cast(self.func("TRY_STRPTIME", expression.this, formatted_time), cast_type)
-            )
+        value, formatted_time = self._strptime_default_year(expression)
 
-        base_sql = str_to_time_sql(self, expression)
+        if expression.args.get("safe"):
+            cast_type = exp.DType.TIMESTAMPTZ if needs_tz else exp.DType.TIMESTAMP
+            return self.sql(exp.cast(self.func("TRY_STRPTIME", value, formatted_time), cast_type))
+
+        base_sql = self.func("STRPTIME", value, formatted_time)
         if needs_tz:
             return self.sql(
                 exp.cast(
@@ -2769,27 +2750,30 @@ class DuckDBGenerator(generator.Generator):
         return base_sql
 
     def strtodate_sql(self, expression: exp.StrToDate) -> str:
-        formatted_time = self.format_time(expression)
+        value, formatted_time = self._strptime_default_year(expression)
         function_name = "STRPTIME" if not expression.args.get("safe") else "TRY_STRPTIME"
         return self.sql(
             exp.cast(
-                self.func(function_name, expression.this, formatted_time),
+                self.func(function_name, value, formatted_time),
                 exp.DataType(this=exp.DType.DATE),
             )
         )
 
+    def _strptime_default_year(
+        self, expression: exp.StrToTime | exp.StrToDate | exp.ParseDatetime
+    ) -> tuple[exp.ExpOrStr, exp.ExpOrStr | None]:
+        value: exp.ExpOrStr = expression.this
+        formatted_time: exp.ExpOrStr | None = self.format_time(expression)
+
+        if default_year := expression.args.get("default_year"):
+            value = exp.DPipe(this=exp.Literal.string(f"{default_year.name} "), expression=value)
+            formatted_time = exp.DPipe(this=exp.Literal.string("%Y "), expression=formatted_time)
+
+        return value, formatted_time
+
     def parsedatetime_sql(self, expression: exp.ParseDatetime) -> str:
-        formatted_time = self.format_time(expression)
-
-        default_year = expression.args.get("default_year")
-        if default_year:
-            year_str = exp.Literal.string(f"{default_year.name} ")
-            fmt_prefix = exp.Literal.string("%Y ")
-            value = exp.DPipe(this=year_str, expression=expression.this)
-            fmt = exp.DPipe(this=fmt_prefix, expression=formatted_time)
-            return self.func("STRPTIME", value, fmt)
-
-        return self.func("STRPTIME", expression.this, formatted_time)
+        value, formatted_time = self._strptime_default_year(expression)
+        return self.func("STRPTIME", value, formatted_time)
 
     def parsetime_sql(self, expression: exp.ParseTime) -> str:
         formatted_time = self.format_time(expression)
@@ -3133,6 +3117,16 @@ class DuckDBGenerator(generator.Generator):
 
         return super().tablesample_sql(expression, tablesample_keyword=tablesample_keyword)
 
+    def in_sql(self, expression: exp.In) -> str:
+        unnest = expression.args.get("unnest")
+        if unnest:
+            return self.sql(
+                exp.replace_placeholders(
+                    self.IN_UNNEST_TEMPLATE, arr=unnest.expressions[0], value=expression.this
+                )
+            )
+        return super().in_sql(expression)
+
     def join_sql(self, expression: exp.Join) -> str:
         if (
             not expression.args.get("using")
@@ -3152,6 +3146,11 @@ class DuckDBGenerator(generator.Generator):
 
     def countif_sql(self, expression: exp.CountIf) -> str:
         if self.dialect.version >= (1, 2):
+            this = expression.this
+            if expression.args.get("zero_on_all_null") and not isinstance(this, exp.Distinct):
+                # DuckDB >= 1.2's COUNT_IF returns NULL when the condition is NULL on all rows,
+                # so we wrap the condition in IS TRUE to preserve count-like semantics
+                expression = exp.CountIf(this=exp.paren(this).is_(exp.true()))
             return self.function_fallback_sql(expression)
 
         # https://github.com/tobymao/sqlglot/pull/4749
@@ -3488,6 +3487,23 @@ class DuckDBGenerator(generator.Generator):
                 this=exp.func("LIST", exp.Distinct(expressions=[expression.this])),
                 expression=exp.Where(this=expression.this.copy().is_(exp.null()).not_()),
             )
+        )
+
+    def arrayconcatagg_sql(self, expression: exp.ArrayConcatAgg) -> str:
+        this = expression.this
+
+        if isinstance(this, exp.Limit):
+            self.unsupported("LIMIT in ARRAY_CONCAT_AGG cannot be transpiled to DuckDB")
+            this = this.this
+
+        inner = this.this if isinstance(this, exp.Order) else this
+
+        return self.func(
+            "FLATTEN",
+            exp.Filter(
+                this=exp.ArrayAgg(this=this),
+                expression=exp.Where(this=inner.copy().is_(exp.null()).not_()),
+            ),
         )
 
     def arrayunionagg_sql(self, expression: exp.ArrayUnionAgg) -> str:
@@ -3947,6 +3963,12 @@ class DuckDBGenerator(generator.Generator):
 
         return super().unnest_sql(expression)
 
+    def arrayagg_sql(self, expression: exp.ArrayAgg) -> str:
+        if isinstance(expression.this, exp.Limit):
+            self.unsupported("LIMIT inside ARRAY_AGG is not supported in DuckDB")
+
+        return super().arrayagg_sql(expression)
+
     def ignorenulls_sql(self, expression: exp.IgnoreNulls) -> str:
         this = expression.this
 
@@ -3954,6 +3976,14 @@ class DuckDBGenerator(generator.Generator):
             # DuckDB should render IGNORE NULLS only for the general-purpose
             # window functions that accept it e.g. FIRST_VALUE(... IGNORE NULLS) OVER (...)
             return super().ignorenulls_sql(expression)
+
+        # For ARRAY_AGG(expr IGNORE NULLS ...), convert IGNORE NULLS to a
+        # FILTER(WHERE expr IS NOT NULL) clause by setting nulls_excluded on
+        # the ArrayAgg.  The existing _add_arrayagg_null_filter method will
+        # emit the FILTER clause during arrayagg_sql / withingroup_sql.
+        if isinstance(this, exp.ArrayAgg):
+            this.set("nulls_excluded", True)
+            return self.sql(this)
 
         if isinstance(this, exp.First):
             this = exp.AnyValue(this=this.this)
@@ -4383,7 +4413,7 @@ class DuckDBGenerator(generator.Generator):
         unit = expression.args.get("unit")
         date = expression.this
 
-        week_start = _week_unit_to_dow(unit)
+        week_start = week_unit_to_dow(unit)
         unit = unit_to_str(expression)
 
         if week_start:

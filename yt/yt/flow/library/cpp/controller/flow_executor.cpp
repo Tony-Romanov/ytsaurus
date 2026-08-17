@@ -22,6 +22,7 @@
 #include <yt/yt/flow/library/cpp/controller/describe/describe_worker.h>
 #include <yt/yt/flow/library/cpp/controller/describe/describe_workers.h>
 
+#include <yt/yt/flow/library/cpp/misc/deploy_url_provider.h>
 #include <yt/yt/flow/library/cpp/misc/load_throughput_throttler.h>
 #include <yt/yt/flow/library/cpp/misc/status_profiler.h>
 
@@ -254,7 +255,7 @@ TSetPipelineDynamicSpecResult TFlowExecutor::SetPipelineDynamicSpec(const TSetPi
 
     auto newDynamicSpec = NYTree::ConvertTo<TDynamicPipelineSpecPtr>(specNode);
     ValidateDynamicPipelineSpec(newDynamicSpec);
-    versionedSpec->SetValue(newDynamicSpec);
+    versionedSpec->TrySetValue(newDynamicSpec, Controller_->GetVersionProvider());
 
     if (versionedSpec->GetVersion() != originalVersion) { // Persist only if there are changes.
         PersistedStateManager_->PersistSpecs(std::nullopt, std::nullopt, versionedSpec, expectedVersion);
@@ -298,9 +299,7 @@ void CheckPipelineSafeForSpecUpdate(
     bool force)
 {
     auto flowView = keeper->GetFlowView();
-    if (!flowView->IsSynced()) {
-        return;
-    }
+    flowView->EnsureIsSynced();
 
     const auto state = flowView->State->ExecutionSpec->PipelineState->GetValue();
     if (state == EPipelineState::Stopped || state == EPipelineState::Unknown) {
@@ -399,9 +398,9 @@ TSetPipelineSpecsResult TFlowExecutor::SetPipelineSpecs(const TSetPipelineSpecsA
             const auto& actualFlowCoreVersion = Controller_->GetNodeInfo()->FlowCoreVersion;
             if (!CheckFlowCoreTarget(targetValue, actualFlowCoreVersion)) {
                 THROW_ERROR_EXCEPTION(NFlow::EErrorCode::FlowCoreTargetMismatch,
-                        "Flow core target mismatches with actual running Controller version, cannot modify Spec")
-                    << TErrorAttribute("flow_core_target", targetValue)
-                    << TErrorAttribute("actual_flow_core_version", actualFlowCoreVersion);
+                    "Flow core target mismatches with actual running Controller version, cannot modify Spec")
+                    .With("flow_core_target", targetValue)
+                    .With("actual_flow_core_version", actualFlowCoreVersion);
             }
 
             auto expectedVersions = MakePipelineImportantVersions(flowView->State, spec);
@@ -412,18 +411,17 @@ TSetPipelineSpecsResult TFlowExecutor::SetPipelineSpecs(const TSetPipelineSpecsA
 
             // Update specs if provided.
             if (argument.Spec) {
-                spec->SetValue(NYTree::ConvertTo<TPipelineSpecPtr>(*argument.Spec));
+                spec->TrySetValue(NYTree::ConvertTo<TPipelineSpecPtr>(*argument.Spec), Controller_->GetVersionProvider());
                 ValidatePipelineSpec(spec->GetValue());
             }
             if (argument.DynamicSpec) {
-                dynamicSpec->SetValue(NYTree::ConvertTo<TDynamicPipelineSpecPtr>(*argument.DynamicSpec));
+                dynamicSpec->TrySetValue(NYTree::ConvertTo<TDynamicPipelineSpecPtr>(*argument.DynamicSpec), Controller_->GetVersionProvider());
                 ValidateDynamicPipelineSpec(dynamicSpec->GetValue());
             }
 
             result.SpecVersion = spec->GetVersion();
             result.DynamicSpecVersion = dynamicSpec->GetVersion();
 
-            // Check if there are any changes (SetValue() changes version when value is really changed).
             bool specChanged = (spec->GetVersion() != originalSpecVersion);
             bool dynamicSpecChanged = (dynamicSpec->GetVersion() != originalDynamicSpecVersion);
 
@@ -442,7 +440,7 @@ TSetPipelineSpecsResult TFlowExecutor::SetPipelineSpecs(const TSetPipelineSpecsA
                     auto specNode = argument.Spec.value()->AsMap();
                     auto specErrors = NFlow::TRegistry::Get()->ValidatePipelineSpecParseability(specNode);
                     if (!specErrors.empty()) {
-                        errors.push_back(TError("Strict validation failed for Spec") << specErrors);
+                        errors.push_back(TError("Strict validation failed for Spec").With(specErrors));
                     }
                 }
 
@@ -450,11 +448,11 @@ TSetPipelineSpecsResult TFlowExecutor::SetPipelineSpecs(const TSetPipelineSpecsA
                 auto dynamicSpecNode = argument.DynamicSpec ? argument.DynamicSpec.value()->AsMap() : ConvertTo<IMapNodePtr>(dynamicSpec->GetValue());
                 auto dynamicSpecErrors = NFlow::TRegistry::Get()->ValidateDynamicPipelineSpecParseability(spec->GetValue(), dynamicSpecNode);
                 if (!dynamicSpecErrors.empty()) {
-                    errors.push_back(TError("Strict validation failed for DynamicSpec") << dynamicSpecErrors);
+                    errors.push_back(TError("Strict validation failed for DynamicSpec").With(dynamicSpecErrors));
                 }
 
                 if (!errors.empty()) {
-                    THROW_ERROR_EXCEPTION("Strict validation failed for specs") << errors;
+                    THROW_ERROR_EXCEPTION("Strict validation failed for specs").With(errors);
                 }
             }
 
@@ -560,18 +558,18 @@ TSetTargetPipelineStateResult TFlowExecutor::SetTargetPipelineState(const TSetTa
         const auto& controllerFlowCoreVersion = Controller_->GetNodeInfo()->FlowCoreVersion;
         if (!CheckFlowCoreTarget(targetValue, controllerFlowCoreVersion)) {
             THROW_ERROR_EXCEPTION(
-                    NFlow::EErrorCode::FlowCoreTargetMismatch,
-                    "Cannot start pipeline: controller FlowCoreVersion does not match FlowCoreTarget. "
-                    "Update the controller binary or reset the target.")
-                << TErrorAttribute("flow_core_target", targetValue)
-                << TErrorAttribute("controller_flow_core_version", controllerFlowCoreVersion);
+                NFlow::EErrorCode::FlowCoreTargetMismatch,
+                "Cannot start pipeline: controller FlowCoreVersion does not match FlowCoreTarget. "
+                "Update the controller binary or reset the target.")
+                .With("flow_core_target", targetValue)
+                .With("controller_flow_core_version", controllerFlowCoreVersion);
         }
     }
 
     const auto expectedVersion = dynamicSpec->GetVersion();
 
     dynamicSpec->GetValue()->TargetState = argument.TargetPipelineState;
-    dynamicSpec->BumpVersion();
+    dynamicSpec->Bump(Controller_->GetVersionProvider());
 
     PersistedStateManager_->PersistSpecs(std::nullopt, std::nullopt, dynamicSpec, expectedVersion);
     keeper->SetSpecs(std::nullopt, dynamicSpec);
@@ -651,7 +649,7 @@ TSetFlowCoreTargetResult TFlowExecutor::SetFlowCoreTarget(const TSetFlowCoreTarg
     expectedVersions->FlowCoreTargetVersion = argument.ExpectedVersion.value_or(currentTarget->GetVersion());
 
     auto newTarget = CloneYsonStruct(currentTarget);
-    newTarget->SetValue(argument.FlowCoreTarget);
+    newTarget->TrySetValue(argument.FlowCoreTarget, Controller_->GetVersionProvider());
 
     PersistedStateManager_->PersistFlowCoreTarget(newTarget, expectedVersions);
 
@@ -724,6 +722,7 @@ TYsonString TFlowExecutor::DescribePipeline(const std::string& /*command*/, cons
             .ControllerFlowCoreVersion = Controller_->GetNodeInfo()->FlowCoreVersion,
             .ControllerBuildType = Controller_->GetNodeInfo()->BuildType,
             .FlowTablesBundle = std::move(flowTablesBundle),
+            .DeployStageUrl = GetDeployStageUrl(),
         });
     return ConvertToYsonString(description);
 }
@@ -837,7 +836,8 @@ TYsonString TFlowExecutor::DescribeWorker(const std::string& /*command*/, const 
     auto argument = ConvertTo<TDescribeWorkerArg>(serializedArgument);
     return ConvertToYsonString(NDescribe::DescribeWorker(
         Controller_->GetFlowViewKeeper()->GetFlowView(),
-        argument.Worker));
+        argument.Worker,
+        GetDeployStageUrl()));
 }
 
 ////////////////////////////////////////////////////////////////////////////////

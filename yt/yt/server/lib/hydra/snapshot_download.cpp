@@ -30,9 +30,9 @@ void DoDownloadSnapshot(
     int snapshotId,
     TLogger logger)
 {
-    const auto& Logger = logger.WithTag("SnapshotId: %v, SelfPeerId: %v",
-        snapshotId,
-        cellManager->GetSelfPeerId());
+    const auto& Logger = logger
+        .WithTag("SnapshotId", snapshotId)
+        .WithTag("SelfPeerId", cellManager->GetSelfPeerId());
 
     auto isPersistenceEnabled = IsPersistenceEnabled(cellManager, options);
     if (!isPersistenceEnabled) {
@@ -76,7 +76,7 @@ void DoDownloadSnapshot(
         YT_LOG_INFO("Snapshot downloaded successfully");
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION("Error downloading snapshot %v", snapshotId)
-            << ex;
+            .With(ex);
     }
 }
 

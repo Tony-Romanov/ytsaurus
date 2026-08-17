@@ -625,7 +625,7 @@ default_config = {
     "default_api_version_for_rpc": "v4",
 
     # Enables generating request id and passing it to native driver.
-    "enable_passing_request_id_to_driver": False,
+    "enable_passing_request_id_to_driver": True,
 
     # Username for native driver requests.
     "driver_user_name": None,
@@ -758,7 +758,10 @@ default_config = {
         # Encrypt files with pickle data (None - disabled, 1 - enabled, 2 - enabled with key in "secure vault")
         "encrypt_pickle_files": RemotePatchableInteger(ENCRYPT_PICKLE_FILES, "python_encrypt_pickle_files"),
         # Pickle encryption engine: "cryptography_fernet" (default) or "native_chacha" (ctypes+OpenSSL with pure Python fallback).
-        "encryption_engine": "cryptography_fernet",
+        "encryption_engine": RemotePatchableString(
+            "cryptography_fernet",
+            "python_pickling_encryption_engine",
+        ),
     },
 
     # Enables special behavior if client works with local mode cluster.
@@ -1184,6 +1187,7 @@ SHORTCUTS = {
     "YT_PROXY_URL_ALIASING_CONFIG": "proxy/aliases",
     "YT_HTTP_PROXY_ROLE": "proxy/http_proxy_role",
     "YT_RPC_PROXY_ROLE": "proxy/rpc_proxy_role",
+    "YT_PREFER_HTTPS": "proxy/prefer_https",
 
     "YT_TOKEN": "token",
     "YT_TOKEN_PATH": "token_path",

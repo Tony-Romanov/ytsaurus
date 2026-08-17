@@ -95,8 +95,22 @@ public:
         double rowsPerSecond,
         TDuration throttlerPeriod);
 
+    // Decides whether a pending reader creation or read stream must be given up on.
+    // Returns the error to report; OK means "not ready yet, keep polling".
+    static TError ClassifyPendingRead(
+        const TFuture<void>& pendingRead,
+        TDuration timeSinceReadProgress,
+        TDuration readTimeout);
+
 private:
     void DoInit() final;
+    void DoTerminate() final;
+
+    // Reports |error| and discards the reader so that the next read recreates it.
+    void DropReader(const TError& error);
+
+    // Cancels the in-flight read (reader creation or ready event) and discards the reader.
+    void CancelReader(const TError& error);
 
     TFuture<std::vector<TRecord>> DoReadNextBatch(
         const TMessageBatcherSettingsPtr& settings,
@@ -113,6 +127,7 @@ protected:
     const NLogging::TLogger Logger;
 
 private:
+    IStatusErrorStatePtr ReadErrorState_;
     NApi::IClientPtr Client_;
     NConcurrency::IReconfigurableThroughputThrottlerPtr Throttler_;
 
@@ -120,7 +135,7 @@ private:
     TFuture<NApi::ITableReaderPtr> ReaderFuture_;
     i64 CurrentOffset_ = 0;
 
-    TInstant LastNonEmptyBatchRead_ = TInstant::Zero();
+    TInstant LastReadProgressInstant_ = TInstant::Zero();
 };
 
 DEFINE_REFCOUNTED_TYPE(TSource);

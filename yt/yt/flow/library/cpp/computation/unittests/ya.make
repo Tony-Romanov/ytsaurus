@@ -10,6 +10,7 @@ SRCS(
     event_timestamp_assigner_ut.cpp
     idle_partition_ut.cpp
     input_store_ut.cpp
+    simple_external_state_joiner_ut.cpp
     static_table_key_visitor_joiner_ut.cpp
     key_visitor_store_ut.cpp
     key_visitor_ut.cpp
@@ -20,6 +21,7 @@ SRCS(
     state_client_ut.cpp
     swift_map_validation_ut.cpp
     timer_store_ut.cpp
+    transform_ordered_source_validation_ut.cpp
     universal_controller_helpers_ut.cpp
     watermark_generator_ut.cpp
 )
@@ -28,7 +30,9 @@ PEERDIR(
     yt/yt/client/unittests/mock
     yt/yt/flow/library/cpp/computation
     yt/yt/flow/library/cpp/common/unittests/mock
+    yt/yt/flow/library/cpp/connectors/random
     yt/yt/flow/library/cpp/tables/unittests/mock
+    yt/yt/library/profiling/solomon
     yt/yt/library/query/engine
 )
 

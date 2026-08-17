@@ -5,8 +5,6 @@
 #include "checksum.h"
 #include "resource.h"
 
-#include <yt/yt/flow/library/cpp/misc/version_helpers.h>
-
 #include <yt/yt/core/ytree/convert.h>
 #include <yt/yt/core/ytree/ephemeral_node_factory.h>
 #include <yt/yt/core/ytree/ypath_client.h>
@@ -29,6 +27,9 @@
 
 #include <util/digest/multi.h>
 #include <util/generic/map.h>
+
+#include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace NYT::NFlow {
@@ -397,21 +398,19 @@ TAggregatedNodeInputMetricsPtr AggregateNodeInputMetrics(const std::vector<TNode
     return result;
 }
 
-THashMap<TComputationId, TAggregatedNodeInputMetricsPtr> AggregateInputMetricsByComputation(const TFlowViewPtr& flowView)
+THashMap<TComputationId, TAggregatedNodeInputMetricsPtr> AggregateInputMetricsByComputation(
+    const TFlowViewPtr& flowView,
+    TInstant minJobStatusUpdateTime)
 {
     const auto& flowLayout = flowView->State->ExecutionSpec->Layout;
     THashMap<TComputationId, std::vector<TNodeInputMetricsPtr>> groupedMetrics;
     for (const auto& [partitionId, partition] : flowLayout->Partitions) {
         if (partition->State == EPartitionState::Executing || partition->State == EPartitionState::Completing || partition->State == EPartitionState::Interrupting) {
-            auto statusIt = flowView->Feedback->PartitionJobStatuses.find(partitionId);
-            if (statusIt == flowView->Feedback->PartitionJobStatuses.end()) {
+            const auto& status = flowView->Feedback->GetFreshCurrentJobStatus(partitionId, minJobStatusUpdateTime);
+            if (!status || !status->InputMetrics) {
                 continue;
             }
-            const auto& status = statusIt->second;
-            if (!status->CurrentJobStatus) {
-                continue;
-            }
-            groupedMetrics[partition->ComputationId].push_back(status->CurrentJobStatus->InputMetrics);
+            groupedMetrics[partition->ComputationId].push_back(status->InputMetrics);
         }
     }
     THashMap<TComputationId, TAggregatedNodeInputMetricsPtr> result;
@@ -522,6 +521,8 @@ void TWorkerResourceStatus::Register(TRegistrar registrar)
     registrar.Parameter("applied_revision_id", &TThis::AppliedRevisionId)
         .Default();
     registrar.Parameter("target_revision_id", &TThis::TargetRevisionId)
+        .Default();
+    registrar.Parameter("update_state", &TThis::UpdateState)
         .Default();
 }
 
@@ -681,9 +682,9 @@ void TFlowLayout::CreatePartition(TPartitionPtr partition)
     YT_TLOG_INFO("CreatePartition")
         .With("PartitionId", partition->PartitionId)
         .With("ComputationId", partition->ComputationId)
-        .With("LowerKey", partition->LowerKey, "%Qv")
-        .With("UpperKey", partition->UpperKey, "%Qv")
-        .With("SourceKey", partition->SourceKey, "%Qv");
+        .With("LowerKey", partition->LowerKey)
+        .With("UpperKey", partition->UpperKey)
+        .With("SourceKey", partition->SourceKey);
     THROW_ERROR_EXCEPTION_UNLESS(Partitions.emplace(partition->PartitionId, partition).second == true, "PartitionId duplicate");
     ++Updated_;
     if (MutationNotifier_) {
@@ -901,13 +902,38 @@ TSystemTimestamp TWatermarkState::GetAlignmentSystemWatermark(const TWatermarkAl
 
 ////////////////////////////////////////////////////////////////////////////////
 
+namespace {
+
+i64 ComputeExecutionSpecEpoch(
+    i64 pipelineStateVersion,
+    i64 pipelineSpecVersion,
+    i64 extendedPipelineSpecVersion,
+    i64 dynamicPipelineSpecVersion,
+    i64 layoutVersion)
+{
+    const auto clockVersion = std::max({
+        pipelineStateVersion,
+        pipelineSpecVersion,
+        extendedPipelineSpecVersion,
+        dynamicPipelineSpecVersion,
+    });
+    YT_VERIFY(layoutVersion >= 0);
+    YT_VERIFY(clockVersion <= std::numeric_limits<i64>::max() - layoutVersion);
+    return clockVersion + layoutVersion;
+}
+
+} // namespace
+
+////////////////////////////////////////////////////////////////////////////////
+
 i64 TExecutionSpec::GetEpoch() const
 {
-    return PipelineState->GetVersion().Underlying() +
-        PipelineSpec->GetVersion().Underlying() +
-        ExtendedPipelineSpec->GetVersion().Underlying() +
-        DynamicPipelineSpec->GetVersion().Underlying() +
-        Layout->GetVersion().Underlying();
+    return ComputeExecutionSpecEpoch(
+        PipelineState->GetVersion().Underlying(),
+        PipelineSpec->GetVersion().Underlying(),
+        ExtendedPipelineSpec->GetVersion().Underlying(),
+        DynamicPipelineSpec->GetVersion().Underlying(),
+        Layout->GetVersion().Underlying());
 }
 
 void TExecutionSpec::AttachToControl(TPersistedStateControlPtr<std::string> control)
@@ -1018,11 +1044,12 @@ bool CheckFlowCoreTarget(const TFlowViewPtr& flowView, const std::string& actual
 
 i64 TExecutionSpecVersions::GetEpoch() const
 {
-    return PipelineStateVersion.Underlying() +
-        PipelineSpecVersion.Underlying() +
-        ExtendedPipelineSpecVersion.Underlying() +
-        DynamicPipelineSpecVersion.Underlying() +
-        LayoutVersion.Underlying();
+    return ComputeExecutionSpecEpoch(
+        PipelineStateVersion.Underlying(),
+        PipelineSpecVersion.Underlying(),
+        ExtendedPipelineSpecVersion.Underlying(),
+        DynamicPipelineSpecVersion.Underlying(),
+        LayoutVersion.Underlying());
 }
 
 void TExecutionSpecVersions::Register(TRegistrar registrar)
@@ -1188,6 +1215,20 @@ const TJobStatusPtr& TFlowFeedback::GetCurrentJobStatus(const TPartitionId& part
 {
     auto it = PartitionJobStatuses.find(partitionId);
     if (it == PartitionJobStatuses.end()) {
+        static TJobStatusPtr nothing;
+        return nothing;
+    }
+    return it->second->CurrentJobStatus;
+}
+
+const TJobStatusPtr& TFlowFeedback::GetFreshCurrentJobStatus(
+    const TPartitionId& partitionId,
+    TInstant minUpdateTime) const
+{
+    auto it = PartitionJobStatuses.find(partitionId);
+    if (it == PartitionJobStatuses.end() ||
+        it->second->CurrentJobStatusUpdateTime < minUpdateTime)
+    {
         static TJobStatusPtr nothing;
         return nothing;
     }

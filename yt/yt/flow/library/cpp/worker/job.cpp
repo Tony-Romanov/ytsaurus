@@ -8,6 +8,7 @@
 #include "private.h"
 #include <yt/yt/flow/library/cpp/computation/stores/output_store.h>
 
+#include <yt/yt/flow/library/cpp/buffers/epoch_cycle_tracker.h>
 #include <yt/yt/flow/library/cpp/common/computation.h>
 #include <yt/yt/flow/library/cpp/common/distributing_tracker.h>
 #include <yt/yt/flow/library/cpp/common/flow_view.h>
@@ -97,7 +98,9 @@ public:
     explicit TComputationRunContext(TWeakPtr<TJob> job);
 
     TFuture<std::vector<TInputMessageConstPtr>> GetNextBatch(const THashSet<TStreamId>& allowedStreams) override;
+    TFuture<THashMap<TStreamId, TInflightMetricsPtr>> GetInputInflightMetrics() override;
     void MarkPersisted(std::span<const TMessageId> messageIds) override;
+    void MarkDeduplicated(std::span<const TMessageId> messageIds) override;
     void RegisterOutputMessages(
         std::span<const TOutputMessageConstPtr> messages,
         std::span<TDistributingTracker> trackers) override;
@@ -130,10 +133,10 @@ public:
         , TraverseData_(std::move(traverseData))
         , WatermarkState_(std::move(watermarkState))
         , Logger(
-            WorkerLogger().WithTag("JobId: %v, PartitionId: %v, ComputationId: %v",
-                JobSpec_->Job->JobId,
-                JobSpec_->Partition->PartitionId,
-                JobSpec_->Partition->ComputationId))
+            WorkerLogger()
+                .WithTag("JobId", JobSpec_->Job->JobId)
+                .WithTag("PartitionId", JobSpec_->Partition->PartitionId)
+                .WithTag("ComputationId", JobSpec_->Partition->ComputationId))
         , Profiler(
             WorkerProfiler()
                 .WithTag("computation_id", JobSpec_->Partition->ComputationId.Underlying())
@@ -144,6 +147,8 @@ public:
             CreateInputBuffer(
                 JobSpec_->Job->JobId,
                 StreamLimitUsageStates_.Input,
+                StreamLimitUsageStates_.InputEpochCycleTracker,
+                StreamLimitUsageStates_.InputOfferedRateEstimators,
                 JobSpec_->ComputationSpec,
                 JobSpec_->Partition->ComputationId,
                 DynamicJobSpec_->DynamicComputationSpec,
@@ -402,7 +407,7 @@ public:
                 auto computationStatus = Computation_->GetStatus();
                 if (computationStatus->NodeTraverse) {
                     auto traverseData = New<TFromPartitionTraverseData>();
-                    traverseData->Node = computationStatus->NodeTraverse;
+                    traverseData->Node = std::move(computationStatus->NodeTraverse);
                     // NB: No need to clamp stream->Epoch here — GetNodeTraverse() already returns nullptr
                     // if any stream's Epoch < PendingSpecGeneration_, so the traverse data is always fresh.
                     status->FromPartitionTraverseData = traverseData;
@@ -505,7 +510,27 @@ public:
             }).AsyncVia(JobContext_->PoolInvoker));
     }
 
+    TFuture<THashMap<TStreamId, TInflightMetricsPtr>> GetInputInflightMetrics()
+    {
+        YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(JobSerializedInvoker_);
+
+        FlushInputAcknowledgements();
+        return InputBuffer_->GetInflightMetrics();
+    }
+
     void MarkPersisted(std::span<const TMessageId> messageIds)
+    {
+        EnqueueAcknowledgements(messageIds, /*reportProcessed*/ true);
+    }
+
+    void MarkDeduplicated(std::span<const TMessageId> messageIds)
+    {
+        EnqueueAcknowledgements(messageIds, /*reportProcessed*/ false);
+    }
+
+    void EnqueueAcknowledgements(
+        std::span<const TMessageId> messageIds,
+        bool reportProcessed)
     {
         YT_ASSERT_THREAD_AFFINITY_ANY();
 
@@ -517,18 +542,35 @@ public:
         bool queueWasEmpty = false;
         {
             auto guard = Guard(MarkPersistedQueueLock_);
-            queueWasEmpty = MarkPersistedQueue_.empty();
-            MarkPersistedQueue_.insert(MarkPersistedQueue_.end(), messageIds.begin(), messageIds.end());
+            queueWasEmpty = MarkPersistedQueue_.empty() && DuplicateAcknowledgementQueue_.empty();
+            auto& queue = reportProcessed
+                ? MarkPersistedQueue_
+                : DuplicateAcknowledgementQueue_;
+            queue.insert(queue.end(), messageIds.begin(), messageIds.end());
         }
         if (queueWasEmpty) {
-            JobSerializedInvoker_->Invoke(BIND_NO_PROPAGATE([this, this_ = MakeStrong(this)] () {
-                std::deque<TMessageId> queuedMessageIds;
-                {
-                    auto guard = Guard(MarkPersistedQueueLock_);
-                    std::swap(queuedMessageIds, MarkPersistedQueue_);
-                }
-                InputBuffer_->MarkPersisted(std::move(queuedMessageIds));
-            }));
+            JobSerializedInvoker_->Invoke(BIND_NO_PROPAGATE(
+                &TJob::FlushInputAcknowledgements,
+                MakeStrong(this)));
+        }
+    }
+
+    void FlushInputAcknowledgements()
+    {
+        YT_ASSERT_SERIALIZED_INVOKER_AFFINITY(JobSerializedInvoker_);
+
+        std::deque<TMessageId> queuedMessageIds;
+        std::deque<TMessageId> duplicateMessageIds;
+        {
+            auto guard = Guard(MarkPersistedQueueLock_);
+            std::swap(queuedMessageIds, MarkPersistedQueue_);
+            std::swap(duplicateMessageIds, DuplicateAcknowledgementQueue_);
+        }
+        if (!queuedMessageIds.empty()) {
+            InputBuffer_->MarkPersisted(std::move(queuedMessageIds));
+        }
+        if (!duplicateMessageIds.empty()) {
+            InputBuffer_->MarkDeduplicated(std::move(duplicateMessageIds));
         }
     }
 
@@ -568,13 +610,6 @@ public:
         Distributor_->DistributeOutputMessages(
             GetJobId(),
             std::move(toDistribute));
-    }
-
-    const IInvokerPtr& GetJobInvoker()
-    {
-        YT_ASSERT_THREAD_AFFINITY_ANY();
-
-        return JobSerializedInvoker_;
     }
 
 private:
@@ -641,6 +676,7 @@ private:
 
     YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, MarkPersistedQueueLock_);
     std::deque<TMessageId> MarkPersistedQueue_;
+    std::deque<TMessageId> DuplicateAcknowledgementQueue_;
 
 private:
     void ExecutorFiber()
@@ -657,7 +693,6 @@ private:
             WatermarkState_,
             TraverseData_,
             JobContext_,
-            StreamLimitUsageStates_.Output,
             JobSerializedInvoker_,
             JobContext_->PoolInvoker,
             Logger,
@@ -769,7 +804,6 @@ private:
         const TWatermarkStatePtr& watermarkState,
         const TToPartitionTraverseDataPtr& partitionData,
         const TJobContextPtr& jobContext,
-        const NFlow::TStreamLimitUsageStateMap& outputStreamLimitUsageStates,
         const IInvokerPtr& jobSerializedInvoker,
         const IInvokerPtr& jobPoolInvoker,
         const NLogging::TLogger& logger,
@@ -791,7 +825,7 @@ private:
         computationContext->EvaluatorCache = jobContext->EvaluatorCache;
         computationContext->ConverterCache = jobContext->ConverterCache;
         computationContext->LoadThroughputThrottler = jobContext->LoadThroughputThrottler;
-        computationContext->OutputStreamLimitUsageStates = outputStreamLimitUsageStates;
+        computationContext->PartitionBufferState = jobContext->PartitionBufferState;
         computationContext->StreamSpecStorage = jobContext->StreamSpecStorage;
         computationContext->JobStateCache = jobContext->JobStateCache;
         computationContext->ExternalMetricsReporter = jobContext->ExternalMetricsReporter;
@@ -880,10 +914,25 @@ TFuture<std::vector<TInputMessageConstPtr>> TComputationRunContext::GetNextBatch
     return MakeFuture<std::vector<TInputMessageConstPtr>>(MakeExecutionInterruptedError());
 }
 
+TFuture<THashMap<TStreamId, TInflightMetricsPtr>> TComputationRunContext::GetInputInflightMetrics()
+{
+    if (auto job = Job_.Lock()) {
+        return job->GetInputInflightMetrics();
+    }
+    return MakeFuture<THashMap<TStreamId, TInflightMetricsPtr>>(MakeExecutionInterruptedError());
+}
+
 void TComputationRunContext::MarkPersisted(std::span<const TMessageId> messageIds)
 {
     if (auto job = Job_.Lock()) {
         return job->MarkPersisted(messageIds);
+    }
+}
+
+void TComputationRunContext::MarkDeduplicated(std::span<const TMessageId> messageIds)
+{
+    if (auto job = Job_.Lock()) {
+        return job->MarkDeduplicated(messageIds);
     }
 }
 

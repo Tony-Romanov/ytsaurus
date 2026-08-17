@@ -49,8 +49,7 @@ public:
             ->ValueDictionaryCompression->MaxAcceptableCompressionRatio)
         , ElectRandomPolicy_(tabletSnapshot->Settings.MountConfig
             ->ValueDictionaryCompression->ElectRandomPolicy)
-        , Logger(TabletNodeLogger().WithTag("%v",
-            tabletSnapshot->LoggingTag))
+        , Logger(TabletNodeLogger().WithTags(tabletSnapshot->LoggingTags))
         , RowDictionaryCompressors_(std::move(rowDictionaryCompressors))
     {
         if (presetPolicy) {
@@ -132,11 +131,11 @@ public:
             columnDecompressor->Decompress(compressedValue, decompressedValue);
             if (!TRef::AreBitwiseEqual(initialValue, decompressedValue)) {
                 auto error = TError("Value decompression double-check failed")
-                    << TErrorAttribute("policy", *ElectedPolicy_)
-                    << TErrorAttribute("dictonary_id", RowDictionaryCompressors_[*ElectedPolicy_].DictionaryId)
-                    << TErrorAttribute("value_id", value.Id)
-                    << TErrorAttribute("row", ToString(*row))
-                    << TErrorAttribute("value", ToString(value));
+                    .With("policy", *ElectedPolicy_)
+                    .With("dictonary_id", RowDictionaryCompressors_[*ElectedPolicy_].DictionaryId)
+                    .With("value_id", value.Id)
+                    .With("row", ToString(*row))
+                    .With("value", ToString(value));
                 YT_LOG_ALERT(error);
                 THROW_ERROR(error);
             }
@@ -326,8 +325,7 @@ public:
         return NTableClient::CreateDictionaryDecompressionSession(
             MakeWeak(this),
             tabletSnapshot->Settings.HunkReaderConfig,
-            TabletNodeLogger().WithTag("%v",
-                tabletSnapshot->LoggingTag));
+            TabletNodeLogger().WithTags(tabletSnapshot->LoggingTags));
     }
 
     TFuture<THashMap<TChunkId, TRowDictionaryDecompressor>> GetDecompressors(
@@ -661,8 +659,7 @@ private:
         TCookie cookie,
         EDictionaryCompressionPolicy policy)
     {
-        auto Logger = TabletNodeLogger().WithTag("%v",
-            tabletSnapshot->LoggingTag);
+        auto Logger = TabletNodeLogger().WithTags(tabletSnapshot->LoggingTags);
 
         auto chunkReaderHost = New<TChunkReaderHost>(
             Bootstrap_->GetClient(),
@@ -691,7 +688,7 @@ private:
             {
                 if (!digestedDictionaryOrError.IsOK()) {
                     auto error = TError("Compression dictionary manager failed to read digested dictionary")
-                        << digestedDictionaryOrError;
+                        .With(digestedDictionaryOrError);
                     YT_LOG_DEBUG(error);
                     cookie.Cancel(error);
                     return;

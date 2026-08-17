@@ -53,7 +53,7 @@ using namespace NServer;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static YT_DEFINE_GLOBAL(const NLogging::TLogger, CoreWatcherLogger, "CoreWatcher");
+static YT_DEFINE_LEAKY_GLOBAL(const NLogging::TLogger, CoreWatcherLogger, "CoreWatcher");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -70,8 +70,8 @@ TGpuCoreReader::TGpuCoreReader(const std::string& corePipePath)
     Fd_ = HandleEintr(::open, corePipePath.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (Fd_ < 0) {
         THROW_ERROR_EXCEPTION("Failed to open GPU core dump pipe")
-            << TErrorAttribute("path", Path_)
-            << TError::FromSystem();
+            .With("path", Path_)
+            .With(TError::FromSystem());
     }
 }
 
@@ -80,8 +80,8 @@ i64 TGpuCoreReader::GetBytesAvailable() const
     int pipeSize;
     if (::ioctl(Fd_, FIONREAD, &pipeSize) < 0) {
         THROW_ERROR_EXCEPTION("Fail to perform ioctl on GPU core dump pipe")
-            << TErrorAttribute("path", Path_)
-            << TError::FromSystem();
+            .With("path", Path_)
+            .With(TError::FromSystem());
     }
 
     return pipeSize;
@@ -118,7 +118,7 @@ TCoreWatcher::TCoreWatcher(
     , Transaction_(transaction)
     , ChunkList_(chunkList)
     , SchemaId_(schemaId)
-    , Logger(CoreWatcherLogger().WithTag("JobId: %v", JobHost_->GetJobId()))
+    , Logger(CoreWatcherLogger().WithTag("JobId", JobHost_->GetJobId()))
 {
     PeriodicExecutor_->Start();
 }
@@ -259,9 +259,9 @@ void TCoreWatcher::DoProcessLinuxCore(const std::string& coreName, int coreIndex
 {
     YT_ASSERT_INVOKER_AFFINITY(IOInvoker_);
 
-    auto Logger = this->Logger().WithTag("CoreName: %v, CoreIndex: %v",
-        coreName,
-        coreIndex);
+    auto Logger = this->Logger()
+        .WithTag("CoreName", coreName)
+        .WithTag("CoreIndex", coreIndex);
 
     TCoreInfo coreInfo;
     coreInfo.set_core_index(coreIndex);
@@ -310,7 +310,7 @@ void TCoreWatcher::DoProcessLinuxCore(const std::string& coreName, int coreIndex
     } catch (const std::exception& ex) {
         YT_LOG_ERROR(ex, "Error while processing core");
         auto error = TError("Error while processing core")
-            << ex;
+            .With(ex);
         ToProto(coreInfo.mutable_error(), error);
         if (!coreInfo.has_executable_name()) {
             coreInfo.set_executable_name("(n/a)");
@@ -352,7 +352,7 @@ void TCoreWatcher::DoProcessGpuCore(IAsyncInputStreamPtr coreStream, int coreInd
     } catch (const std::exception& ex) {
         YT_LOG_ERROR(ex, "Error processing GPU core dump");
         auto error = TError("Error processing GPU core dump")
-            << ex;
+            .With(ex);
         ToProto(coreInfo.mutable_error(), error);
     }
 
@@ -363,9 +363,9 @@ i64 TCoreWatcher::DoReadCore(const IAsyncInputStreamPtr& coreStream, const std::
 {
     YT_ASSERT_INVOKER_AFFINITY(IOInvoker_);
 
-    auto Logger = this->Logger().WithTag("CoreName: %v, CoreIndex: %v",
-        coreName,
-        coreIndex);
+    auto Logger = this->Logger()
+        .WithTag("CoreName", coreName)
+        .WithTag("CoreIndex", coreIndex);
 
     TBlobTableWriter blobTableWriter(
         GetCoreBlobTableSchema(),

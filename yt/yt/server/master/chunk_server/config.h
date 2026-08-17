@@ -339,8 +339,8 @@ struct TDynamicDataNodeTrackerConfig
     // COMPAT(grphil)
     bool IgnoreReplicasWithChangedStateDuringValidation;
 
-    // COMPAT(cherepashka)
     bool EnableChunkReplicasThrottlingInHeartbeats;
+    bool FlushBatchedIncrementalHeartbeatsOnThrottling;
 
     bool EnableLocationIndexesInDataNodeHeartbeats;
 
@@ -908,6 +908,9 @@ struct TDynamicChunkManagerConfig
 
     // COMPAT(koloshmet)
     bool UpdateHistoricallyNonVitalInUnexport;
+
+    // COMPAT(danilalexeev)
+    bool UpdateHistoricallyNonVitalOnChunkCreationAndExport;
 
     bool AllowOffshoreMedia;
 

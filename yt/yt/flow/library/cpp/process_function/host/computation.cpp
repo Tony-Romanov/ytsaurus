@@ -1,5 +1,7 @@
 #include "computation.h"
 
+#include <yt/yt/flow/library/cpp/computation/swift_ordered_source_computation.h>
+
 #include <yt/yt/flow/library/cpp/common/registry.h>
 
 #include <yt/yt/flow/library/cpp/common/input_context.h>
@@ -46,30 +48,55 @@ void TProcessFunctionComputationBase<TBase>::DoInit(IJobInitContextPtr initConte
     auto runtimeInitContext = New<TRuntimeInitContext>(
         std::move(initContext),
         this->StateManager_,
+        this->GetPartitionId(),
         this->GetSpec()->ProcessingFunctionParameters,
-        this->GetContext()->StaticResources);
+        this->GetContext()->StaticResources,
+        this->GetContext()->Profiler);
     Function_->Init(runtimeInitContext);
 }
 
 template <class TBase>
 void TProcessFunctionComputationBase<TBase>::DoProcess(IInputContextPtr input, IOutputCollectorPtr output)
 {
-    RuntimeContext_->RefreshEpochState(this->GetWatermarkState(), this->GetDynamicSpec()->ProcessingFunctionParameters);
+    RefreshRuntimeContext();
     Batch_->Process(input, output, RuntimeContext_);
+}
+
+template <class TBase>
+void TProcessFunctionComputationBase<TBase>::DoSyncIfPresent(IRetryableTransactionPtr transaction)
+{
+    if (SyncFunction_) {
+        RefreshRuntimeContext();
+        SyncFunction_->Sync(transaction, RuntimeContext_);
+    }
+}
+
+template <class TBase>
+void TProcessFunctionComputationBase<TBase>::RefreshRuntimeContext()
+{
+    RuntimeContext_->RefreshEpochState(
+        this->GetWatermarkState(),
+        this->GetDynamicSpec()->ProcessingFunctionParameters,
+        this->GetEpochUniqueSeqNo());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 template class TProcessFunctionComputationBase<TTransformComputation>;
 template class TProcessFunctionComputationBase<TSwiftMapComputation>;
+template class TProcessFunctionComputationBase<TTransformOrderedSourceComputation>;
+template class TProcessFunctionComputationBase<TSwiftOrderedSourceComputation>;
 
 ////////////////////////////////////////////////////////////////////////////////
 
 void TProcessFunctionComputation::DoSync(IRetryableTransactionPtr transaction)
 {
-    if (SyncFunction_) {
-        SyncFunction_->Sync(transaction, RuntimeContext_);
-    }
+    DoSyncIfPresent(std::move(transaction));
+}
+
+void TProcessFunctionTransformOrderedSourceComputation::DoSync(IRetryableTransactionPtr transaction)
+{
+    DoSyncIfPresent(std::move(transaction));
 }
 
 ////////////////////////////////////////////////////////////////////////////////

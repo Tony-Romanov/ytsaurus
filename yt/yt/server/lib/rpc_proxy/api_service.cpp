@@ -60,10 +60,9 @@
 
 #include <yt/yt/client/api/rpc_proxy/helpers.h>
 #include <yt/yt/client/api/rpc_proxy/protocol_version.h>
+#include <yt/yt/client/api/rpc_proxy/request_info.h>
 #include <yt/yt/client/api/rpc_proxy/row_stream.h>
 #include <yt/yt/client/api/rpc_proxy/wire_row_stream.h>
-
-#include <yt/yt/client/rpc/request_info.h>
 
 #include <yt/yt/client/security_client/helpers.h>
 
@@ -1425,7 +1424,7 @@ void TApiService::InitContext(TApiServiceContext<TRequestMessage, TResponseMessa
     using TContext = NYT::NRpcProxy::TApiServiceContext<TRequestMessage, TResponseMessage>;
 
     context->SetLogger(Logger
-        .WithTag("RequestId: %v", context->GetRequestId()));
+        .WithTag("RequestId", context->GetRequestId()));
 
     // First, recover request path from the typed request context using the incredible power of C++20 concepts.
     std::optional<TYPath> requestPath;
@@ -1633,11 +1632,11 @@ private:
     void HandleError(const TError& error)
     {
         auto wrappedError = TError(error.GetCode(), "Internal RPC call failed")
-            << error;
+            .With(error);
         // If request contains path (e.g. GetNode), enrich error with it.
         if constexpr (requires { Context_->Request().path(); }) {
             wrappedError = wrappedError
-                << TErrorAttribute("path", Context_->Request().path());
+                .With("path", Context_->Request().path());
         }
         Context_->Reply(std::move(wrappedError));
     }
@@ -1768,7 +1767,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, GenerateTimestamps)
         },
         [clockClusterTag] (const auto& context, const TTimestamp& timestamp) {
             auto* response = &context->Response();
-            response->set_timestamp(timestamp);
+            response->set_timestamp(ToProto(timestamp));
 
             context->SetResponseInfo("Timestamp: %v@%v",
                 timestamp,
@@ -1816,7 +1815,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, StartTransaction)
     }
     options.PrerequisiteTransactionIds = FromProto<std::vector<TTransactionId>>(request->prerequisite_transaction_ids());
     if (request->has_start_timestamp()) {
-        options.StartTimestamp = request->start_timestamp();
+        options.StartTimestamp = FromProto<NTransactionClient::TTimestamp>(request->start_timestamp());
     }
 
     context->SetRequestInfo("TransactionType: %v, TransactionId: %v, ParentId: %v, PrerequisiteTransactionIds: %v, "
@@ -1844,7 +1843,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, StartTransaction)
         [=, this, this_ = MakeStrong(this)] (const auto& context, const auto& transaction) {
             auto* response = &context->Response();
             ToProto(response->mutable_id(), transaction->GetId());
-            response->set_start_timestamp(transaction->GetStartTimestamp());
+            response->set_start_timestamp(ToProto(transaction->GetStartTimestamp()));
             if (transactionType == ETransactionType::Tablet) {
                 response->set_sequence_number_source_id(NextSequenceNumberSourceId_++);
             }
@@ -1903,11 +1902,11 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, CommitTransaction)
     }
     if (options.ExpectedPrepareSignatures.size() != options.AdditionalParticipantCellIds.size()) {
         THROW_ERROR_EXCEPTION("Expected prepare signatures count mismatch")
-            << TErrorAttribute("additional_participant_cell_ids_size", options.AdditionalParticipantCellIds.size())
-            << TErrorAttribute("expected_prepare_signatures_size", options.ExpectedPrepareSignatures.size());
+            .With("additional_participant_cell_ids_size", options.AdditionalParticipantCellIds.size())
+            .With("expected_prepare_signatures_size", options.ExpectedPrepareSignatures.size());
     }
     if (request->has_max_allowed_commit_timestamp()) {
-        options.MaxAllowedCommitTimestamp = request->max_allowed_commit_timestamp();
+        options.MaxAllowedCommitTimestamp = FromProto<NTransactionClient::TTimestamp>(request->max_allowed_commit_timestamp());
     }
     if (request->has_prerequisite_options()) {
         FromProto(&options, request->prerequisite_options());
@@ -1934,7 +1933,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, CommitTransaction)
         [] (const auto& context, const TTransactionCommitResult& result) {
             auto* response = &context->Response();
             ToProto(response->mutable_commit_timestamps(), result.CommitTimestamps);
-            response->set_primary_commit_timestamp(result.PrimaryCommitTimestamp);
+            response->set_primary_commit_timestamp(ToProto(result.PrimaryCommitTimestamp));
 
             context->SetResponseInfo("PrimaryCommitTimestamp: %v, CommitTimestamps: %v",
                 result.PrimaryCommitTimestamp, result.CommitTimestamps);
@@ -2026,7 +2025,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, AttachTransaction)
         /*searchInPool*/ true);
 
     response->set_type(static_cast<NApi::NRpcProxy::NProto::ETransactionType>(transaction->GetType()));
-    response->set_start_timestamp(transaction->GetStartTimestamp());
+    response->set_start_timestamp(ToProto(transaction->GetStartTimestamp()));
     response->set_atomicity(static_cast<NApi::NRpcProxy::NProto::EAtomicity>(transaction->GetAtomicity()));
     response->set_durability(static_cast<NApi::NRpcProxy::NProto::EDurability>(transaction->GetDurability()));
     response->set_timeout(ToProto(transaction->GetTimeout()));
@@ -3086,7 +3085,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, AlterTable)
         options.ReplicationProgress = FromProto<TReplicationProgress>(request->replication_progress());
     }
     if (request->has_clip_timestamp()) {
-        options.ClipTimestamp = request->clip_timestamp();
+        options.ClipTimestamp = FromProto<NTransactionClient::TTimestamp>(request->clip_timestamp());
     }
 
     context->SetRequestInfo("Path: %v",
@@ -4211,10 +4210,10 @@ static void LookupRowsPrelude(
 
     SetTimeoutOptions(options, context.Get());
 
-    options->Timestamp = request->timestamp();
+    options->Timestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
 
     if constexpr (requires { request->retention_timestamp(); }) {
-        options->RetentionTimestamp = request->retention_timestamp();
+        options->RetentionTimestamp = FromProto<NTransactionClient::TTimestamp>(request->retention_timestamp());
     }
 
     if (request->has_multiplexing_band()) {
@@ -4620,7 +4619,7 @@ template <class TRequest>
 static void FillSelectRowsOptionsBaseFromRequest(const TRequest request, TSelectRowsOptionsBase* options)
 {
     if (request->has_timestamp()) {
-        options->Timestamp = request->timestamp();
+        options->Timestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
     }
     if (request->has_udf_registry_path()) {
         options->UdfRegistryPath = request->udf_registry_path();
@@ -4675,7 +4674,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, SelectRows)
         options.EnableCodeCache = request->enable_code_cache();
     }
     if (request->has_retention_timestamp()) {
-        options.RetentionTimestamp = request->retention_timestamp();
+        options.RetentionTimestamp = FromProto<NTransactionClient::TTimestamp>(request->retention_timestamp());
     }
     // TODO: Support WorkloadDescriptor
     if (request->has_memory_limit_per_node()) {
@@ -4792,14 +4791,14 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PullRows)
     options.OrderRowsByTimestamp = request->order_rows_by_timestamp();
     FromProto(&options.ReplicationProgress, request->replication_progress());
     if (request->has_upper_timestamp()) {
-        options.UpperTimestamp = request->upper_timestamp();
+        options.UpperTimestamp = FromProto<NTransactionClient::TTimestamp>(request->upper_timestamp());
     }
     for (auto protoReplicationRowIndex : request->start_replication_row_indexes()) {
         auto tabletId = FromProto<TTabletId>(protoReplicationRowIndex.tablet_id());
         int rowIndex = protoReplicationRowIndex.row_index();
         if (options.StartReplicationRowIndexes.contains(tabletId)) {
             THROW_ERROR_EXCEPTION("Duplicate tablet id in start replication row indexes")
-                << TErrorAttribute("tablet_id", tabletId);
+                .With("tablet_id", tabletId);
         }
         InsertOrCrash(options.StartReplicationRowIndexes, std::pair(tabletId, rowIndex));
     }
@@ -4880,7 +4879,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, GetInSyncReplicas)
     TGetInSyncReplicasOptions options;
     SetTimeoutOptions(&options, context.Get());
     if (request->has_timestamp()) {
-        options.Timestamp = request->timestamp();
+        options.Timestamp = FromProto<NTransactionClient::TTimestamp>(request->timestamp());
     }
 
     if (request->has_cached_sync_replicas_timeout()) {
@@ -4953,15 +4952,15 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, GetTabletInfos)
                 protoTabletInfo->set_total_row_count(tabletInfo.TotalRowCount);
                 protoTabletInfo->set_trimmed_row_count(tabletInfo.TrimmedRowCount);
                 protoTabletInfo->set_delayed_lockless_row_count(tabletInfo.DelayedLocklessRowCount);
-                protoTabletInfo->set_barrier_timestamp(tabletInfo.BarrierTimestamp);
-                protoTabletInfo->set_last_write_timestamp(tabletInfo.LastWriteTimestamp);
+                protoTabletInfo->set_barrier_timestamp(ToProto(tabletInfo.BarrierTimestamp));
+                protoTabletInfo->set_last_write_timestamp(ToProto(tabletInfo.LastWriteTimestamp));
                 ToProto(protoTabletInfo->mutable_tablet_errors(), tabletInfo.TabletErrors);
 
                 if (tabletInfo.TableReplicaInfos) {
                     for (const auto& replicaInfo : *tabletInfo.TableReplicaInfos) {
                         auto* protoReplicaInfo = protoTabletInfo->add_replicas();
                         ToProto(protoReplicaInfo->mutable_replica_id(), replicaInfo.ReplicaId);
-                        protoReplicaInfo->set_last_replication_timestamp(replicaInfo.LastReplicationTimestamp);
+                        protoReplicaInfo->set_last_replication_timestamp(ToProto(replicaInfo.LastReplicationTimestamp));
                         protoReplicaInfo->set_mode(static_cast<NApi::NRpcProxy::NProto::ETableReplicaMode>(replicaInfo.Mode));
                         protoReplicaInfo->set_current_replication_row_index(replicaInfo.CurrentReplicationRowIndex);
                         protoReplicaInfo->set_committed_replication_row_index(replicaInfo.CommittedReplicationRowIndex);
@@ -5074,7 +5073,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PushQueueProducer)
         },
         [] (const auto& context, const auto& pushQueueProducerResult) {
             auto* response = &context->Response();
-            response->set_last_sequence_number(pushQueueProducerResult.LastSequenceNumber.Underlying());
+            response->set_last_sequence_number(ToProto(pushQueueProducerResult.LastSequenceNumber));
             response->set_skipped_row_count(pushQueueProducerResult.SkippedRowCount);
 
             context->SetResponseInfo(
@@ -5414,8 +5413,8 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, CreateQueueProducerSession)
         [=] (const auto& context, const TCreateQueueProducerSessionResult& result) {
             auto* response = &context->Response();
 
-            response->set_sequence_number(result.SequenceNumber.Underlying());
-            response->set_epoch(result.Epoch.Underlying());
+            response->set_sequence_number(ToProto(result.SequenceNumber));
+            response->set_epoch(ToProto(result.Epoch));
             if (result.UserMeta) {
                 ToProto(response->mutable_user_meta(), ConvertToYsonString(result.UserMeta).ToString());
             }
@@ -5470,7 +5469,7 @@ void TApiService::DoModifyRows(
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION("Error sending rows for table %v",
             path)
-            << TError(ex);
+            .With(TError(ex));
     }
 
     auto rowsetRows = rowset->GetRows();
@@ -5478,8 +5477,8 @@ void TApiService::DoModifyRows(
 
     if (rowsetSize != request.row_modification_types_size()) {
         THROW_ERROR_EXCEPTION("Row count mismatch")
-            << TErrorAttribute("rowset_size", rowsetSize)
-            << TErrorAttribute("row_modification_types_size", request.row_modification_types_size());
+            .With("rowset_size", rowsetSize)
+            .With("row_modification_types_size", request.row_modification_types_size());
     }
 
     auto totalLockCount = request.row_legacy_read_locks_size() + request.row_legacy_locks_size() + request.row_locks_size();
@@ -5489,11 +5488,11 @@ void TApiService::DoModifyRows(
         (totalLockCount != 0 && totalLockCount != rowsetSize))
     {
         THROW_ERROR_EXCEPTION("Lock count mismatch")
-            << TErrorAttribute("rowset_size", rowsetSize)
-            << TErrorAttribute("row_legacy_read_locks_size", request.row_legacy_read_locks_size())
-            << TErrorAttribute("row_legacy_locks_size", request.row_legacy_locks_size())
-            << TErrorAttribute("row_locks_size", request.row_locks_size())
-            << TErrorAttribute("total_lock_count", totalLockCount);
+            .With("rowset_size", rowsetSize)
+            .With("row_legacy_read_locks_size", request.row_legacy_read_locks_size())
+            .With("row_legacy_locks_size", request.row_legacy_locks_size())
+            .With("row_locks_size", request.row_locks_size())
+            .With("total_lock_count", totalLockCount);
     }
 
     std::vector<TRowModification> modifications;
@@ -5538,8 +5537,8 @@ void TApiService::DoModifyRows(
 
             default:
                 THROW_ERROR_EXCEPTION("Unknown modification type")
-                    << TErrorAttribute("row_modification_type", request.row_modification_types(index))
-                    << TErrorAttribute("index", index);
+                    .With("row_modification_type", request.row_modification_types(index))
+                    .With("index", index);
         }
     }
 
@@ -5606,18 +5605,18 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, BatchModifyRows)
     for (int partCount : request->part_counts()) {
         if (partCount < 0) {
             THROW_ERROR_EXCEPTION("Received a negative part count")
-                << TErrorAttribute("part_count", partCount);
+                .With("part_count", partCount);
         }
         if (partCount >= attachmentCount) {
             THROW_ERROR_EXCEPTION("Part count is too large")
-                << TErrorAttribute("part_count", partCount);
+                .With("part_count", partCount);
         }
         expectedAttachmentCount += partCount + 1;
     }
     if (attachmentCount != expectedAttachmentCount) {
         THROW_ERROR_EXCEPTION("Attachment count mismatch")
-            << TErrorAttribute("actual_attachment_count", attachmentCount)
-            << TErrorAttribute("expected_attachment_count", expectedAttachmentCount);
+            .With("actual_attachment_count", attachmentCount)
+            .With("expected_attachment_count", expectedAttachmentCount);
     }
 
     auto transaction = GetTransactionOrThrow(
@@ -6394,10 +6393,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, ReadFile)
         FromProto(&options, request->suppressable_access_tracking_options());
     }
 
-    context->SetRequestInfo("Path: %v, Offset: %v, Length: %v",
-        path,
-        options.Offset,
-        options.Length);
+    SetReadFileRequestInfo(context, *request);
 
     PutMethodInfoInTraceContext("read_file");
 
@@ -6436,10 +6432,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteFile)
         FromProto(&options, request->prerequisite_options());
     }
 
-    context->SetRequestInfo(
-        "Path: %v, ComputeMD5: %v",
-        path,
-        options.ComputeMD5);
+    SetWriteFileRequestInfo(context, path, *request);
 
     PutMethodInfoInTraceContext("write_file");
 
@@ -6631,10 +6624,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, ReadTable)
         format = ConvertTo<NFormats::TFormat>(*rawFormat);
     }
 
-    SetReadTableRequestInfo(
-        context,
-        path,
-        *request);
+    SetReadTableRequestInfo(context, path, *request);
 
     PutMethodInfoInTraceContext("read_table");
 
@@ -6776,9 +6766,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteTable)
     PutMethodInfoInTraceContext("write_table");
 
     auto path = FromProto<TRichYPath>(request->path());
-    context->SetRequestInfo(
-        "Path: %v",
-        path);
+    SetWriteTableRequestInfo(context, path);
 
     NApi::TTableWriterOptions options;
     std::string tableWriterConfig("{}");
@@ -6903,15 +6891,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PartitionTables)
         FromProto(&options, request->transactional_options());
     }
 
-    context->SetRequestInfo("Paths: %v, PartitionMode: %v, KeyGuarantee: %v, DataWeightPerPartition: %v, CompressedDataSizePerPartition: %v, AdjustDataWeightPerPartition: %v, EnableCookies: %v, FetchCookieNodeDescriptors: %v",
-        paths,
-        options.PartitionMode,
-        options.EnableKeyGuarantee,
-        options.DataWeightPerPartition,
-        options.CompressedDataSizePerPartition,
-        options.AdjustDataWeightPerPartition,
-        options.EnableCookies,
-        options.FetchCookieNodeDescriptors);
+    SetPartitionTablesRequestInfo(context, paths, *request);
 
     ExecuteCall(
         context,
@@ -6953,12 +6933,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, ReadTablePartition)
         format = ConvertTo<NFormats::TFormat>(*rawFormat);
     }
 
-    context->SetRequestInfo(
-        "Unordered: %v, OmitInaccessibleColumns: %v, DesiredRowsetFormat: %v, ArrowFallbackRowsetFormat: %v",
-        options.Unordered,
-        options.OmitInaccessibleColumns,
-        NApi::NRpcProxy::NProto::ERowsetFormat_Name(desiredRowsetFormat),
-        NApi::NRpcProxy::NProto::ERowsetFormat_Name(arrowFallbackRowsetFormat));
+    SetReadTablePartitionRequestInfo(context, *request);
 
     PutMethodInfoInTraceContext("read_table_partition");
 
@@ -7039,9 +7014,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, StartDistributedWriteSession)
     TDistributedWriteSessionStartOptions options;
     ParseRequest(&path, &options, *request);
 
-    context->SetRequestInfo(
-        "Path: %v",
-        path);
+    SetStartDistributedWriteSessionRequestInfo(context, path);
 
     ExecuteCall(
         context,
@@ -7065,9 +7038,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PingDistributedWriteSession)
     ParseRequest(&session, &options, *request);
 
     auto concreteSession = ConvertTo<TDistributedWriteSession>(TYsonStringBuf(session.Underlying()->Payload()));
-    context->SetRequestInfo(
-        "TableId: %v",
-        concreteSession.PatchInfo.ObjectId);
+    SetPingDistributedWriteSessionRequestInfo(context, concreteSession.PatchInfo.ObjectId);
 
     ExecuteCall(
         context,
@@ -7087,9 +7058,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, FinishDistributedWriteSession)
 
     auto session = ConvertTo<TDistributedWriteSession>(TYsonStringBuf(sessionWithResults.Session.Underlying()->Payload()));
 
-    context->SetRequestInfo(
-        "TableId: %v",
-        session.PatchInfo.ObjectId);
+    SetFinishDistributedWriteSessionRequestInfo(context, session.PatchInfo.ObjectId);
 
     ExecuteCall(
         context,
@@ -7102,9 +7071,9 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, FinishDistributedWriteSession)
                 if (sessionId != result.SessionId) {
                     THROW_ERROR_EXCEPTION(
                         "Found write results with a different session id")
-                        << TErrorAttribute("finish_distributed_write_session_id", sessionId)
-                        << TErrorAttribute("write_result_session_id", result.SessionId)
-                        << TErrorAttribute("cookie_id", result.CookieId);
+                        .With("finish_distributed_write_session_id", sessionId)
+                        .With("write_result_session_id", result.SessionId)
+                        .With("cookie_id", result.CookieId);
                 }
                 validation.push_back(ValidateSignature(signedResult.Underlying()));
             }
@@ -7137,10 +7106,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteTableFragment)
 
     auto concreteCookie = ConvertTo<TWriteFragmentCookie>(TYsonStringBuf(cookie.Underlying()->Payload()));
 
-    context->SetRequestInfo(
-        "TableId: %v, Main transaction id: %v",
-        concreteCookie.PatchInfo.ObjectId,
-        concreteCookie.MainTransactionId);
+    SetWriteTableFragmentRequestInfo(context, concreteCookie.PatchInfo.ObjectId, concreteCookie.MainTransactionId);
 
     auto isValid = WaitFor(ValidateSignature(cookie.Underlying()))
         .ValueOrThrow();
@@ -7148,8 +7114,8 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteTableFragment)
     if (!isValid) {
         THROW_ERROR_EXCEPTION(
             "Signature validation failed for write table fragment")
-                << TErrorAttribute("session_id", concreteCookie.SessionId)
-                << TErrorAttribute("cookie_id", concreteCookie.CookieId);
+                .With("session_id", concreteCookie.SessionId)
+                .With("cookie_id", concreteCookie.CookieId);
     }
 
     auto tableWriter = WaitFor(client->CreateTableFragmentWriter(cookie, options))
@@ -7176,9 +7142,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, StartDistributedWriteFileSession)
     TRichYPath path;
     TDistributedWriteFileSessionStartOptions options;
     ParseRequest(&path, &options, *request);
-    context->SetRequestInfo(
-        "Path: %v",
-        path);
+    SetStartDistributedWriteFileSessionRequestInfo(context, path);
 
     ExecuteCall(
         context,
@@ -7202,9 +7166,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PingDistributedWriteFileSession)
     ParseRequest(&session, &options, *request);
 
     auto concreteSession = ConvertTo<TDistributedWriteFileSession>(TYsonStringBuf(session.Underlying()->Payload()));
-    context->SetRequestInfo(
-        "FileId: %v",
-        concreteSession.HostData.FileId);
+    SetPingDistributedWriteFileSessionRequestInfo(context, concreteSession.HostData.FileId);
 
     ExecuteCall(
         context,
@@ -7224,9 +7186,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, FinishDistributedWriteFileSession)
 
     auto session = ConvertTo<TDistributedWriteFileSession>(TYsonStringBuf(sessionWithResults.Session.Underlying()->Payload()));
 
-    context->SetRequestInfo(
-        "FileId: %v",
-        session.HostData.FileId);
+    SetFinishDistributedWriteFileSessionRequestInfo(context, session.HostData.FileId);
 
     ExecuteCall(
         context,
@@ -7239,9 +7199,9 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, FinishDistributedWriteFileSession)
                 if (sessionId != result.SessionId) {
                     THROW_ERROR_EXCEPTION(
                         "Found write results with a different session id")
-                        << TErrorAttribute("finish_distributed_write_session_id", sessionId)
-                        << TErrorAttribute("write_result_session_id", result.SessionId)
-                        << TErrorAttribute("cookie_id", result.CookieId);
+                        .With("finish_distributed_write_session_id", sessionId)
+                        .With("write_result_session_id", result.SessionId)
+                        .With("cookie_id", result.CookieId);
                 }
                 validation.push_back(ValidateSignature(signedResult.Underlying()));
             }
@@ -7273,10 +7233,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteFileFragment)
     auto concreteCookie = ConvertTo<TWriteFileFragmentCookie>(TYsonStringBuf(cookie.Underlying()->Payload()));
     const auto& cookieData = concreteCookie.CookieData;
 
-    context->SetRequestInfo(
-        "FileId: %v, Main transaction id: %v",
-        cookieData.FileId,
-        cookieData.MainTransactionId);
+    SetWriteFileFragmentRequestInfo(context, cookieData.FileId, cookieData.MainTransactionId);
 
     auto isValid = WaitFor(ValidateSignature(cookie.Underlying()))
         .ValueOrThrow();
@@ -7284,8 +7241,8 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteFileFragment)
     if (!isValid) {
         THROW_ERROR_EXCEPTION(
             "Signature validation failed for write file fragment")
-                << TErrorAttribute("session_id", concreteCookie.SessionId)
-                << TErrorAttribute("cookie_id", concreteCookie.CookieId);
+                .With("session_id", concreteCookie.SessionId)
+                .With("cookie_id", concreteCookie.CookieId);
     }
 
     auto fileWriter = client->CreateFileFragmentWriter(cookie, options);
@@ -7951,7 +7908,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, ReadShuffleData)
 
     if (!isValid) {
         THROW_ERROR_EXCEPTION("Signature validation failed for shuffle handle")
-            << TErrorAttribute("shuffle_handle", shuffleHandle);
+            .With("shuffle_handle", shuffleHandle);
     }
 
     std::optional<IShuffleClient::TIndexRange> writerIndexRange;
@@ -7961,8 +7918,8 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, ReadShuffleData)
 
         if (!writerIndexBegin.has_value() || !writerIndexEnd.has_value()) {
             THROW_ERROR_EXCEPTION("One or both writer index range limits are empty")
-                << TErrorAttribute("begin", writerIndexBegin)
-                << TErrorAttribute("end", writerIndexEnd);
+                .With("begin", writerIndexBegin)
+                .With("end", writerIndexEnd);
         }
 
         if (*writerIndexBegin > *writerIndexEnd) {
@@ -8042,7 +7999,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteShuffleData)
 
     if (!isValid) {
         THROW_ERROR_EXCEPTION("Signature validation failed for shuffle handle")
-            << TErrorAttribute("shuffle_handle", shuffleHandle);
+            .With("shuffle_handle", shuffleHandle);
     }
 
     auto partitionColumn = request->partition_column();

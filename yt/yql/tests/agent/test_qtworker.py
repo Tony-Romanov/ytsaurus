@@ -1,12 +1,13 @@
 import test_simple
+import test_udfs
 
-from common import TestQueriesYqlBase
+from common import TestQueriesYqlBase, TestUpdateYqlAgentQtWorkerDynamicConfigMixin
 
-from conftest import merge_old_dynconfig_into_new_static
+from yt.environment.helpers import assert_items_equal
 
-from yt_commands import authors, create, write_file, write_table, raises_yt_error, wait
+from yt_commands import authors, create, create_user, write_table, raises_yt_error, wait, update_access_control_object_acl
 
-from google.protobuf.text_format import MessageToString
+from dirty_equals import AnyThing
 
 import pytest
 
@@ -35,18 +36,8 @@ class TestYqlAgentWithQtWorker(test_simple.TestYqlAgent):
 
 
 @authors("mpereskokova")
-class TestYqlAgentDynConfigWithQtWorker(test_simple.TestYqlAgentDynConfig):
+class TestYqlAgentDynConfigWithQtWorker(TestUpdateYqlAgentQtWorkerDynamicConfigMixin, test_simple.TestYqlAgentDynConfig):
     YQL_QTWORKER = True
-
-    def _update_dyn_config(self, yql_agent, dyn_config):
-        if "gateways" in dyn_config:
-            config = yql_agent.render_gateways_conf(yql_agent.yql_agent.env)
-            merge_old_dynconfig_into_new_static(config, dyn_config["gateways"])
-            filename = "//sys/yql_agent/proto_gateways/default.conf"
-            create("file", filename, recursive=True, force=True)
-            write_file(filename, MessageToString(config).encode('utf-8'))
-
-        super()._update_dyn_config(yql_agent, dyn_config)
 
     def _safe_test_query(self, query, rows):
         try:
@@ -78,19 +69,22 @@ class TestYqlAgentDynConfigWithQtWorker(test_simple.TestYqlAgentDynConfig):
         wait(lambda: self._safe_test_query("select * from primary.`//tmp/t`", rows))
 
 
+@authors("ziganshinmr")
+class TestYqlAgentInitialDynConfigWithQtWorker(TestUpdateYqlAgentQtWorkerDynamicConfigMixin, test_simple.TestYqlAgentInitialDynConfig):
+    YQL_QTWORKER = True
+
+
 @authors("mpereskokova")
 class TestMaxYqlVersionConfigAttrWithQtWorker(test_simple.TestMaxYqlVersionConfigAttr):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestNotTableResultWithQtWorker(test_simple.TestNotTableResult):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestGetOperationLinkWithQtWorker(test_simple.TestGetOperationLink):
     YQL_QTWORKER = True
 
@@ -122,13 +116,27 @@ class TestComplexQueriesYqlWithQtWorker(test_simple.TestComplexQueriesYql):
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestExecutionModesYqlWithQtWorker(test_simple.TestExecutionModesYql):
     YQL_QTWORKER = True
 
+    @authors("mpereskokova")
+    def test_validate(self, query_tracker, yql_agent):
+        create("table", "//tmp/t1", attributes={
+            "schema": [{"name": "a", "type": "int64"}]
+        })
+        rows = [{"a": 42}, {"a": 43}]
+        write_table("//tmp/t1", rows)
+
+        for mode in ["validate", 0]:
+            query = self.start_query("yql", "select * from `//tmp/t1`", settings={"execution_mode": mode})
+            query.track()
+            result = query.get()
+            assert result["result_count"] == 0
+            # Unlike the native plugin, the plan is not returned here, which is the correct behavior.
+            assert "yql_plan" not in result["progress"]
+
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestYqlPluginWithQtWorker(test_simple.TestYqlPlugin):
     YQL_QTWORKER = True
 
@@ -144,7 +152,6 @@ class TestAllYqlAgentsOverloadWithQtWorker(test_simple.TestAllYqlAgentsOverload)
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestPartialYqlAgentsOverloadWithQtWorker(test_simple.TestPartialYqlAgentsOverload):
     YQL_QTWORKER = True
 
@@ -155,25 +162,21 @@ class TestQueriesYqlLimitedResultWithQtWorker(test_simple.TestQueriesYqlLimitedR
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestQueriesYqlResultTruncationWithQtWorker(test_simple.TestQueriesYqlResultTruncation):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestQueriesYqlAuthWithQtWorker(test_simple.TestQueriesYqlAuth):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestQueriesYqlWithSecretsWithQtWorker(test_simple.TestQueriesYqlWithSecrets):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestQueriesYqlWithSecretProtectionWithQtWorker(test_simple.TestQueriesYqlWithSecretProtection):
     YQL_QTWORKER = True
 
@@ -199,13 +202,11 @@ class TestYqlColumnOrderSelectScalarsWithQtWorker(test_simple.TestYqlColumnOrder
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestYqlColumnOrderDifferentSourcesWithQtWorker(test_simple.TestYqlColumnOrderDifferentSources):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestAssignedEngineWithQtWorker(test_simple.TestAssignedEngine):
     YQL_QTWORKER = True
 
@@ -216,19 +217,16 @@ class TestAstReturnsWithQtWorker(test_simple.TestAstReturns):
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestYqlVersionChangesWithQtWorker(test_simple.TestYqlVersionChanges):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestAgentWithInvalidMaxYqlVersionWithQtWorker(test_simple.TestAgentWithInvalidMaxYqlVersion):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestAgentWithUndefinedMaxYqlVersionWithQtWorker(test_simple.TestAgentWithUndefinedMaxYqlVersion):
     YQL_QTWORKER = True
 
@@ -269,24 +267,136 @@ class TestGetQueryTrackerInfoWithVisibleYqlVersionBothNotReleasedWithQtWorker(te
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestDeclareWithQtWorker(test_simple.TestDeclare):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestsDDLWithQtWorker(test_simple.TestsDDL):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestCrossClusterQueriesYqlWithQtWorker(test_simple.TestCrossClusterQueriesYql):
     YQL_QTWORKER = True
 
 
 @authors("mpereskokova")
-@pytest.mark.skip(reason="TODO@mpereskokova")
 class TestOperationOptionsWithQtWorker(test_simple.TestOperationOptions):
     YQL_QTWORKER = True
+
+
+@authors("ziganshinmr")
+class TestUdfsWithQtWorker(test_udfs.TestUdfs):
+    YQL_QTWORKER = True
+
+
+@authors("ziganshinmr")
+class TestPythonUdfWithQtWorker(test_udfs.TestPythonUdf):
+    YQL_QTWORKER = True
+
+
+@authors("ziganshinmr")
+class TestUdfRegistry(TestQueriesYqlBase):
+    YQL_QTWORKER = True
+
+    # Note that UDFs from yql/essentials/udfs/common/
+    # are preloaded as trusted during qtworker startup,
+    # so we are using SimpleUdf which is outside of this path
+    YQL_UDF_REGISTRY = {
+        "simple": {
+            "path": "yql/essentials/udfs/test/simple/libsimple_udf.so",
+            "modules": {
+                "SimpleUdf": {
+                    "functions": [
+                        {
+                            "OptionalArgCount": 0,
+                            "ArgCount": 1,
+                            "MinLangVer": 0,
+                            "SupportsBlocks": False,
+                            "Name": "SimpleUdf.Echo",
+                            "RunConfigType": "[\"VoidType\"]",
+                            "IsTypeAwareness": False,
+                            "IsStrict": False,
+                            "CallableType": "[\"CallableType\";[];[[\"DataType\";\"String\"]];[[[\"OptionalType\";[\"DataType\";\"String\"]]]]]",
+                            "MaxLangVer": 0
+                        }
+                    ]
+                }
+            },
+        },
+    }
+
+    @authors("ziganshinmr")
+    @pytest.mark.timeout(120)
+    def test_udf_registry(self, query_tracker, yql_agent):
+        create("table", "//tmp/t", attributes={"schema": [{"name": "a", "type": "string"}]})
+        write_table("//tmp/t", [{"a": "a meow"}])
+        query = self.start_query("yql", "select SimpleUdf::Echo(a) as echoed_a from primary.`//tmp/t`")
+        query.track()
+        result = query.read_result(0)
+        assert_items_equal(result, [{"echoed_a": "a meow"}])
+
+    @authors("ziganshinmr")
+    @pytest.mark.timeout(120)
+    def test_udf_meta(self, query_tracker, yql_agent):
+        cluster = yql_agent.yql_agent.env.id
+        addresss = yql_agent.yql_agent.env.get_http_proxy_address()
+
+        with raises_yt_error("Query of type \"UdfMeta\" must not be indexed"):
+            self.start_query(
+                "yql",
+                "",
+                settings={"query_type": "udf_meta"},
+                access_control_objects=["admin"]
+                # Indexed
+            ).track()
+
+        with raises_yt_error("Query of type \"UdfMeta\" is expected to have only \"admin\" access control object set"):
+            self.start_query(
+                "yql",
+                "",
+                settings={"query_type": "udf_meta", "is_indexed": False},
+                # No ACO
+            ).track()
+
+        with raises_yt_error("\"Administer\" permission required to run \"UdfMeta\" queries"):
+            create_user("unprivileged")
+            self.start_query(
+                "yql",
+                "",
+                settings={"query_type": "udf_meta", "is_indexed": False},
+                access_control_objects=["admin"],
+                authenticated_user="unprivileged"
+            ).track()
+
+        create_user("privileged")
+        update_access_control_object_acl("queries", "admin", [
+            {"action": "allow", "subjects": ["privileged"], "permissions": ["administer"], "inheritance_mode": "object_and_descendants"},
+        ])
+
+        query = self.start_query(
+            "yql",
+            "",
+            files=[{"name": "simple", "content": f"yt://{cluster}//sys/yql_agent/udfs/libsimple_udf.so", "type": "url"}],
+            settings={"query_type": "udf_meta", "is_indexed": False},
+            access_control_objects=["admin"],
+            authenticated_user="privileged"
+        )
+        query.track()
+        result = query.read_result(0)
+
+        assert len(result) == 1
+        udf_meta = result[0].get("result")
+        assert udf_meta == [
+            {
+                "Imports": [
+                    {
+                        "CustomUdfPrefix": "",
+                        "Modules": ["SimpleUdf"],
+                        "FileAlias": f"yt://{addresss}//sys/yql_agent/udfs/libsimple_udf.so",
+                    }
+                ],
+                "Udfs": AnyThing(),
+            }
+        ]

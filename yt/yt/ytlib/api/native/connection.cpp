@@ -76,6 +76,7 @@
 #include <yt/yt/ytlib/offshore_data_gateway/offshore_data_gateway_channel.h>
 
 #include <yt/yt/ytlib/security_client/permission_cache.h>
+#include <yt/yt/ytlib/security_client/query_pool_permission_cache.h>
 #include <yt/yt/ytlib/security_client/user_attribute_cache.h>
 
 #include <yt/yt/ytlib/tablet_balancer_client/tablet_balancer_channel.h>
@@ -224,12 +225,12 @@ public:
         : StaticConfig_(std::move(staticConfig))
         , Config_(std::move(dynamicConfig))
         , Options_(options)
-        , LoggingTag_(Format("PrimaryCellTag: %v, ConnectionId: %v, ConnectionName: %v",
-            CellTagFromId(StaticConfig_->PrimaryMaster->CellId),
-            TGuid::Create(),
-            StaticConfig_->ConnectionName))
+        , LoggingTags_(NLogging::TLoggingTagList()
+            .With("PrimaryCellTag", CellTagFromId(StaticConfig_->PrimaryMaster->CellId))
+            .With("ConnectionId", TGuid::Create())
+            .With("ConnectionName", StaticConfig_->ConnectionName))
         , ClusterId_(MakeConnectionClusterId(StaticConfig_))
-        , Logger(ApiLogger().WithRawTag(LoggingTag_))
+        , Logger(ApiLogger().WithTags(LoggingTags_))
         , Profiler_(TProfiler("/connection").WithTag("connection_name", StaticConfig_->ConnectionName))
         , TabletSyncReplicaCache_(New<TTabletSyncReplicaCache>())
         , BannedReplicaTrackerCache_(CreateBannedReplicaTrackerCache(StaticConfig_->BannedReplicaTrackerCache, Logger))
@@ -266,7 +267,7 @@ public:
         }
 
         if (config->EnableDynamicCacheStickyGroupSize) {
-            YT_LOG_INFO("Dynamic cache sticky group size enabled");
+            YT_TLOG_INFO("Dynamic cache sticky group size enabled");
             StickyGroupSizeCache_ = New<TStickyGroupSizeCache>(
                 config->StickyGroupSizeCacheExpirationTimeout,
                 GetInvoker());
@@ -316,7 +317,7 @@ public:
             GetMasterChannelOrThrow(EMasterChannelKind::Follower),
             GetNetworks());
 
-        OffshoreDataGatewayChannel_ = NOffshoreDataGateway::CreateOffshoreDataGatewayChannel(
+        OffshoreDataGatewayChannelManager_ = NOffshoreDataGateway::CreateOffshoreDataGatewayChannelManager(
             config->OffshoreDataGateway,
             ChannelFactory_,
             this);
@@ -337,6 +338,11 @@ public:
             config->PermissionCache,
             this,
             Profiler_.WithPrefix("/permission_cache"));
+
+        QueryPoolPermissionCache_ = New<TQueryPoolPermissionCache>(
+            config->PermissionCache,
+            this,
+            Profiler_.WithPrefix("/query_pool_permission_cache"));
 
         UserAttributeCache_ = New<TUserAttributeCache>(
             config->UserAttributeCache,
@@ -474,9 +480,9 @@ public:
         return GetPrimaryMasterCellTag();
     }
 
-    const std::string& GetLoggingTag() const override
+    const NLogging::TLoggingTagList& GetLoggingTags() const override
     {
-        return LoggingTag_;
+        return LoggingTags_;
     }
 
     const std::string& GetClusterId() const override
@@ -532,6 +538,11 @@ public:
         return PermissionCache_;
     }
 
+    const TQueryPoolPermissionCachePtr& GetQueryPoolPermissionCache() override
+    {
+        return QueryPoolPermissionCache_;
+    }
+
     const TUserAttributeCachePtr& GetUserAttributeCache() override
     {
         return UserAttributeCache_;
@@ -581,6 +592,7 @@ public:
     {
         TableMountCache_->Clear();
         PermissionCache_->Clear();
+        QueryPoolPermissionCache_->Clear();
         UserAttributeCache_->Clear();
     }
 
@@ -713,9 +725,14 @@ public:
         return TabletBalancerChannel_;
     }
 
-    const IChannelPtr& GetOffshoreDataGatewayChannel() override
+    IChannelPtr GetStickyOffshoreDataGatewayChannel() override
     {
-        return OffshoreDataGatewayChannel_;
+        return OffshoreDataGatewayChannelManager_->GetStickyChannel();
+    }
+
+    const IChannelPtr& GetNonStickyOffshoreDataGatewayChannel() override
+    {
+        return OffshoreDataGatewayChannelManager_->GetNonStickyChannel();
     }
 
     IChannelPtr GetChaosChannelByCellId(TCellId cellId, EPeerKind peerKind) override
@@ -991,9 +1008,9 @@ public:
         const std::vector<TCellId>& srcCellIds,
         TCellId dstCellId) override
     {
-        YT_LOG_DEBUG("Started synchronizing Hive cell with others (SrcCellIds: %v, DstCellId: %v)",
-            srcCellIds,
-            dstCellId);
+        YT_TLOG_DEBUG("Started synchronizing Hive cell with others")
+            .With("SrcCellIds", srcCellIds)
+            .With("DstCellId", dstCellId);
 
         auto channel = CellDirectory_->GetChannelByCellIdOrThrow(dstCellId);
         THiveServiceProxy proxy(std::move(channel));
@@ -1009,9 +1026,9 @@ public:
                     "Error synchronizing Hive cell %v with %v",
                     dstCellId,
                     srcCellIds);
-                YT_LOG_DEBUG("Finished synchronizing Hive cell with others (SrcCellIds: %v, DstCellId: %v)",
-                    srcCellIds,
-                    dstCellId);
+                YT_TLOG_DEBUG("Finished synchronizing Hive cell with others")
+                    .With("SrcCellIds", srcCellIds)
+                    .With("DstCellId", dstCellId);
             }));
     }
 
@@ -1065,7 +1082,7 @@ private:
 
     TConnectionOptions Options_;
 
-    const std::string LoggingTag_;
+    const NLogging::TLoggingTagList LoggingTags_;
     const std::string ClusterId_;
 
     NRpc::IChannelFactoryPtr ChannelFactory_;
@@ -1092,7 +1109,7 @@ private:
     IChannelPtr BundleControllerChannel_;
     IChannelPtr TabletBalancerChannel_;
 
-    IChannelPtr OffshoreDataGatewayChannel_;
+    NOffshoreDataGateway::IOffshoreDataGatewayChannelManagerPtr OffshoreDataGatewayChannelManager_;
 
     THashMap<std::string, IChannelPtr> QueueAgentChannels_;
     IQueueConsumerRegistrationManagerPtr QueueConsumerRegistrationManager_;
@@ -1105,6 +1122,7 @@ private:
     IClockManagerPtr ClockManager_;
     TJobShellDescriptorCachePtr JobShellDescriptorCache_;
     TPermissionCachePtr PermissionCache_;
+    TQueryPoolPermissionCachePtr QueryPoolPermissionCache_;
     TUserAttributeCachePtr UserAttributeCache_;
     TSyncReplicaCachePtr SyncReplicaCache_;
 
@@ -1401,12 +1419,16 @@ private:
                 try {
                     config = ConvertTo<NNative::TConnectionDynamicConfigPtr>(nativeConnectionConfig);
                 } catch (const std::exception& ex) {
-                    YT_LOG_ERROR(ex, "Cannot update cluster TVM ids because of invalid connection config (Name: %v)", name);
+                    YT_TLOG_ERROR("Cannot update cluster TVM ids because of invalid connection config")
+                        .With("Name", name)
+                        .With(ex);
                     return;
                 }
 
                 if (config->TvmId) {
-                    YT_LOG_INFO("Adding cluster service ticket to TVM client (Name: %v, TvmId: %v)", name, *config->TvmId);
+                    YT_TLOG_INFO("Adding cluster service ticket to TVM client")
+                        .With("Name", name)
+                        .With("TvmId", *config->TvmId);
                     tvmService->AddDestinationServiceIds({*config->TvmId});
                 }
             }));
@@ -1681,7 +1703,8 @@ TFuture<IConnectionPtr> InsistentGetRemoteConnection(
 
         auto Logger = ApiLogger();
         TError error = TError("Unknown insistent get remote connection mode %v", mode);
-        YT_LOG_ALERT(error);
+        YT_TLOG_ALERT("Unknown insistent get remote connection mode")
+            .With("Mode", mode);
         return MakeFuture(error);
     }();
 
@@ -1738,7 +1761,7 @@ TFuture<std::vector<IConnectionPtr>> InsistentGetMultipleRemoteConnections(
                         }
 
                         return TError("Failed to get remote connections for some clusters")
-                            << std::move(errors);
+                            .With(std::move(errors));
                     }));
             }
             case EInsistentGetRemoteConnectionMode::WaitFirstSuccessfulSync: {
@@ -1752,7 +1775,8 @@ TFuture<std::vector<IConnectionPtr>> InsistentGetMultipleRemoteConnections(
 
         auto Logger = ApiLogger();
         TError error = TError("Unknown insistent get remote connection mode %v", mode);
-        YT_LOG_ALERT(error);
+        YT_TLOG_ALERT("Unknown insistent get remote connection mode")
+            .With("Mode", mode);
         return MakeFuture(error);
     }();
 

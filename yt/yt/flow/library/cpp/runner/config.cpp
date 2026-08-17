@@ -32,6 +32,8 @@ void TFlowNodeConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("clients_cache", &TThis::ClientsCache)
         .DefaultNew();
+    registrar.Parameter("clients_cache_factory", &TThis::ClientsCacheFactory)
+        .Default();
 
     registrar.Parameter("rpc_port", &TThis::RpcPort)
         .Default(0)
@@ -83,6 +85,9 @@ void TFlowNodeConfig::Register(TRegistrar registrar)
         .Default(false);
 
     registrar.Parameter("enable_phdr_cache", &TThis::EnablePhdrCache)
+        .Default(true);
+
+    registrar.Parameter("enable_porto_resource_tracker", &TThis::EnablePortoResourceTracker)
         .Default(true);
 
     registrar.Preprocessor([] (TThis* config) {

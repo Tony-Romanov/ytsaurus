@@ -125,6 +125,9 @@ void TTabletManagerDynamicConfig::Register(TRegistrar registrar)
     registrar.Parameter("extended_snapshot_eviction_timeout", &TThis::ExtendedSnapshotEvictionTimeout)
         .Default(TDuration::Minutes(3));
 
+    registrar.Parameter("wait_on_read_only_smooth_movement_stage_timeout", &TThis::WaitOnReadOnlySmoothMovementStageTimeout)
+        .Default(TDuration::MilliSeconds(500));
+
     registrar.Parameter("yield_before_building_lsm_actions", &TThis::YieldBeforeBuildingLsmActions)
         .Default(false);
 }
@@ -265,6 +268,9 @@ void TStoreCompactorDynamicConfig::Register(TRegistrar registrar)
         .Optional();
     registrar.Parameter("partitioning_query_pool", &TThis::PartitioningFairSharePool)
         .Optional();
+
+    registrar.Parameter("reuse_compaction_invoker_for_writer_compression", &TThis::ReuseCompactionInvokerForWriterCompression)
+        .Default(false);
 
     registrar.Parameter("schedule_new_tasks_after_task_completion", &TThis::ScheduleNewTasksAfterTaskCompletion)
         .Default(true);
@@ -864,6 +870,7 @@ void TTabletNodeConfig::Register(TRegistrar registrar)
 
     registrar.Preprocessor([] (TThis* config) {
         config->VersionedChunkMetaCache->Capacity = 10_GB;
+        config->ClientCache->Capacity = 1024;
     });
 
     registrar.Postprocessor([] (TThis* config) {

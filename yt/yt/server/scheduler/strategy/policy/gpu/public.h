@@ -9,6 +9,7 @@ namespace NYT::NScheduler::NStrategy::NPolicy::NGpu {
 
 DEFINE_ENUM(EGpuAssignmentPlanningStage,
     (FullHostModuleBound)
+    (FullHostNonGang)
     (Normal)
     (WithExtraResources)
     (LimitsCheck)
@@ -26,6 +27,8 @@ DECLARE_REFCOUNTED_CLASS(TOperation)
 DECLARE_REFCOUNTED_CLASS(TNode)
 
 DECLARE_REFCOUNTED_STRUCT(TGpuPlanUpdateStatistics)
+
+struct IAssignmentPlanUpdateContext;
 
 ////////////////////////////////////////////////////////////////////////////////
 

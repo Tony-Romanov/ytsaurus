@@ -1846,10 +1846,9 @@ DEFINE_REFCOUNTED_TYPE(TInputQueryOptions)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TInputlyQueryableSpec
+struct TInputlyQueryableSpec
     : public virtual NYTree::TYsonStruct
 {
-public:
     std::optional<std::string> InputQuery;
     std::optional<NTableClient::TTableSchema> InputSchema;
     TInputQueryFilterOptionsPtr InputQueryFilterOptions;
@@ -1864,10 +1863,9 @@ DEFINE_REFCOUNTED_TYPE(TInputlyQueryableSpec)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TOperationWithUserJobSpec
+struct TOperationWithUserJobSpec
     : public virtual NYTree::TYsonStruct
 {
-public:
     std::optional<NYPath::TRichYPath> StderrTablePath;
     NTableClient::TBlobTableWriterConfigPtr StderrTableWriter;
 
@@ -2158,6 +2156,11 @@ struct TSortOperationSpecBase
     std::optional<i64> CompressedDataSizePerPartitionJob;
 
     std::optional<int> PartitionJobCount;
+
+    //! Hard limit on the number of partition jobs (map jobs in map-reduce).
+    //! Unlike |PartitionJobCount|, which pins the exact job count,
+    //! this option only caps the job count inferred from data size heuristics.
+    std::optional<int> MaxPartitionJobCount;
 
     //! Data size per shuffle job.
     i64 DataWeightPerShuffleJob;

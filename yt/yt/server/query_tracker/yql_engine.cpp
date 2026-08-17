@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "handler_base.h"
+#include "helpers.h"
 
 #include <yt/yt/ytlib/query_tracker_client/records/query.record.h>
 
@@ -33,6 +34,7 @@ using namespace NYqlClient;
 using namespace NYqlClient::NProto;
 using namespace NYson;
 using namespace NConcurrency;
+using namespace NSecurityClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -52,6 +54,7 @@ struct TYqlSettings
 {
     std::optional<std::string> Stage;
     EExecuteMode ExecuteMode;
+    EQueryType QueryType;
 
     REGISTER_YSON_STRUCT(TYqlSettings);
 
@@ -61,6 +64,8 @@ struct TYqlSettings
             .Optional();
         registrar.Parameter("execution_mode", &TThis::ExecuteMode)
             .Default(EExecuteMode::Run);
+        registrar.Parameter("query_type", &TThis::QueryType)
+            .Default(EQueryType::Regular);
     }
 };
 
@@ -87,9 +92,8 @@ public:
         const TYqlEngineConfigPtr& config,
         const NQueryTrackerClient::NRecords::TActiveQuery& activeQuery,
         const NApi::NNative::IConnectionPtr& connection,
-        const IInvokerPtr& controlInvoker,
-        const TDuration notIndexedQueriesTTL)
-        : TQueryHandlerBase(stateClient, stateRoot, controlInvoker, config, activeQuery, notIndexedQueriesTTL)
+        const IInvokerPtr& controlInvoker)
+        : TQueryHandlerBase(stateClient, stateRoot, controlInvoker, config, activeQuery)
         , Query_(activeQuery.Query)
         , Config_(config)
         , Files_(ConvertTo<std::optional<std::vector<TQueryFilePtr>>>(activeQuery.Files).value_or(std::vector<TQueryFilePtr>()))
@@ -97,6 +101,7 @@ public:
         , Settings_(ConvertTo<TYqlSettingsPtr>(SettingsNode_))
         , Stage_(Settings_->Stage.value_or(Config_->Stage))
         , ExecuteMode_(Settings_->ExecuteMode)
+        , QueryType_(Settings_->QueryType)
         , Secrets_(MakeSecrets(activeQuery.Secrets))
         , ProgressGetterExecutor_(New<TPeriodicExecutor>(controlInvoker, BIND(&TYqlQueryHandler::GetProgress, MakeWeak(this)), Config_->QueryProgressGetPeriod))
     { }
@@ -108,6 +113,28 @@ public:
 
     void Start() override
     {
+        if (QueryType_ != EQueryType::Regular) {
+            if (IsIndexed_) {
+                THROW_ERROR_EXCEPTION("Query of type %Qv must not be indexed", QueryType_);
+            }
+
+            auto accessControlObjectList = ConvertTo<std::optional<std::vector<std::string>>>(AccessControlObjects_);
+            if (!accessControlObjectList || accessControlObjectList->size() != 1 || (*accessControlObjectList)[0] != AdminAccessControlObjectName) {
+                THROW_ERROR_EXCEPTION("Query of type %Qv is expected to have only %Qv access control object set",
+                    QueryType_,
+                    AdminAccessControlObjectName);
+            }
+
+            if (CheckAccessControl(User_, AccessControlObjects_, StateClient_, EPermission::Administer) == ESecurityAction::Deny) {
+                THROW_ERROR_EXCEPTION(NSecurityClient::EErrorCode::AuthorizationError,
+                    "%Qv permission required to run %Qv queries",
+                    EPermission::Administer,
+                    QueryType_)
+                    .With("user", User_)
+                    .With("access_control_objects", AccessControlObjects_);
+            }
+        }
+
         auto providerInfo = Connection_->GetYqlAgentChannelProviderOrThrow(Stage_);
         YqlAgentChannelProvider_ = providerInfo.first;
         YqlAgentChannelProviderConfig_ = providerInfo.second;
@@ -151,6 +178,7 @@ private:
     const TYqlSettingsPtr Settings_;
     const std::string Stage_;
     const EExecuteMode ExecuteMode_;
+    const EQueryType QueryType_;
     const IInvokerPtr ProgressInvoker_;
     const std::vector<TQuerySecretPtr> Secrets_;
 
@@ -184,6 +212,7 @@ private:
         yqlRequest->set_query(Query_);
         yqlRequest->set_settings(ToProto(ConvertToYsonString(SettingsNode_)));
         yqlRequest->set_mode(ToProto(ExecuteMode_));
+        yqlRequest->set_query_type(ToProto(QueryType_));
 
         for (const auto& file : Files_) {
             auto* protoFile = yqlRequest->add_files();
@@ -455,16 +484,14 @@ public:
             Config_,
             activeQuery,
             DynamicPointerCast<NNative::IConnection>(StateClient_->GetConnection()),
-            ControlQueue_->GetInvoker(),
-            NotIndexedQueriesTTL_);
+            ControlQueue_->GetInvoker());
     }
 
-    void Reconfigure(const TEngineConfigBasePtr& config, const TDuration notIndexedQueriesTTL) override
+    void Reconfigure(const TEngineConfigBasePtr& config) override
     {
         YT_ASSERT_THREAD_AFFINITY(ControlThread);
 
         Config_ = DynamicPointerCast<TYqlEngineConfig>(config);
-        NotIndexedQueriesTTL_ = notIndexedQueriesTTL;
     }
 
     std::optional<IProxyEngineProviderPtr> GetProxyEngineProvider() override
@@ -478,7 +505,6 @@ private:
     const TActionQueuePtr ControlQueue_;
     const IProxyEngineProviderPtr ProxyEngineProvider_;
     TYqlEngineConfigPtr Config_;
-    TDuration NotIndexedQueriesTTL_;
 
     DECLARE_THREAD_AFFINITY_SLOT(ControlThread);
 };

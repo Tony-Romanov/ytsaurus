@@ -29,11 +29,17 @@ on:
 env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
+permissions:
+  contents: read
+
 jobs:
 
   notify-start:
     name: Notify PR start
     runs-on: trampoline
+    permissions:
+      issues: write
+      pull-requests: write
     outputs:
       comment-id: ${{ steps.notify-pr.outputs.comment-id }}
     steps:
@@ -63,9 +69,10 @@ jobs:
     steps:
       - name: Start YC runner
         id: start-yc-runner
-        uses: yc-actions/yc-github-runner@v1
+        uses: yc-actions/yc-github-runner@v2.1.0
         with:
           mode: start
+          retry-timeout: PT5M
           yc-sa-json-credentials: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
           folder-id: ${{ vars.YC_FOLDER_ID }}
@@ -76,7 +83,7 @@ jobs:
           memory: 64GB
           core-fraction: 100
           disk-type: network-ssd-nonreplicated
-          disk-size: 558GB
+          disk-size: 744GB
           user: ${{ secrets.YC_VM_USERNAME }}
           ssh-public-key: ${{ secrets.YC_VM_SSH_PUBLIC_KEY }}
           public-ip: false
@@ -95,11 +102,15 @@ jobs:
           ref: ${{ inputs.commit-sha }}
           fetch-depth: 2
           path: ytsaurus
+          allow-unsafe-pr-checkout: true
 
   build-strawberry:
     name: Build Strawberry controller
+    permissions:
+      contents: read
     with:
       runs-on-value: ubuntu-latest
+      checkout-ref: ${{ inputs.commit-sha }}
     uses: ./.github/workflows/strawberry-action.yaml
 
   build-check-cmake:
@@ -143,6 +154,10 @@ jobs:
       - notify-start
       - checkout
     if: ${{ needs.build-ya-make.result == 'success' }}
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     uses: ./.github/workflows/pr-tests.yaml
     with:
       runs-on-value: ${{ needs.start-vm.outputs.label }}
@@ -162,6 +177,9 @@ jobs:
       - build-check-cmake
       - build-strawberry
     runs-on: trampoline
+    permissions:
+      issues: write
+      pull-requests: write
     if: ${{ always() }}
     steps:
       - name: Notify PR
@@ -200,9 +218,10 @@ jobs:
     if: ${{ always() }}
     steps:
       - name: Stop YC runner
-        uses: yc-actions/yc-github-runner@v1
+        uses: yc-actions/yc-github-runner@v2.1.0
         with:
           mode: stop
+          retry-timeout: PT5M
           yc-sa-json-credentials: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
           label: ${{ needs.start-vm.outputs.label }}

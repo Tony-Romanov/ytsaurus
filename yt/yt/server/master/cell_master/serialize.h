@@ -210,6 +210,12 @@ DEFINE_ENUM(EMasterReign,
     ((ExpirationArmingTime_26_2)                                    (3335))  // theevilbird
     ((VerboseChunkLogging)                                          (3336))  // evanevannnn
     ((FixBoomerangWaveEviction)                                     (3337))  // babenko
+    ((DropHasHunkChunkListUserAttribute)                            (3338))  // babenko
+    ((FixWaitableLocksAccumulation)                                 (3339))  // ivpiskarev
+    ((DetachChunkTrees)                                             (3340))  // babenko
+    ((ChunkMergerInfo)                                              (3341))  // aleksandra-zh
+    ((CustomCumulativeDataWeightForNewQueues)                       (3342))  // akozhikhov
+    ((SkipScratchChunkListParent)                                   (3343))  // babenko
 );
 
 static_assert(TEnumTraits<EMasterReign>::IsMonotonic, "Master reign enum is not monotonic");

@@ -97,11 +97,11 @@ public:
                     .WithTag("computation_id", computationId.Underlying())
                     .WithGlobal());
             context->StatusProfiler = Context_->StatusProfiler->WithPrefix(Format("/computation_controllers/%v", computationId.Underlying()));
-            context->Logger = Logger().WithTag("ComputationId: %v", computationId.Underlying());
+            context->Logger = Logger().WithTag("ComputationId", computationId);
             context->ClientsCache = Context_->ClientsCache;
             context->PipelinePath = Context_->PipelinePath;
             context->Invoker = Context_->MainCycleInvoker;
-            context->PublicLogger = PublicControllerLogger().WithTag("ComputationId: %v", computationId.Underlying());
+            context->PublicLogger = PublicControllerLogger().WithTag("ComputationId", computationId);
             auto dynamicContext = New<TDynamicComputationControllerContext>();
             dynamicContext->DynamicComputationSpec = dynamicSpec;
 
@@ -122,8 +122,8 @@ public:
                 ComputationControllers_[computationId] = controller;
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Failed to create computation controller")
-                    << TErrorAttribute("computation_id", computationId)
-                    << TError(ex);
+                    .With("computation_id", computationId)
+                    .With(TError(ex));
             }
         }
 
@@ -131,8 +131,10 @@ public:
             auto resourceControllerContext = New<TResourceControllerContext>();
             resourceControllerContext->ResourceId = resourceId;
             resourceControllerContext->ResourceSpec = resourceSpec;
+            resourceControllerContext->ClientsCache = Context_->ClientsCache;
+            resourceControllerContext->PipelinePath = Context_->PipelinePath;
             resourceControllerContext->Invoker = Context_->MainCycleInvoker;
-            resourceControllerContext->Logger = Logger().WithTag("ResourceController: %v", resourceId.Underlying());
+            resourceControllerContext->Logger = Logger().WithTag("ResourceController", resourceId);
             resourceControllerContext->Profiler = WithPipelineRelatedTags(
                 ControllerProfiler()
                     .WithPrefix("/resource_controller")
@@ -154,13 +156,20 @@ public:
                 EmplaceOrCrash(ResourceControllers_, resourceId, TResourceControllerEntry{.Controller = std::move(resourceController)});
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION("Failed to create resource controller")
-                    << TErrorAttribute("resource_id", resourceId)
-                    << TError(ex);
+                    .With("resource_id", resourceId)
+                    .With(TError(ex));
             }
         }
 
         for (const auto& workerGroup : workerGroups) {
             EmplaceOrCrash(BalanceSynchronizers_, workerGroup, NBalancer::CreateBalanceAsyncSynchronizer(Profiler_.WithPrefix("/job_balancer"), workerGroup));
+            auto errorStatePath = workerGroup.Underlying().empty()
+                ? "/insufficient_workers/default"
+                : Format("/insufficient_workers/groups/%v", workerGroup.Underlying());
+            EmplaceOrCrash(
+                InsufficientWorkersErrorStates_,
+                workerGroup,
+                Context_->StatusProfiler->ErrorState(errorStatePath));
         }
         ActualizeBalancing();
     }
@@ -284,8 +293,8 @@ public:
                     }
                 } catch (const std::exception& ex) {
                     THROW_ERROR_EXCEPTION(ex)
-                        << TErrorAttribute("computation_id", computationId)
-                        << TErrorAttribute("partition_id", partitionId);
+                        .With("computation_id", computationId)
+                        .With("partition_id", partitionId);
                 }
             }
         }
@@ -309,9 +318,9 @@ public:
                 // node data: only this computation's streams stay behind.
                 if (!current) {
                     THROW_ERROR_EXCEPTION(ex)
-                        << TErrorAttribute("computation_id", computationId);
+                        .With("computation_id", computationId);
                 }
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Failed to process partition traverse data, reusing the previous one")
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Failed to process partition traverse data, reusing the previous one")
                     .With("ComputationId", computationId)
                     .With("Error", TError(ex));
             }
@@ -345,7 +354,20 @@ public:
                 }
             } catch (const std::exception& ex) {
                 THROW_ERROR_EXCEPTION(ex)
-                    << TErrorAttribute("computation_id", computationId);
+                    .With("computation_id", computationId);
+            }
+        }
+
+        for (const auto& [computationId, computationSpec] : spec->Computations) {
+            auto computationTraverseIt = traverseData->Computations.find(computationId);
+            if (computationTraverseIt == traverseData->Computations.end()) {
+                continue;
+            }
+            const auto& computationTraverse = computationTraverseIt->second;
+            for (const auto& streamId : computationSpec->InputStreamIds) {
+                computationTraverse->Streams[streamId] = BuildConsumerStreamTraverseData(
+                    GetOrCrash(computationTraverse->Streams, streamId),
+                    GetOrCrash(streamsTraverseData, streamId));
             }
         }
         traverseData->Streams = std::move(streamsTraverseData);
@@ -382,7 +404,7 @@ public:
 
     void UpdateInputStreamsTraverse(const TFlowViewPtr& flowView) override
     {
-        flowView->State->ExecutionSpec->InputStreamsTraverse->SetValue(flowView->State->TraverseData->Streams);
+        flowView->State->ExecutionSpec->InputStreamsTraverse->TrySetValue(flowView->State->TraverseData->Streams, Context_->VersionProvider);
     }
 
     void UpdateWatermarkState(const TFlowViewPtr& flowView) override
@@ -417,7 +439,7 @@ public:
                 }
             }
         }
-        flowView->State->ExecutionSpec->WatermarkState->SetValue(watermarkState);
+        flowView->State->ExecutionSpec->WatermarkState->TrySetValue(watermarkState, Context_->VersionProvider);
     }
 
     void UpdateResourceControllers(const TFlowViewPtr& flowView) override
@@ -441,9 +463,7 @@ public:
         }
 
         for (auto& [resourceId, entry] : ResourceControllers_) {
-            auto oldVersion = entry.PublishedSpec->GetVersion();
-            entry.PublishedSpec->SetValue(entry.Controller->BuildTargetRevisionSpec());
-            if (entry.PublishedSpec->GetVersion() != oldVersion) {
+            if (entry.PublishedSpec->TrySetValue(entry.Controller->BuildTargetRevisionSpec(), Context_->VersionProvider)) {
                 YT_TLOG_INFO("Publishing resource target revision")
                     .With("ResourceId", resourceId)
                     .With("RevisionId", entry.PublishedSpec->GetVersion().Underlying());
@@ -452,8 +472,7 @@ public:
 
         auto targetRevisions = BuildTargetRevisions();
         ResourceManager_->Reconfigure(/*dynamicSpecs*/ {}, targetRevisions);
-        // SetValue dedups by content, so an unchanged map does not bump the section version.
-        flowView->State->ExecutionSpec->ResourceTargetRevisions->SetValue(std::move(targetRevisions));
+        flowView->State->ExecutionSpec->ResourceTargetRevisions->TrySetValue(std::move(targetRevisions), Context_->VersionProvider);
 
         THashMap<TResourceId, NYTree::IMapNodePtr> views;
         for (const auto& [resourceId, entry] : ResourceControllers_) {
@@ -494,6 +513,8 @@ public:
                 }
                 auto targetWorkerIt = flowView->State->Workers.find(*(*eph)->PendingGracefulRebalanceWorkerAddress);
                 if (targetWorkerIt == flowView->State->Workers.end()) {
+                    // The move can no longer be honored; CancelInvalidGracefulRebalances drops
+                    // the intent before the next job is created.
                     continue;
                 }
 
@@ -537,11 +558,11 @@ public:
                         newState = EPartitionState::Interrupted;
                     } else {
                         THROW_ERROR_EXCEPTION("Partition is already completed")
-                            << TErrorAttribute("partition_id", partition->PartitionId)
-                            << TErrorAttribute("computation_id", partition->ComputationId)
-                            << TErrorAttribute("partition_state", partition->State);
+                            .With("partition_id", partition->PartitionId)
+                            .With("computation_id", partition->ComputationId)
+                            .With("partition_state", partition->State);
                     }
-                    YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Info, "Job completed")
+                    YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Info, "Job completed")
                         .With("JobId", currentJobStatus->JobId)
                         .With("PartitionId", partitionId)
                         .With("ComputationId", partition->ComputationId);
@@ -582,7 +603,7 @@ public:
                     continue;
                 }
                 foundError += 1;
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Job failed")
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Job failed")
                     .With("JobId", currentJobStatus->JobId)
                     .With("PartitionId", partitionId)
                     .With("ComputationId", GetOrCrash(layout->Partitions, partitionId)->ComputationId)
@@ -657,7 +678,7 @@ public:
                 partition->PartitionId,
                 partition->ComputationId,
                 lostReasonTags);
-            YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Error, "")
+            YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "")
                 .With(error);
             removed++;
             layout->RemoveJob(jobId, EJobFinishReason::LostWorker);
@@ -781,6 +802,26 @@ public:
         PartitioningMutationsCounter_.Increment(updated);
     }
 
+    // The worker re-reads FinishAfterCurrentEpoch from the spec delivered with every
+    // heartbeat, so dropping the intent before the job reaches its next epoch boundary keeps
+    // the job running instead of costing a shutdown and a reschedule.
+    void CancelInvalidGracefulRebalances(const TFlowViewPtr& flowView) override
+    {
+        for (const auto& [partitionId, partitionState] : flowView->EphemeralState->Partitions) {
+            const auto& targetWorkerAddress = partitionState->PendingGracefulRebalanceWorkerAddress;
+            if (!targetWorkerAddress || flowView->State->Workers.contains(*targetWorkerAddress)) {
+                continue;
+            }
+
+            YT_TLOG_INFO("Graceful rebalance cancelled: target worker has gone")
+                .With("PartitionId", partitionId)
+                .With("TargetWorkerAddress", *targetWorkerAddress);
+
+            partitionState->PendingGracefulRebalanceWorkerAddress = std::nullopt;
+            partitionState->DynamicPartitionSpec->FinishAfterCurrentEpoch = false;
+        }
+    }
+
     void DistributeJobs(const TFlowViewPtr& flowView) override
     {
         const auto& layout = flowView->State->ExecutionSpec->Layout;
@@ -812,6 +853,7 @@ public:
         // computations cannot run) while the overall worker count looks healthy. The required count
         // is taken from the group's override when present, so it can be tuned per worker group (set
         // it to 0 for a group that is allowed to run with no workers).
+        bool hasInsufficientWorkers = false;
         for (const auto& [workerGroup, balanceSynchronizer] : BalanceSynchronizers_) {
             const TDynamicJobManagerGroupSpec* groupJobManagerSpec = DynamicSpec_->JobManager.Get();
             if (auto* overrideSpec = DynamicSpec_->JobManager->WorkerGroupOverride.FindPtr(workerGroup)) {
@@ -824,13 +866,28 @@ public:
                     ++workersInGroup;
                 }
             }
+            const auto& errorState = GetOrCrash(InsufficientWorkersErrorStates_, workerGroup);
             if (workersInGroup < minimumWorkerCount) {
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Too few workers in worker group")
+                hasInsufficientWorkers = true;
+                auto error = workerGroup.Underlying().empty()
+                    ? TError("Too few workers (Count: %v, Required: %v)",
+                        workersInGroup,
+                        minimumWorkerCount)
+                    : TError("Too few workers in worker group %Qv (Count: %v, Required: %v)",
+                        workerGroup.Underlying(),
+                        workersInGroup,
+                        minimumWorkerCount);
+                errorState->SetError(std::move(error));
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Too few workers in worker group")
                     .With("WorkerGroup", workerGroup)
                     .With("Count", workersInGroup)
                     .With("Required", minimumWorkerCount);
-                return StopAllJobs(flowView);
+            } else {
+                errorState->ClearError();
             }
+        }
+        if (hasInsufficientWorkers) {
+            return StopAllJobs(flowView);
         }
 
         ssize_t stopCount = 0;
@@ -864,7 +921,7 @@ public:
             // "worker is lost" error. Name the real problem instead.
             const auto* partitionState = flowView->EphemeralState->Partitions.FindPtr(partitionId);
             if (!partitionState || !(*partitionState)->DynamicPartitionSpec->ComputationPartitionSpec) {
-                YT_TLOG_EVENT_FLUENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Creating job for a partition without dynamic partition spec; the job cannot start until the spec appears")
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Creating job for a partition without dynamic partition spec; the job cannot start until the spec appears")
                     .With("PartitionId", partitionId)
                     .With("ComputationId", GetOrCrash(layout->Partitions, partitionId)->ComputationId);
             }
@@ -881,18 +938,18 @@ public:
             auto worker = GetOrDefault(flowView->State->Workers, job->WorkerAddress, nullptr);
             if (!worker) {
                 THROW_ERROR_EXCEPTION("Worker not found")
-                    << TErrorAttribute("job_id", jobId)
-                    << TErrorAttribute("partition_id", job->PartitionId)
-                    << TErrorAttribute("worker_address", job->WorkerAddress)
-                    << TErrorAttribute("worker_incarnation_id", job->WorkerIncarnationId);
+                    .With("job_id", jobId)
+                    .With("partition_id", job->PartitionId)
+                    .With("worker_address", job->WorkerAddress)
+                    .With("worker_incarnation_id", job->WorkerIncarnationId);
             }
             if (worker->IncarnationId != job->WorkerIncarnationId) {
                 THROW_ERROR_EXCEPTION("Worker incarnation mismatch")
-                    << TErrorAttribute("job_id", jobId)
-                    << TErrorAttribute("partition_id", job->PartitionId)
-                    << TErrorAttribute("worker_address", job->WorkerAddress)
-                    << TErrorAttribute("worker_incarnation_id", job->WorkerIncarnationId)
-                    << TErrorAttribute("actual_worker_incarnation_id", worker->IncarnationId);
+                    .With("job_id", jobId)
+                    .With("partition_id", job->PartitionId)
+                    .With("worker_address", job->WorkerAddress)
+                    .With("worker_incarnation_id", job->WorkerIncarnationId)
+                    .With("actual_worker_incarnation_id", worker->IncarnationId);
             }
         }
 
@@ -1007,6 +1064,7 @@ private:
     const IResourceManagerPtr ResourceManager_;
 
     THashMap<TComputationId, IComputationControllerPtr> ComputationControllers_;
+    THashMap<TWorkerGroupId, IStatusErrorStatePtr> InsufficientWorkersErrorStates_;
 
     struct TResourceControllerEntry
     {
@@ -1052,7 +1110,9 @@ private:
     {
         auto context = New<TResourceManagerContext>();
         context->PipelineAuthenticator = PipelineAuthenticator_;
-        context->Logger = Logger().WithTag("ResourceManager");
+        context->ClientsCache = Context_->ClientsCache;
+        context->PipelinePath = Context_->PipelinePath;
+        context->Logger = Logger().WithTag("Manager", "Resource");
         context->Invoker = Context_->MainCycleInvoker;
         context->Profiler = WithPipelineRelatedTags(ControllerProfiler());
         context->StatusProfiler = Context_->StatusProfiler->WithPrefix("/resource_manager");

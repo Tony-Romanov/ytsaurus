@@ -332,6 +332,8 @@ def eval_boolean(
     expression: object, a: SupportsComparison, b: SupportsComparison
 ) -> exp.Boolean | None:
     if isinstance(expression, (exp.EQ, exp.Is)):
+        if isinstance(expression, exp.Is) and expression.args.get("negate"):
+            return boolean_literal(a != b)
         return boolean_literal(a == b)
     if isinstance(expression, exp.NEQ):
         return boolean_literal(a != b)
@@ -710,9 +712,6 @@ class Simplifier:
             if node is not original:
                 original.replace(node)
 
-            for n in node.iter_expressions(reverse=True):
-                if n.meta_get(FINAL):
-                    raise
             pre_transformation_stack.extend(
                 n for n in node.iter_expressions(reverse=True) if not n.meta_get(FINAL)
             )
@@ -895,8 +894,11 @@ class Simplifier:
         self, expression: exp.Expr, left: exp.Expr, right: exp.Expr, or_: bool = False
     ) -> exp.Expr | None:
         if isinstance(left, self.COMPARISONS) and isinstance(right, self.COMPARISONS):
-            ll, lr = left.args.values()
-            rl, rr = right.args.values()
+            if any(isinstance(e, exp.Is) and e.args.get("negate") for e in (left, right)):
+                return None
+
+            ll, lr = left.this, left.expression
+            rl, rr = right.this, right.expression
 
             largs = {ll, lr}
             rargs = {rl, rr}
@@ -1196,6 +1198,9 @@ class Simplifier:
             else:
                 c = b
                 not_ = False
+
+            if expression.args.get("negate"):
+                not_ = not not_
 
             if is_null(c):
                 if isinstance(a, exp.Literal):
@@ -1685,7 +1690,7 @@ class Gen:
         self.stack.append(f'"{e.this}"' if e.quoted else e.this)
 
     def ilike_sql(self, e: exp.ILike) -> None:
-        self._binary(e, " ILIKE ")
+        self._binary(e, " NOT ILIKE " if e.args.get("negate") else " ILIKE ")
 
     def in_sql(self, e: exp.In) -> None:
         self.stack.append(")")
@@ -1702,10 +1707,10 @@ class Gen:
         self._binary(e, " DIV ")
 
     def is_sql(self, e: exp.Is) -> None:
-        self._binary(e, " IS ")
+        self._binary(e, " IS NOT " if e.args.get("negate") else " IS ")
 
     def like_sql(self, e: exp.Like) -> None:
-        self._binary(e, " Like ")
+        self._binary(e, " NOT Like " if e.args.get("negate") else " Like ")
 
     def literal_sql(self, e: exp.Literal) -> None:
         self.stack.append(f"'{e.this}'" if e.is_string else e.this)

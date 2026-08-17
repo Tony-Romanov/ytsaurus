@@ -129,8 +129,8 @@ using namespace NYTree;
 using namespace NQueryClient;
 
 using NChunkClient::TChunkReaderStatistics;
-using NYT::ToProto;
 using NYT::FromProto;
+using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -145,10 +145,9 @@ TMasterJobBase::TMasterJobBase(
     , JobId_(jobId)
     , JobSpec_(jobSpec)
     , JobTrackerAddress_(jobTrackerAddress)
-    , Logger(DataNodeLogger().WithTag(
-        "JobId: %v, JobType: %v",
-        jobId,
-        FromProto<EJobType>(jobSpec.type())))
+    , Logger(DataNodeLogger()
+        .WithTag("JobId", jobId)
+        .WithTag("JobType", FromProto<EJobType>(jobSpec.type())))
     , ResourceHolder_(TResourceHolder::CreateResourceHolder(
         jobId.Underlying(),
         bootstrap->GetJobResourceManager().Get(),
@@ -424,7 +423,7 @@ public:
         , ChunkId_(FromProto<TChunkId>(JobSpecExt_.chunk_id()))
         , DynamicConfig_(Bootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->RemoveChunkJob)
     {
-        Logger.AddTag("ChunkId: %v", ChunkId_);
+        Logger.AddTag("ChunkId", ChunkId_);
     }
 
 private:
@@ -514,7 +513,7 @@ public:
         , ChunkId_(FromProto<TChunkId>(JobSpecExt_.chunk_id()))
         , DynamicConfig_(Bootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->ReplicateChunkJob)
     {
-        Logger.AddTag("ChunkId: %v", ChunkId_);
+        Logger.AddTag("ChunkId", ChunkId_);
     }
 
 private:
@@ -562,7 +561,9 @@ private:
 
         TChunkReadOptions chunkReadOptions;
         chunkReadOptions.WorkloadDescriptor = workloadDescriptor;
-        chunkReadOptions.BlockCache = DynamicConfig_->UseBlockCache ? Bootstrap_->GetBlockCache() : GetNullBlockCache();
+        chunkReadOptions.BlockCache = DynamicConfig_->UseBlockCache
+            ? Bootstrap_->GetBlockCacheForMedium(chunk->GetLocation()->GetMediumIndex())
+            : GetNullBlockCache();
         chunkReadOptions.ChunkReaderStatistics = New<TChunkReaderStatistics>();
         chunkReadOptions.MemoryUsageTracker = Bootstrap_->GetSystemJobsMemoryUsageTracker();
 
@@ -774,7 +775,7 @@ public:
         , Sensors_(std::move(sensors))
         , DynamicConfig_(Bootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->RepairChunkJob)
     {
-        Logger.AddTag("ChunkId: %v", ChunkId_);
+        Logger.AddTag("ChunkId", ChunkId_);
     }
 
 private:
@@ -1096,7 +1097,7 @@ public:
         , ChunkId_(FromProto<TChunkId>(JobSpecExt_.chunk_id()))
         , DynamicConfig_(Bootstrap_->GetDynamicConfigManager()->GetConfig()->DataNode->SealChunkJob)
     {
-        Logger.AddTag("ChunkId: %v", ChunkId_);
+        Logger.AddTag("ChunkId", ChunkId_);
     }
 
 private:
@@ -1738,11 +1739,11 @@ private:
         for (const auto& context : InputChunkReadContexts_) {
             auto miscExt = GetProtoExtension<TMiscExt>(context.Meta->extensions());
             if (miscExt.has_min_timestamp()) {
-                auto currentMinTs = miscExt.min_timestamp();
+                auto currentMinTs = FromProto<NTransactionClient::TTimestamp>(miscExt.min_timestamp());
                 minTs = minTs == NullTimestamp ? currentMinTs : std::min(minTs, currentMinTs);
             }
             if (miscExt.has_max_timestamp()) {
-                auto currentMaxTs = miscExt.max_timestamp();
+                auto currentMaxTs = FromProto<NTransactionClient::TTimestamp>(miscExt.max_timestamp());
                 maxTs = maxTs == NullTimestamp ? currentMaxTs : std::max(maxTs, currentMaxTs);
             }
         }
@@ -1933,8 +1934,8 @@ private:
 
         if (inputChunksRowCount != outputChunkRowCount) {
             return TError("Total number of rows in input chunks differs from number of rows in output chunk")
-                << TErrorAttribute("input_chunks_row_count", inputChunksRowCount)
-                << TErrorAttribute("output_chunk_row_count", outputChunkRowCount);
+                .With("input_chunks_row_count", inputChunksRowCount)
+                .With("output_chunk_row_count", outputChunkRowCount);
         }
 
         i64 rowIndex = 0;
@@ -1980,22 +1981,22 @@ private:
 
             if (inputChunksRowsRead > inputChunksRowCount) {
                 return TError("Actual number of rows in input chunks is greater than expected")
-                    << TErrorAttribute("rows_read", inputChunksRowsRead)
-                    << TErrorAttribute("expected_rows", inputChunksRowCount);
+                    .With("rows_read", inputChunksRowsRead)
+                    .With("expected_rows", inputChunksRowCount);
             } else if (inputExhausted && inputChunksRowsRead < inputChunksRowCount) {
                 return TError("Actual number of rows in input chunks is less than expected")
-                    << TErrorAttribute("rows_read", inputChunksRowsRead)
-                    << TErrorAttribute("expected_rows", inputChunksRowCount);
+                    .With("rows_read", inputChunksRowsRead)
+                    .With("expected_rows", inputChunksRowCount);
             }
 
             if (outputChunkRowsRead > outputChunkRowCount) {
                 return TError("Actual number of rows in output chunk is greater than expected")
-                    << TErrorAttribute("rows_read", outputChunkRowsRead)
-                    << TErrorAttribute("expected_rows", outputChunkRowCount);
+                    .With("rows_read", outputChunkRowsRead)
+                    .With("expected_rows", outputChunkRowCount);
             } else if (outputExhausted && outputChunkRowsRead < outputChunkRowCount) {
                 return TError("Actual number of rows in output chunk is less than expected")
-                    << TErrorAttribute("rows_read", outputChunkRowsRead)
-                    << TErrorAttribute("expected_rows", outputChunkRowCount);
+                    .With("rows_read", outputChunkRowsRead)
+                    .With("expected_rows", outputChunkRowCount);
             }
 
             if (inputExhausted && outputExhausted) {
@@ -2023,10 +2024,10 @@ private:
                     TStringBuilder rowDiffBuilder;
                     TBitwiseUnversionedRowEqual::FormatDiff(&rowDiffBuilder, inputRow, outputRow);
                     return TError("Row differs in input and output chunks")
-                        << TErrorAttribute("row_index", rowIndex)
-                        << TErrorAttribute("input_row", inputRow)
-                        << TErrorAttribute("output_row", outputRow)
-                        << TErrorAttribute("row_diff", rowDiffBuilder.Flush());
+                        .With("row_index", rowIndex)
+                        .With("input_row", inputRow)
+                        .With("output_row", outputRow)
+                        .With("row_diff", rowDiffBuilder.Flush());
                 }
 
                 ++rowIndex;
@@ -2370,10 +2371,10 @@ private:
         TChunkTimestamps chunkTimestamps;
         if (auto misc = GetChunkMiscExt(oldChunkMeta)) {
             if (misc->has_min_timestamp()) {
-                chunkTimestamps.MinTimestamp = misc->min_timestamp();
+                chunkTimestamps.MinTimestamp = FromProto<NTransactionClient::TTimestamp>(misc->min_timestamp());
             }
             if (misc->has_max_timestamp()) {
-                chunkTimestamps.MaxTimestamp = misc->max_timestamp();
+                chunkTimestamps.MaxTimestamp = FromProto<NTransactionClient::TTimestamp>(misc->max_timestamp());
             }
         }
 
@@ -2891,9 +2892,8 @@ private:
 
             auto future = BIND([&, index, jobLogger = Logger] {
                 auto Logger = jobLogger
-                    .WithTag("TailChunkId: %v, WriterIndex: %v",
-                        TailChunkId_,
-                        index);
+                    .WithTag("TailChunkId", TailChunkId_)
+                    .WithTag("WriterIndex", index);
 
                 auto& chunkWriter = writer.ChunkWriter;
 
@@ -2937,9 +2937,9 @@ private:
                 succeededWriters.push_back(writers[index]);
             } else {
                 auto error = TError("Tail replica writer failed")
-                    << TErrorAttribute("tail_chunk_id", TailChunkId_)
-                    << TErrorAttribute("writer_index", index)
-                    << replicaOrError;
+                    .With("tail_chunk_id", TailChunkId_)
+                    .With("writer_index", index)
+                    .With(replicaOrError);
                 YT_LOG_WARNING(error);
                 writerErrors.push_back(std::move(error));
             }
@@ -2949,7 +2949,7 @@ private:
             THROW_ERROR_EXCEPTION("Too few tail chunk writers finished successfully: %v completed, %v needed",
                 succeededWriters.size(),
                 WriteQuorum_)
-                << writerErrors;
+                .With(writerErrors);
         }
 
         return succeededWriters;

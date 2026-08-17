@@ -74,6 +74,7 @@ def qualify_derived_table_outputs(expression: exp.Expr) -> exp.Expr:
         and isinstance(alias, exp.TableAlias)
         and not alias.columns
     ):
+        from sqlglot.dialects.tsql import TSQL
         from sqlglot.optimizer.qualify_columns import qualify_outputs
 
         # We keep track of the unaliased column projection indexes instead of the expressions
@@ -84,7 +85,7 @@ def qualify_derived_table_outputs(expression: exp.Expr) -> exp.Expr:
             i for i, c in enumerate(query.selects) if isinstance(c, exp.Column) and not c.alias
         )
 
-        qualify_outputs(query)
+        qualify_outputs(query, dialect=TSQL())
 
         # Preserve the quoting information of columns for newly added Alias nodes
         query_selects = query.selects
@@ -377,9 +378,10 @@ class TSQLGenerator(generator.Generator):
         return "(1 = 1)" if expression.this else "(1 = 0)"
 
     def is_sql(self, expression: exp.Is) -> str:
+        negate = expression.args.get("negate")
         if isinstance(expression.expression, exp.Boolean):
-            return self.binary(expression, "=")
-        return self.binary(expression, "IS")
+            return self.binary(expression, "<>" if negate else "=")
+        return self.binary(expression, "IS NOT" if negate else "IS")
 
     def createable_sql(self, expression: exp.Create, locations: defaultdict) -> str:
         sql = self.sql(expression, "this")
@@ -639,7 +641,9 @@ class TSQLGenerator(generator.Generator):
         this = self.sql(expression, "this")
         expressions = self.expressions(expression)
         expressions = f" {expressions}" if expressions else ""
-        return f"EXECUTE {this}{expressions}"
+        return_status = self.sql(expression, "return_status")
+        return_status = f"{return_status} = " if return_status else ""
+        return f"EXECUTE {return_status}{this}{expressions}"
 
     def executesql_sql(self, expression: exp.ExecuteSql) -> str:
         return self.execute_sql(expression)

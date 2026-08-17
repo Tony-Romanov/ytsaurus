@@ -64,9 +64,6 @@ namespace NDetail {
 
 constexpr int MaxAccessControlObjectsPerQuery = 10;
 
-// Path to access control object namespace for QT.
-const NYPath::TYPath QueriesAcoNamespacePath = "//sys/access_control_object_namespaces/queries";
-
 static const TYsonString EmptyMap = TYsonString(TString("{}"));
 static const std::string CompressedEmptyMap = Compress(EmptyMap.ToString(), MaxDyntableStringSize);
 
@@ -114,7 +111,7 @@ TFuture<typename TRecordDescriptor::TRecordPartial> LookupQueryTrackerRecord(
     return asyncRecord;
 };
 
-ESecurityAction CheckAccessControl(
+ESecurityAction CheckQueryAccessControl(
     const std::string& user,
     const std::optional<TYsonString>& accessControlObjects,
     const std::string& queryAuthor,
@@ -125,35 +122,7 @@ ESecurityAction CheckAccessControl(
         return ESecurityAction::Allow;
     }
 
-    auto userSubjects = GetUserSubjects(user, client);
-    if (userSubjects.contains(NSecurityClient::SuperusersGroupName)) {
-        return NSecurityClient::ESecurityAction::Allow;
-    }
-
-    auto accessControlObjectList = ConvertTo<std::optional<std::vector<std::string>>>(accessControlObjects);
-    if (!accessControlObjectList) {
-        return NSecurityClient::ESecurityAction::Deny;
-    }
-
-    TCheckPermissionOptions checkPermissionOptions;
-    checkPermissionOptions.ReadFrom = EMasterChannelKind::Cache;
-    checkPermissionOptions.SuccessStalenessBound = TDuration::Minutes(1);
-    for (const auto& accessControlObject : *accessControlObjectList) {
-        auto path = Format(
-            "%v/%v/principal",
-            QueriesAcoNamespacePath,
-            NYPath::ToYPathLiteral(accessControlObject));
-
-        auto securityAction = WaitFor(client->CheckPermission(user, path, permission, checkPermissionOptions))
-            .ValueOrThrow()
-            .Action;
-
-        if (securityAction == NSecurityClient::ESecurityAction::Allow) {
-            return NSecurityClient::ESecurityAction::Allow;
-        }
-    }
-
-    return NSecurityClient::ESecurityAction::Deny;
+    return CheckAccessControl(user, accessControlObjects, client, permission);
 }
 
 void ThrowAccessDeniedException(
@@ -167,9 +136,9 @@ void ThrowAccessDeniedException(
         "Access denied to query %v due to missing %Qv permission",
         queryId,
         permission)
-        << TErrorAttribute("user", user)
-        << TErrorAttribute("access_control_objects", accessControlObjects)
-        << TErrorAttribute("query_author", queryAuthor);
+        .With("user", user)
+        .With("access_control_objects", accessControlObjects)
+        .With("query_author", queryAuthor);
 }
 
 //! Lookup a query in active_queries and finished_queries tables by query id.
@@ -201,7 +170,7 @@ TQuery LookupQuery(
         THROW_ERROR_EXCEPTION(NQueryTrackerClient::EErrorCode::QueryNotFound,
             "Query %v is not found neither in active nor in finished query tables",
             queryId)
-            << error;
+            .With(error);
     }
     bool isActive = asyncActiveRecord.IsSet() && asyncActiveRecord.GetOrCrash().IsOK();
     bool isFinished = asyncFinishedRecord.IsSet() && asyncFinishedRecord.GetOrCrash().IsOK();
@@ -235,7 +204,7 @@ void ValidateQueryPermissions(
         "access_control_objects",
     };
     auto query = LookupQuery(queryId, client, root, lookupKeys, timestamp, logger);
-    if (CheckAccessControl(user, query.AccessControlObjects, *query.User, client, permission) == ESecurityAction::Deny) {
+    if (CheckQueryAccessControl(user, query.AccessControlObjects, *query.User, client, permission) == ESecurityAction::Deny) {
         ThrowAccessDeniedException(queryId, permission, user, query.AccessControlObjects, *query.User);
     }
 }
@@ -252,7 +221,7 @@ void VerifyAllAccessControlObjectsExist(const std::vector<std::string>& accessCo
             .Apply(BIND([accessControlObject] (const TErrorOr<bool>& rspOrError) {
                 if (!rspOrError.IsOK()) {
                     THROW_ERROR_EXCEPTION("Failed to check whether access control object %Qv exists", accessControlObject)
-                        << rspOrError;
+                        .With(rspOrError);
                 }
 
                 if (!rspOrError.Value()) {
@@ -337,24 +306,21 @@ using namespace NDetail;
 TQueryTrackerProxy::TQueryTrackerProxy(
     IClientPtr stateClient,
     TYPath stateRoot,
-    TQueryTrackerProxyConfigPtr config,
+    TQueryTrackerDynamicConfigPtr config,
     std::unordered_map<EQueryEngine, IProxyEngineProviderPtr> engineProviders,
     int expectedTablesVersion)
     : StateClient_(std::move(stateClient))
     , StateRoot_(std::move(stateRoot))
-    , ProxyConfig_(std::move(config))
+    , DynamicConfig_(std::move(config))
     , EngineProviders_(std::move(engineProviders))
     , ExpectedTablesVersion_(expectedTablesVersion)
     , TimeBasedIndex_(CreateTimeBasedIndex(StateClient_, StateRoot_))
     , TokenBasedIndex_(CreateTokenBasedIndex(StateClient_, StateRoot_))
 { }
 
-void TQueryTrackerProxy::Reconfigure(
-    const TQueryTrackerProxyConfigPtr& config,
-    const TDuration notIndexedQueriesTTL)
+void TQueryTrackerProxy::Reconfigure(const TQueryTrackerDynamicConfigPtr& config)
 {
-    ProxyConfig_ = config;
-    NotIndexedQueriesTTL_ = notIndexedQueriesTTL;
+    DynamicConfig_ = config;
 }
 
 void TQueryTrackerProxy::StartQuery(
@@ -364,22 +330,22 @@ void TQueryTrackerProxy::StartQuery(
     const TStartQueryOptions& options,
     const std::string& user)
 {
-    if (ssize(options.Files) > ProxyConfig_->MaxQueryFileCount) {
+    if (ssize(options.Files) > DynamicConfig_->ProxyConfig->MaxQueryFileCount) {
         THROW_ERROR_EXCEPTION("Too many files: limit is %v, actual count is %v",
-            ProxyConfig_->MaxQueryFileCount,
+            DynamicConfig_->ProxyConfig->MaxQueryFileCount,
             options.Files.size());
     }
     for (const auto& file : options.Files) {
-        if (ssize(file->Name) > ProxyConfig_->MaxQueryFileNameSizeBytes) {
+        if (ssize(file->Name) > DynamicConfig_->ProxyConfig->MaxQueryFileNameSizeBytes) {
             THROW_ERROR_EXCEPTION("Too large file %v name: limit is %v, actual size is %v",
                 file->Name,
-                ProxyConfig_->MaxQueryFileNameSizeBytes,
+                DynamicConfig_->ProxyConfig->MaxQueryFileNameSizeBytes,
                 file->Name.size());
         }
-        if (ssize(file->Content) > ProxyConfig_->MaxQueryFileContentSizeBytes) {
+        if (ssize(file->Content) > DynamicConfig_->ProxyConfig->MaxQueryFileContentSizeBytes) {
             THROW_ERROR_EXCEPTION("Too large file %v content: limit is %v, actual size is %v",
                 file->Name,
-                ProxyConfig_->MaxQueryFileContentSizeBytes,
+                DynamicConfig_->ProxyConfig->MaxQueryFileContentSizeBytes,
                 file->Content.size());
         }
     }
@@ -446,7 +412,9 @@ void TQueryTrackerProxy::StartQuery(
                 .IsTutorial = isTutorial,
             };
             if (!isIndexed) {
-                newRecord.TTL = NotIndexedQueriesTTL_.MilliSeconds();
+                if (auto ttl = GetConfigByEngine(DynamicConfig_, engine)->NotIndexedQueriesTtl) {
+                    newRecord.Ttl = ttl->MilliSeconds();
+                }
             }
 
             filterFactors = GetFilterFactors(newRecord);
@@ -585,7 +553,7 @@ void TQueryTrackerProxy::AbortQuery(
         if (error.FindMatching(NTabletClient::EErrorCode::TransactionLockConflict)) {
             // TODO(max42): retry such errors automatically?
             THROW_ERROR_EXCEPTION("Cannot abort query because its state is being changed at the moment; please try again")
-                << error;
+                .With(error);
         }
         THROW_ERROR error;
     }
@@ -1104,7 +1072,7 @@ TGetQueryDeclaredParametersInfoResult TQueryTrackerProxy::GetQueryDeclaredParame
 TQueryTrackerProxyPtr CreateQueryTrackerProxy(
     IClientPtr stateClient,
     TYPath stateRoot,
-    TQueryTrackerProxyConfigPtr config,
+    TQueryTrackerDynamicConfigPtr config,
     std::unordered_map<EQueryEngine, IProxyEngineProviderPtr> engineProviders,
     int expectedTablesVersion)
 {

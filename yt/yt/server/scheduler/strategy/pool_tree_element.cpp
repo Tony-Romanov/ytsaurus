@@ -163,7 +163,7 @@ void TPoolTreeElement::BuildLoggingStringAttributes(TDelimitedStringBuilderWrapp
     delimitedBuilder->AppendFormat(
         "Status: %v, DominantResource: %v, DemandShare: %.6g, UsageShare: %.6g, LimitsShare: %.6g, "
         "StrongGuaranteeShare: %.6g, TotalFairShare: %.6g, FairShare: %.6g, Satisfaction: %.4lg, LocalSatisfaction: %.4lg, "
-        "PromisedFairShare: %.6g, StarvationStatus: %v, Weight: %v, Volume: %v",
+        "StarvationStatus: %v, Weight: %v, Volume: %v",
         GetStatus(),
         Attributes_.DominantResource,
         Attributes_.DemandShare,
@@ -174,7 +174,6 @@ void TPoolTreeElement::BuildLoggingStringAttributes(TDelimitedStringBuilderWrapp
         Attributes_.FairShare,
         PostUpdateAttributes_.SatisfactionRatio,
         PostUpdateAttributes_.LocalSatisfactionRatio,
-        Attributes_.PromisedFairShare,
         GetStarvationStatus(),
         GetWeight(),
         GetAccumulatedResourceRatioVolume());
@@ -1243,9 +1242,9 @@ TPoolTreePoolElement::TPoolTreePoolElement(
         treeId,
         id,
         EResourceTreeElementKind::Pool,
-        logger.WithTag("Pool: %v, SchedulingMode: %v",
-            id,
-            config->Mode))
+        logger
+            .WithTag("Pool", id)
+            .WithTag("SchedulingMode", config->Mode))
     , TPoolTreePoolElementFixedState(id, objectId)
 {
     DoSetConfig(std::move(config));
@@ -1818,7 +1817,7 @@ TPoolTreeOperationElement::TPoolTreeOperationElement(
         treeId,
         ToString(operation->GetId()),
         EResourceTreeElementKind::Operation,
-        logger.WithTag("OperationId: %v", operation->GetId()))
+        logger.WithTag("OperationId", operation->GetId()))
     , TPoolTreeOperationElementFixedState(
         std::move(operation),
         std::move(controllerConfig),
@@ -2654,9 +2653,9 @@ TPoolTreeRootElement::TPoolTreeRootElement(
         treeId,
         RootPoolName,
         EResourceTreeElementKind::Root,
-        logger.WithTag("Pool: %v, SchedulingMode: %v",
-            RootPoolName,
-            ESchedulingMode::FairShare))
+        logger
+            .WithTag("Pool", RootPoolName)
+            .WithTag("SchedulingMode", ESchedulingMode::FairShare))
 {
     Mode_ = ESchedulingMode::FairShare;
 }

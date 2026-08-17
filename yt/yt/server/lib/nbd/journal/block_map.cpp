@@ -1,7 +1,6 @@
 #include "block_map.h"
 
 #include <yt/yt/core/misc/collection_helpers.h>
-#include <yt/yt/core/misc/finally.h>
 
 #include <library/cpp/yt/assert/assert.h>
 
@@ -14,8 +13,6 @@
 #include <library/cpp/containers/absl/flat_hash_map.h>
 
 #include <atomic>
-#include <deque>
-#include <functional>
 #include <optional>
 #include <vector>
 
@@ -92,37 +89,36 @@ public:
         YT_VERIFY(blockCount >= 0);
     }
 
-    TMappedBlockId FindBlock(int blockIndex) override
+    TMappedBlockId FindBlock(int blockIndex) final
     {
         auto& slot = GetSlot(blockIndex);
         return WithoutCoW(TMappedBlockId(slot.load(std::memory_order::acquire)));
     }
 
-    void PutDirty(int blockIndex, TDirtyBlockId blockId) override
+    void PutBlock(int blockIndex, TDirtyBlockId blockId) final
     {
-        std::optional<TStoredBlockId> diedStoredBlockId;
+        std::optional<TStoredBlockId> unreferencedStoredBlockId;
         {
             auto guard = Guard(WriteLock_);
 
             auto& slot = GetSlot(blockIndex);
             auto oldId = TMappedBlockId(slot.load(std::memory_order::acquire));
+            auto bareOldId = WithoutCoW(oldId);
 
-            // The first write to a block makes it non-empty for good.
-            if (oldId == EmptyMappedBlockId) {
+            if (bareOldId == EmptyMappedBlockId) {
                 UsedBlockCount_.fetch_add(1, std::memory_order::relaxed);
             }
 
-            auto bareOldId = WithoutCoW(oldId);
             if (IsStoredMappedBlockId(bareOldId)) {
-                diedStoredBlockId = ToStoredBlockId(bareOldId);
+                unreferencedStoredBlockId = ToStoredBlockId(bareOldId);
             }
 
             auto newId = ToMappedBlockId(blockId);
             // While a snapshot scans, stash the pre-snapshot value the first time we overwrite a block
-            // (the CoW bit means "already stashed") so TakeSnapshot can restore it.
+            // (the CoW bit means "already stashed") so a scan can read it back.
             if (SnapshotState_ == ESnapshotState::CoWActive) {
                 if (!IsCoW(oldId)) {
-                    CoWBlocks_.emplace_back(blockIndex, oldId);
+                    EmplaceOrCrash(CoWBlocks_, blockIndex, oldId);
                 }
                 newId = WithCoW(newId);
             }
@@ -130,78 +126,148 @@ public:
         }
 
         // Fire outside WriteLock_ (subscribers may re-enter the map), strictly after the slot update.
-        if (diedStoredBlockId) {
-            StoredBlockDied_.Fire(*diedStoredBlockId);
+        if (unreferencedStoredBlockId) {
+            StoredBlockUnreferenced_.Fire(*unreferencedStoredBlockId);
         }
     }
 
-    bool TryMakeClean(int blockIndex, TDirtyBlockId expectedBlockId, TStoredBlockId storedBlockId) override
+    bool TryPutBlock(int blockIndex, TMappedBlockId expectedBlockId, TStoredBlockId storedBlockId) final
     {
-        auto adopted = TryAdoptStoredBlock(blockIndex, expectedBlockId, storedBlockId);
+        bool succeeded;
+        {
+            auto guard = Guard(WriteLock_);
 
-        // Fire outside WriteLock_ (subscribers may re-enter the map) but strictly after the slot
-        // update, and regardless of whether the flush was adopted: a snapshot armed under the same
-        // lock either sees the update in its scan or is subscribed by now, so it cannot miss this.
-        BlockFlushObserved_.Fire(expectedBlockId, storedBlockId);
-
-        // A flush that lost the last-write-wins race is never referenced, so its stored block is dead
-        // on arrival.
-        if (!adopted) {
-            StoredBlockDied_.Fire(storedBlockId);
+            auto& slot = GetSlot(blockIndex);
+            auto oldId = TMappedBlockId(slot.load(std::memory_order::acquire));
+            succeeded = WithoutCoW(oldId) == expectedBlockId;
+            if (succeeded) {
+                auto newId = ToMappedBlockId(storedBlockId);
+                // Stash the pre-snapshot value on first overwrite during a scan; see #PutBlock.
+                if (SnapshotState_ == ESnapshotState::CoWActive) {
+                    if (!IsCoW(oldId)) {
+                        EmplaceOrCrash(CoWBlocks_, blockIndex, oldId);
+                    }
+                    newId = WithCoW(newId);
+                }
+                slot.store(newId.Underlying(), std::memory_order::release);
+            }
         }
 
-        return adopted;
+        // Fire outside WriteLock_ (subscribers may re-enter the map), strictly after the slot update. A
+        // dirty expected id means this is a flush: report where it landed, succeeded or not, so a snapshot
+        // armed under the same lock cannot miss it.
+        if (IsDirtyMappedBlockId(expectedBlockId)) {
+            BlockFlushObserved_.Fire(ToDirtyBlockId(expectedBlockId), storedBlockId);
+        }
+
+        if (succeeded) {
+            // A superseded stored id is now unreferenced; a dirty one was never a stored block.
+            if (IsStoredMappedBlockId(expectedBlockId)) {
+                StoredBlockUnreferenced_.Fire(ToStoredBlockId(expectedBlockId));
+            }
+        } else {
+            StoredBlockUnreferenced_.Fire(storedBlockId);
+        }
+
+        return succeeded;
     }
 
-    int GetUsedBlockCount() const override
+    bool DiscardBlock(int blockIndex) final
+    {
+        std::optional<TStoredBlockId> unreferencedStoredBlockId;
+        {
+            auto guard = Guard(WriteLock_);
+
+            auto& slot = GetSlot(blockIndex);
+            auto oldId = TMappedBlockId(slot.load(std::memory_order::acquire));
+            auto bareOldId = WithoutCoW(oldId);
+            if (bareOldId == EmptyMappedBlockId) {
+                return false;
+            }
+
+            UsedBlockCount_.fetch_sub(1, std::memory_order::relaxed);
+            if (IsStoredMappedBlockId(bareOldId)) {
+                unreferencedStoredBlockId = ToStoredBlockId(bareOldId);
+            }
+
+            auto newId = EmptyMappedBlockId;
+            if (SnapshotState_ == ESnapshotState::CoWActive) {
+                if (!IsCoW(oldId)) {
+                    EmplaceOrCrash(CoWBlocks_, blockIndex, oldId);
+                }
+                newId = WithCoW(newId);
+            }
+            slot.store(newId.Underlying(), std::memory_order::release);
+        }
+
+        if (unreferencedStoredBlockId) {
+            StoredBlockUnreferenced_.Fire(*unreferencedStoredBlockId);
+        }
+
+        return true;
+    }
+
+    int GetBlockCount() const final
+    {
+        return std::ssize(Slots_);
+    }
+
+    int GetUsedBlockCount() const final
     {
         return UsedBlockCount_.load(std::memory_order::acquire);
     }
 
-    //! Takes a point-in-time cut without holding the lock across the whole scan, via copy-on-write:
-    //! flip to CoWActive, scan the slots lock-free, and let concurrent writers stash the pre-snapshot
-    //! value of each block they first touch. The scan may catch post-flip values; a cleanup pass then
-    //! restores the stashed originals, yielding the map exactly as of the flip.
-    TBlockMapSnapshot TakeSnapshot(std::function<void(int)> onScanned) override
+    void BeginSnapshot() final
     {
-        // Arm copy-on-write. Only one snapshot at a time (the CoW bit and CoWBlocks_ are single-writer).
-        {
-            auto guard = Guard(WriteLock_);
+        auto guard = Guard(WriteLock_);
 
-            if (SnapshotState_ != ESnapshotState::None) {
-                THROW_ERROR_EXCEPTION("Another snapshot is already in progress");
-            }
-
-            SnapshotState_ = ESnapshotState::CoWActive;
-            YT_VERIFY(CoWBlocks_.empty());
+        if (SnapshotState_ != ESnapshotState::None) {
+            THROW_ERROR_EXCEPTION("Another snapshot is already in progress");
         }
 
-        auto disarmGuard = Finally([&] {
-            auto guard = Guard(WriteLock_);
+        SnapshotState_ = ESnapshotState::CoWActive;
+        YT_VERIFY(CoWBlocks_.empty());
+    }
 
-            SnapshotState_ = ESnapshotState::None;
-            CoWBlocks_.clear();
-        });
+    TBlockMapSnapshot ScanSnapshotPart(int beginBlockIndex, int endBlockIndex) final
+    {
+        YT_VERIFY(SnapshotState_ == ESnapshotState::CoWActive);
+        YT_VERIFY(0 <= beginBlockIndex && beginBlockIndex <= endBlockIndex && endBlockIndex <= std::ssize(Slots_));
 
-        // Scan every slot lock-free, recording its current value and where it landed in the result.
+        // Positions in Blocks whose slot was overwritten since the flip, to be filled in from the stash.
+        std::vector<int> stashedPositions;
+
         TBlockMapSnapshot snapshot;
-        snapshot.Blocks.reserve(GetUsedBlockCount());
-        absl::flat_hash_map<int, int> blockIndexToPosition;
-        blockIndexToPosition.reserve(snapshot.Blocks.capacity());
-        for (int index = 0; index < std::ssize(Slots_); ++index) {
-            if (onScanned) {
-                onScanned(index);
-            }
-            auto& slot = GetSlot(index);
-            auto id = TMappedBlockId(slot.load(std::memory_order::acquire));
-            if (id == EmptyMappedBlockId) {
+        for (int index = beginBlockIndex; index < endBlockIndex; ++index) {
+            auto id = TMappedBlockId(GetSlot(index).load(std::memory_order::acquire));
+            if (IsCoW(id)) {
+                stashedPositions.push_back(std::ssize(snapshot.Blocks));
+            } else if (id == EmptyMappedBlockId) {
+                // Untouched since the flip, and empty then too.
                 continue;
             }
-            EmplaceOrCrash(blockIndexToPosition, index, std::ssize(snapshot.Blocks));
-            snapshot.Blocks.emplace_back(index, WithoutCoW(id));
+            snapshot.Blocks.emplace_back(index, id);
         }
 
-        // Disarm: past this barrier no writer stashes anything, so CoWBlocks_ is complete and stable.
+        if (!stashedPositions.empty()) {
+            {
+                auto guard = Guard(WriteLock_);
+                for (int position : stashedPositions) {
+                    auto& [index, id] = snapshot.Blocks[position];
+                    id = GetOrCrash(CoWBlocks_, index);
+                }
+            }
+
+            // Drop those the stash says were empty at the flip.
+            EraseIf(snapshot.Blocks, [] (const auto& indexAndId) { return indexAndId.second == EmptyMappedBlockId; });
+        }
+
+        return snapshot;
+    }
+
+    void EndSnapshot() final
+    {
+        // Past this barrier no writer stashes anything, so CoWBlocks_ is complete and stable.
         {
             auto guard = Guard(WriteLock_);
 
@@ -209,39 +275,70 @@ public:
             SnapshotState_ = ESnapshotState::CoWCleanup;
         }
 
-        // Restore each stashed block to its pre-flip value and clear its CoW bit (so the next snapshot
-        // starts clean). A block absent from the scan was empty at the flip; its stash is Empty.
-        for (auto [index, id] : CoWBlocks_) {
-            auto& slot = GetSlot(index);
-            slot.fetch_and(~CoWMask, std::memory_order::release);
-            if (auto it = blockIndexToPosition.find(index); it != blockIndexToPosition.end()) {
-                snapshot.Blocks[it->second].second = id;
-            }
+        // Clear the CoW bit of every stashed block, so the next snapshot starts clean.
+        for (const auto& [index, id] : CoWBlocks_) {
+            GetSlot(index).fetch_and(~CoWMask, std::memory_order::release);
         }
 
-        // Drop blocks that were empty at the flip (first written mid-scan).
-        EraseIf(
-            snapshot.Blocks,
-            [] (const auto& indexAndId) { return indexAndId.second == EmptyMappedBlockId; });
+        {
+            auto guard = Guard(WriteLock_);
 
-        return snapshot;
+            SnapshotState_ = ESnapshotState::None;
+            CoWBlocks_.clear();
+        }
     }
 
-    void LoadSnapshot(const TBlockMapSnapshot& snapshot) override
+    void BeginLoadSnapshot() final
     {
-        YT_VERIFY(GetUsedBlockCount() == 0);
-        UsedBlockCount_.store(std::ssize(snapshot.Blocks), std::memory_order::release);
+        YT_VERIFY(!LoadingSnapshot_);
+        LoadingSnapshot_ = true;
+    }
+
+    void LoadSnapshotPart(const TBlockMapSnapshot& snapshot) final
+    {
+        YT_VERIFY(LoadingSnapshot_);
 
         for (auto [index, id] : snapshot.Blocks) {
             YT_VERIFY(IsStoredMappedBlockId(id) && !IsCoW(id));
             auto& slot = GetSlot(index);
-            YT_VERIFY(TMappedBlockId(slot.load(std::memory_order::acquire)) == EmptyMappedBlockId);
+            // The blocks come from a snapshot table, which may name the same block twice; refuse rather
+            // than crash the server on it.
+            if (TMappedBlockId(slot.load(std::memory_order::acquire)) != EmptyMappedBlockId) {
+                THROW_ERROR_EXCEPTION("Snapshot maps block %v more than once", index);
+            }
             slot.store(id.Underlying(), std::memory_order::release);
+            UsedBlockCount_.fetch_add(1, std::memory_order::relaxed);
         }
     }
 
+    void EndLoadSnapshot() final
+    {
+        YT_VERIFY(LoadingSnapshot_);
+        LoadingSnapshot_ = false;
+    }
+
+    std::vector<std::pair<int, TStoredBlockId>> GetChunkBlocks(int chunkIndex) const final
+    {
+        YT_VERIFY(0 <= chunkIndex && chunkIndex < MaxChunksPerDevice);
+
+        using namespace NStoredBlockIdLayout;
+
+        auto slotMask = TagMask | (((1ULL << ChunkIndexBits) - 1) << (RecordIndexBits + BlockIndexBits));
+        auto slotExpected = (StoredTag << PayloadBits) |
+            (static_cast<ui64>(chunkIndex) << (RecordIndexBits + BlockIndexBits));
+
+        std::vector<std::pair<int, TStoredBlockId>> blocks;
+        for (int index = 0; index < std::ssize(Slots_); ++index) {
+            auto slot = Slots_[index].load(std::memory_order::acquire);
+            if ((slot & slotMask) == slotExpected) {
+                blocks.emplace_back(index, ToStoredBlockId(TMappedBlockId(slot)));
+            }
+        }
+        return blocks;
+    }
+
     DEFINE_SIGNAL_OVERRIDE(void(TDirtyBlockId dirtyBlockId, TStoredBlockId storedBlockId), BlockFlushObserved);
-    DEFINE_SIGNAL_OVERRIDE(void(TStoredBlockId storedBlockId), StoredBlockDied);
+    DEFINE_SIGNAL_OVERRIDE(void(TStoredBlockId storedBlockId), StoredBlockUnreferenced);
 
 private:
     std::vector<std::atomic<TMappedBlockId::TUnderlying>> Slots_;
@@ -258,37 +355,16 @@ private:
 
     ESnapshotState SnapshotState_ = ESnapshotState::None;
 
-    // A deque (not a vector) so appends under WriteLock_ never trigger an O(n) reallocation-and-copy.
-    std::deque<std::pair<int, TMappedBlockId>> CoWBlocks_;
+    bool LoadingSnapshot_ = false;
+
+    //! Pre-snapshot value of every block overwritten since the snapshot was armed, so a scan can read
+    //! back what a CoW-marked slot held at the flip. Guarded by WriteLock_.
+    absl::flat_hash_map<int, TMappedBlockId> CoWBlocks_;
 
     std::atomic<TMappedBlockId::TUnderlying>& GetSlot(int blockIndex)
     {
         YT_ASSERT(0 <= blockIndex && blockIndex < std::ssize(Slots_));
         return Slots_[blockIndex];
-    }
-
-    //! The locked half of #TryMakeClean; returns whether the flush was adopted.
-    bool TryAdoptStoredBlock(int blockIndex, TDirtyBlockId expectedBlockId, TStoredBlockId storedBlockId)
-    {
-        auto guard = Guard(WriteLock_);
-
-        auto& slot = GetSlot(blockIndex);
-        auto oldId = TMappedBlockId(slot.load(std::memory_order::acquire));
-        if (WithoutCoW(oldId) != ToMappedBlockId(expectedBlockId)) {
-            return false;
-        }
-
-        auto newId = ToMappedBlockId(storedBlockId);
-        // Stash the pre-snapshot value on first overwrite during a scan; see #PutDirty.
-        if (SnapshotState_ == ESnapshotState::CoWActive) {
-            if (!IsCoW(oldId)) {
-                CoWBlocks_.emplace_back(blockIndex, oldId);
-            }
-            newId = WithCoW(newId);
-        }
-        slot.store(newId.Underlying(), std::memory_order::release);
-
-        return true;
     }
 };
 

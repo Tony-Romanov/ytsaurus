@@ -37,24 +37,28 @@ public:
         YT_VERIFY(capacityCount > 0);
     }
 
-    int GetCapacity() const override
+    int GetCapacity() const final
     {
         return CapacityCount_;
     }
 
-    int GetSize() const override
+    int GetSize() const final
     {
         auto guard = Guard(Lock_);
         return GetSizeLocked();
     }
 
-    TFuture<std::vector<TDirtyBlockId>> Put(TRange<TDirtyBlockPtr> blocks) override
+    TFuture<std::vector<TDirtyBlockId>> Put(TRange<TDirtyBlockPtr> blocks) final
     {
+        auto guard = Guard(Lock_);
+
+        if (!FailedError_.IsOK()) {
+            return MakeFuture<std::vector<TDirtyBlockId>>(FailedError_);
+        }
+
         if (blocks.empty()) {
             return MakeFuture(std::vector<TDirtyBlockId>{});
         }
-
-        auto guard = Guard(Lock_);
 
         // Accept as many blocks as currently fit (the caller resubmits the rest). Only when
         // nothing fits do we wait for space; puts already waiting keep their place in line.
@@ -71,7 +75,27 @@ public:
         return PendingPuts_.back().Promise.ToFuture();
     }
 
-    TDirtyBlockPtr Find(TDirtyBlockId blockId, int blockIndex) override
+    void Fail(const TError& error) final
+    {
+        YT_VERIFY(!error.IsOK());
+
+        std::deque<TPendingPut> pendingPuts;
+        {
+            auto guard = Guard(Lock_);
+            if (!FailedError_.IsOK()) {
+                return;
+            }
+            FailedError_ = error;
+            pendingPuts = std::exchange(PendingPuts_, {});
+        }
+
+        // Outside the lock, as with the fulfillment in #EndDrain.
+        for (const auto& pendingPut : pendingPuts) {
+            pendingPut.Promise.TrySet(error);
+        }
+    }
+
+    TDirtyBlockPtr Find(TDirtyBlockId blockId, int blockIndex) final
     {
         // Lock-free: load the slot and check whether it still holds the requested block.
         auto block = BlockRing_[GetSlot(blockId.Underlying())].Acquire();
@@ -80,7 +104,7 @@ public:
             : nullptr;
     }
 
-    TBeginDrainResult BeginDrain(int maxBlockCount) override
+    TBeginDrainResult BeginDrain(int maxBlockCount) final
     {
         auto guard = Guard(Lock_);
         // Hand out the oldest blocks without removing them; the paired EndDrain evicts them. Only
@@ -94,7 +118,7 @@ public:
         return result;
     }
 
-    void EndDrain(const TBeginDrainResult& result) override
+    void EndDrain(const TBeginDrainResult& result) final
     {
         std::vector<TPendingPut> readyPuts;
         {
@@ -122,7 +146,7 @@ public:
 
         // Fulfill the unblocked puts outside the lock.
         for (auto& pendingPut : readyPuts) {
-            pendingPut.Promise.Set(std::move(pendingPut.BlockIds));
+            pendingPut.Promise.TrySet(std::move(pendingPut.BlockIds));
         }
     }
 
@@ -146,6 +170,9 @@ private:
     };
 
     std::deque<TPendingPut> PendingPuts_;
+
+    //! Set by #Fail. Once set, every put fails with it.
+    TError FailedError_;
 
     int GetSizeLocked() const
     {

@@ -651,7 +651,7 @@ public:
         CollectAndTopologicallySortAllAncestors(std::move(transactions));
     }
 
-    template <CInvocable<void(TRange<std::optional<NRecords::TTransaction>>)> F>
+    template <NMpl::CInvocable<void(TRange<std::optional<NRecords::TTransaction>>)> F>
     void IterateOverInnermostTransactionGroupedByCoordinator(F&& callback)
     {
         YT_ASSERT_INVOKER_AFFINITY(Invoker_);
@@ -2177,7 +2177,7 @@ private:
         if (!replicas.empty()) {
             NTransactionServer::NProto::TReqCommitTransaction req;
             ToProto(req.mutable_transaction_id(), TransactionId_);
-            req.set_commit_timestamp(CommitTimestamp_);
+            req.set_commit_timestamp(ToProto(CommitTimestamp_));
             auto transactionActionData = MakeTransactionActionData(req);
 
             for (const auto& replica : replicas) {

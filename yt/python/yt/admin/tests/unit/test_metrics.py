@@ -165,10 +165,11 @@ class TestPromql:
     @pytest.mark.parametrize(
         "selector, expected_metric, expected_matchers",
         [
-            ('foo_total{a="1", b=~"2"}', "foo_total", {"a": ("=", "1"), "b": ("=~", "2")}),
-            ('foo_total', "foo_total", {}),
-            ('{a="1"}', None, {"a": ("=", "1")}),
-            ('', None, {}),
+            ('foo_total{a="1", b=~"2"}', "foo_total", [("a", "=", "1"), ("b", "=~", "2")]),
+            ('foo_total', "foo_total", []),
+            ('{a="1"}', None, [("a", "=", "1")]),
+            ('', None, []),
+            ('foo{env="prod",env=~".*"}', "foo", [("env", "=", "prod"), ("env", "=~", ".*")]),
         ],
     )
     def test_parse_selector(self, selector, expected_metric, expected_matchers):
@@ -307,6 +308,36 @@ class TestPromql:
                     '{__name__="yt_accounts", account=~".*"}',
                 ],
             ),
+            (
+                [
+                    'foo{env="prod",env=~".*"}',
+                    'foo{env="dev"}',
+                ],
+                [
+                    'foo{env="dev"}',
+                    'foo{env="prod",env=~".*"}',
+                ],
+            ),
+            (
+                [
+                    'foo{pod!="p-tmp",pod=~".*"}',
+                    'foo{pod="p-tmp"}',
+                ],
+                [
+                    'foo{pod="p-tmp"}',
+                    'foo{pod!="p-tmp",pod=~".*"}',
+                ],
+            ),
+            (
+                [
+                    'foo{band=~""}',
+                    'foo{band=~".+"}',
+                ],
+                [
+                    'foo{band=~""}',
+                    'foo{band=~".+"}',
+                ],
+            ),
         ],
     )
     def test_eliminate_subsets(self, selectors, expected):
@@ -385,9 +416,19 @@ targets:
         assert spec.dashboards == []
         assert spec.raw["defaults"]["step"] == "30s"
 
-    def test_uses_default_step_when_missing(self, tmp_path):
+    @pytest.mark.parametrize(
+        "defaults_section",
+        [
+            "",
+            "defaults:\n",
+            "defaults: {}\n",
+            "defaults: null\n",
+            "defaults:\n  # step: 30s\n",
+        ],
+    )
+    def test_uses_default_step_when_missing(self, tmp_path, defaults_section):
         spec_path = tmp_path / "spec.yaml"
-        spec_path.write_text("""
+        spec_path.write_text(defaults_section + """
 targets:
 - type: metric
   query: foo_total

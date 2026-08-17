@@ -10,6 +10,7 @@
 #include <yt/yt/flow/library/cpp/common/public.h>
 
 #include <yt/yt/core/misc/collection_helpers.h>
+#include <yt/yt/core/misc/error.h>
 
 #include <util/system/type_name.h>
 
@@ -111,8 +112,8 @@ void TRegistry::EmplaceDescriptorOrCrash(THashMap<std::string, TDescriptor>& des
         YT_TLOG_FATAL(
             "Can not emplace descriptor because it is already present in descriptor map. "
             "Check that YT_FLOW_DEFINE_* macro is not called in header file. Or in two source files.")
-            .With("Descriptor", TypeName<TDescriptor>(), "%Qv")
-            .With("Type", TypeName<T>(), "%Qv");
+            .With("Descriptor", TypeName<TDescriptor>())
+            .With("Type", TypeName<T>());
     }
 }
 
@@ -148,15 +149,20 @@ void TRegistry::RegisterComputation()
         YT_TLOG_FATAL(
             "Can not emplace computation because it is already present in descriptor map. "
             "Check that a YT_FLOW_DEFINE_* macro is not called in a header file or in two source files.")
-            .With("Computation", TypeName<T>(), "%Qv");
+            .With("Computation", TypeName<T>());
     }
 }
 
 template <class TFunction, class TStaticParameters, class TDynamicParameters>
 void TRegistry::RegisterProcessFunction()
 {
-    EmplaceDescriptorOrCrash<TFunction>(
-        TypeNameToProcessFunctionDescriptor_,
+    // Unlike the other Register* methods, this one can be reached at runtime
+    // (via the companion TPipeline typed API), where a duplicate — the same
+    // function declared with different parameter types, or a typed declaration
+    // clashing with a linked YT_FLOW_DEFINE_PROCESS_FUNCTION — must surface as
+    // a catchable error rather than a crash.
+    auto [it, success] = TypeNameToProcessFunctionDescriptor_.try_emplace(
+        TypeName<TFunction>(),
         TProcessFunctionDescriptor{
             .Factory = [] {
                 return IProcessFunctionBasePtr(New<TFunction>());
@@ -176,6 +182,9 @@ void TRegistry::RegisterProcessFunction()
             },
             .OverridesSync = std::is_base_of_v<ISyncProcessFunction, TFunction>,
         });
+    THROW_ERROR_EXCEPTION_UNLESS(success,
+        "Process function %Qv is already registered",
+        TypeName<TFunction>());
 }
 
 template <class T>
@@ -253,6 +262,24 @@ void TRegistry::RegisterResource()
             .ParametersFactory = &New<TUnitedParameters<T>>,
             .DynamicParametersFactory = &New<TDynamicUnitedParameters<T>>,
             .ValidateSpec = [] (const TResourceSpec& spec) {
+                T::TValidator::Validate(spec);
+            },
+        });
+}
+
+template <class T>
+void TRegistry::RegisterFileSource()
+{
+    static_assert(std::is_base_of_v<IFileSource, T>);
+
+    ValidateParametersType<typename T::TParameters, typename T::TParametersPtr>();
+
+    EmplaceDescriptorOrCrash<T>(
+        TypeNameToFileSourceDescriptor_,
+        TFileSourceDescriptor{
+            .Factory = &New<T, const TFileSourceContextPtr&>,
+            .ParametersFactory = &New<typename T::TParameters>,
+            .ValidateSpec = [] (const TFileSourceSpec& spec) {
                 T::TValidator::Validate(spec);
             },
         });

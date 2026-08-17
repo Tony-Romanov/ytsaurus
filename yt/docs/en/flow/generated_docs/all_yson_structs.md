@@ -70,6 +70,8 @@ This file contains descriptions of all specs and configs used for {{product-name
 
 {% include [_](./NYT_NFlow_EProcessingMode.md) %}
 
+{% include [_](./NYT_NFlow_EQueueTabletIndexRoutingHashPolicy.md) %}
+
 {% include [_](./NYT_NFlow_ETimeType.md) %}
 
 {% include [_](./NYT_NFlow_ETimestampFormat.md) %}
@@ -97,6 +99,8 @@ This file contains descriptions of all specs and configs used for {{product-name
 {% include [_](./NYT_NFlow_NController_TPersistedStateManagerConfig.md) %}
 
 {% include [_](./NYT_NFlow_NDeltaCodecs_ECodec.md) %}
+
+{% include [_](./NYT_NFlow_NFileStorage_TFileStorageConfig.md) %}
 
 {% include [_](./NYT_NFlow_NStaticTableConnector_TTableTimestampLocatorSpec.md) %}
 
@@ -184,7 +188,11 @@ This file contains descriptions of all specs and configs used for {{product-name
 
 {% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NCompanion_TTransformCompanionComputation.md) %}
 
+{% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NCompanion_TTransformOrderedSourceCompanionComputation.md) %}
+
 {% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NSortedDynamicTable_TSyncSink.md) %}
+
+{% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink.md) %}
 
 {% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TSource.md) %}
 
@@ -237,6 +245,12 @@ This file contains descriptions of all specs and configs used for {{product-name
 {% include [_](./NYT_NFlow_TExternalStateManagerSpec.md) %}
 
 {% include [_](./NYT_NFlow_TFetcherInJoinerSpec.md) %}
+
+{% include [_](./NYT_NFlow_TFileResourceDynamicParameters.md) %}
+
+{% include [_](./NYT_NFlow_TFileResourceParameters.md) %}
+
+{% include [_](./NYT_NFlow_TFileSourceSpec.md) %}
 
 {% include [_](./NYT_NFlow_TFlowNodeConfig.md) %}
 
@@ -316,7 +330,11 @@ This file contains descriptions of all specs and configs used for {{product-name
 
 {% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NCompanion_TTransformCompanionComputation.md) %}
 
+{% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NCompanion_TTransformOrderedSourceCompanionComputation.md) %}
+
 {% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NSortedDynamicTable_TSyncSink.md) %}
+
+{% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink.md) %}
 
 {% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnector_TSource.md) %}
 

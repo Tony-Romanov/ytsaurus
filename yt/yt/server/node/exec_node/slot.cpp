@@ -81,7 +81,7 @@ public:
         , NodeTag_(nodeTag)
         , JobProxyUnixDomainSocketPath_(GetJobProxyUnixDomainSocketPath())
         , NumaNodeAffinity_(numaNodeAffinity)
-        , Logger(SlotLogger().WithTag("SlotIndex: %v", SlotIndex_))
+        , Logger(SlotLogger().WithTag("SlotIndex", SlotIndex_))
     {
         Location_->IncreaseSessionCount();
         if (diskRequest.disk_space() > 0) {
@@ -489,8 +489,8 @@ public:
 
                                 auto& volumeResults = volumeResultsOrError.Value();
 
-                                // Inform slot location about tmpfses to be used.
-                                Location_->TakeIntoAccountTmpfsVolumes(
+                                // Inform slot location about non-root volumes to be used.
+                                Location_->TakeIntoAccountNonRootVolumes(
                                     SlotIndex_,
                                     rootVolume,
                                     volumeResults,
@@ -701,7 +701,7 @@ public:
     {
         VerifyEnabled();
 
-        Logger.AddTag("AllocationId: %v", allocationId);
+        Logger.AddTag("AllocationId", allocationId);
     }
 
     std::string GetJobProxyUnixDomainSocketPath() const override
@@ -777,7 +777,7 @@ public:
         YT_ASSERT_THREAD_AFFINITY_ANY();
         if (!IsEnabled_.load()) {
             THROW_ERROR_EXCEPTION("User slot is disabled")
-                << TErrorAttribute("slot_index", SlotIndex_);
+                .With("slot_index", SlotIndex_);
         }
 
         Location_->ValidateEnabled();
@@ -829,7 +829,7 @@ private:
             YT_LOG_DEBUG("Skip preparation action since preparation is canceled (ActionName: %v)", actionName);
 
             return MakeFuture<TUnderlyingReturnType>(TError("Job preparation canceled")
-                << TErrorAttribute("slot_index", SlotIndex_));
+                .With("slot_index", SlotIndex_));
         } else {
             YT_LOG_DEBUG("Running preparation action (ActionName: %v)", actionName);
 

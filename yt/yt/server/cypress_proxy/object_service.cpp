@@ -294,7 +294,7 @@ public:
         , ForceUseTargetCellTag_(
             targetCellTag != Owner_->Connection_->GetPrimaryMasterCellTag())
         , DynamicConfig_(Owner_->GetDynamicConfig())
-        , Logger(Owner_->Logger.WithTag("RequestId: %v", RpcContext_->GetRequestId()))
+        , Logger(Owner_->Logger.WithTag("RequestId", RpcContext_->GetRequestId()))
     { }
 
     void Run()
@@ -415,7 +415,7 @@ private:
                 THROW_ERROR_EXCEPTION(
                     NRpc::EErrorCode::ProtocolError,
                     "Could not parse subrequest header")
-                    << TErrorAttribute("subrequest_index", index);
+                    .With("subrequest_index", index);
             }
 
             if (RpcContext_->IsRetry()) {
@@ -822,8 +822,8 @@ private:
             auto error = TError(
                 NRpc::EErrorCode::ProtocolError,
                 "Error parsing response header")
-                << TErrorAttribute("request_id", RpcContext_->GetRequestId())
-                << TErrorAttribute("subrequest_index", subrequestIndex);
+                .With("request_id", RpcContext_->GetRequestId())
+                .With("subrequest_index", subrequestIndex);
             YT_LOG_WARNING(error);
 
             THROW_ERROR error;

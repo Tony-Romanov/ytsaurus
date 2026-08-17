@@ -12,9 +12,26 @@ SRCS(
     node.cpp
     node_info.cpp
     queue_log_writer.cpp
+    root_clients_cache.cpp
     simple_runner_program.cpp
     vanilla_launcher.cpp
 )
+
+IF (OPENSOURCE)
+    SRCS(
+        network_bandwidth_opensource.cpp
+        vanilla_defaults_opensource.cpp
+    )
+ELSE()
+    SRCS(
+        network_bandwidth_yandex.cpp
+        vanilla_defaults_yandex.cpp
+    )
+    PEERDIR(
+        yt/yt/flow/yandex/deploy_url_provider
+        yt/yt/flow/yandex/yp_address_provider
+    )
+ENDIF()
 
 PEERDIR(
     yt/yt/flow/library/cpp/vanilla
@@ -39,6 +56,18 @@ PEERDIR(
     library/cpp/yt/phdr_cache
     library/cpp/yt/string/enable_enum_suggestions_on_enum_parse_error
 )
+
+# Porto is linux-only, and library/cpp/porto does not build in the cpp-sdk export,
+# so everything that reaches it lives in a separate source file.
+IF (OS_LINUX AND OPENSOURCE_PROJECT != "yt-cpp-sdk")
+    SRCS(porto_tracker.cpp)
+
+    PEERDIR(
+        yt/yt/library/containers
+    )
+ELSE()
+    SRCS(porto_tracker_dummy.cpp)
+ENDIF()
 
 END()
 

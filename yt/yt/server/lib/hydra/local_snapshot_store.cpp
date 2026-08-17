@@ -50,7 +50,7 @@ public:
         : FileName_(std::move(fileName))
         , SnapshotId_(snapshotId)
         , IOInvoker_(std::move(ioInvoker))
-        , Logger(HydraLogger().WithTag("Path: %v", fileName))
+        , Logger(HydraLogger().WithTag("Path", fileName))
     { }
 
     int GetSnapshotId() const
@@ -152,7 +152,7 @@ private:
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error opening snapshot %v for reading",
                 FileName_)
-                << ex;
+                .With(ex);
         }
 
         YT_LOG_DEBUG("Local snapshot reader opened");
@@ -216,7 +216,7 @@ public:
         , SnapshotId_(snapshotId)
         , Meta_(std::move(meta))
         , IOInvoker_(std::move(ioInvoker))
-        , Logger(HydraLogger().WithTag("Path: %v", FileName_))
+        , Logger(HydraLogger().WithTag("Path", FileName_))
     {
         SerializedMeta_ = SerializeProtoToRef(Meta_);
     }
@@ -337,7 +337,7 @@ private:
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error opening snapshot %v for writing",
                 FileName_)
-                << ex;
+                .With(ex);
         }
 
         IsOpened_ = true;
@@ -423,7 +423,7 @@ public:
         : FileName_(std::move(fileName))
         , Meta_(std::move(meta))
         , IOInvoker_(std::move(ioInvoker))
-        , Logger(HydraLogger().WithTag("Path: %v", FileName_))
+        , Logger(HydraLogger().WithTag("Path", FileName_))
     { }
 
     TFuture<void> Open() override
@@ -474,7 +474,7 @@ private:
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error opening snapshot %v for reading",
                 FileName_)
-                << ex;
+                .With(ex);
         }
 
         YT_LOG_DEBUG("Local snapshot reader opened");
@@ -514,7 +514,7 @@ public:
         IInvokerPtr ioInvoker)
         : FileName_(std::move(fileName))
         , IOInvoker_(std::move(ioInvoker))
-        , Logger(HydraLogger().WithTag("Path: %v", FileName_))
+        , Logger(HydraLogger().WithTag("Path", FileName_))
     { }
 
     ~TUncompressedHeaderlessLocalSnapshotWriter()
@@ -595,7 +595,7 @@ private:
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION("Error opening snapshot %v for writing",
                 FileName_)
-                << ex;
+                .With(ex);
         }
 
         IsOpened_ = true;
@@ -643,7 +643,7 @@ public:
         IInvokerPtr ioInvoker)
         : Config_(std::move(config))
         , IOInvoker_(std::move(ioInvoker))
-        , Logger(HydraLogger().WithTag("Path: %v", Config_->Path))
+        , Logger(HydraLogger().WithTag("Path", Config_->Path))
     { }
 
     TFuture<void> Initialize()

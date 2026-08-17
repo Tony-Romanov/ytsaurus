@@ -1184,7 +1184,7 @@ IVersionedReaderPtr TSortedChunkStore::CreateReader(
     // NB: This is a fast path for in-memory readers to avoid extra wrapper.
     // We could do the same for ext-memory readers but there is no need.
     bool needKeyRangeFiltering = skippedBefore > 0 || skippedAfter > 0;
-    bool needTimestampResetting = OverrideTimestamp_;
+    bool needTimestampResetting = OverrideTimestamp_ != NullTimestamp;
     if (!needKeyRangeFiltering && !needTimestampResetting) {
         // Check for in-memory reads.
         if (auto chunkState = FindPreloadedChunkState()) {
@@ -1310,12 +1310,12 @@ bool TSortedChunkStore::CheckRowLocks(
         NTabletClient::EErrorCode::CannotCheckConflictsAgainstChunkStore,
         "Checking for transaction conflicts against chunk stores is not supported; "
         "consider reducing transaction duration or increasing store retention time")
-        << TErrorAttribute("transaction_id", transaction->GetId())
-        << TErrorAttribute("transaction_start_time", transaction->GetStartTime())
-        << TErrorAttribute("tablet_id", TabletId_)
-        << TErrorAttribute("table_path", TablePath_)
-        << TErrorAttribute("store_id", StoreId_)
-        << TErrorAttribute("key", RowToKey(row));
+        .With("transaction_id", transaction->GetId())
+        .With("transaction_start_time", transaction->GetStartTime())
+        .With("tablet_id", TabletId_)
+        .With("table_path", TablePath_)
+        .With("store_id", StoreId_)
+        .With("key", RowToKey(row));
     return false;
 }
 
@@ -1374,11 +1374,11 @@ void TSortedChunkStore::PopulateAddStoreDescriptor(NProto::TAddStoreDescriptor* 
     }
 
     if (OverrideTimestamp_) {
-        chunkViewDescriptor->set_override_timestamp(OverrideTimestamp_);
+        chunkViewDescriptor->set_override_timestamp(ToProto(OverrideTimestamp_));
     }
 
     if (MaxClipTimestamp_) {
-        chunkViewDescriptor->set_max_clip_timestamp(MaxClipTimestamp_);
+        chunkViewDescriptor->set_max_clip_timestamp(ToProto(MaxClipTimestamp_));
     }
 }
 
@@ -1455,10 +1455,10 @@ void TSortedChunkStore::ValidateBlockSize(
             const auto& miscExt = chunkMeta->Misc();
             if (miscExt.max_data_block_size() > *blockSizeLimit) {
                 THROW_ERROR_EXCEPTION("Maximum block size limit violated")
-                    << TErrorAttribute("tablet_id", TabletId_)
-                    << TErrorAttribute("chunk_id", GetId())
-                    << TErrorAttribute("block_size", miscExt.max_data_block_size())
-                    << TErrorAttribute("block_size_limit", *blockSizeLimit);
+                    .With("tablet_id", TabletId_)
+                    .With("chunk_id", GetId())
+                    .With("block_size", miscExt.max_data_block_size())
+                    .With("block_size_limit", *blockSizeLimit);
             }
         }
     }

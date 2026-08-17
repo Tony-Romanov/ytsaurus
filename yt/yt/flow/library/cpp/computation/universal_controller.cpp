@@ -57,6 +57,8 @@ void TUniversalComputationControllerPartitioningState::Register(TRegistrar regis
 {
     registrar.Parameter("last_sink_channel_counts", &TThis::LastSinkChannelCounts)
         .Default();
+    registrar.Parameter("suppressed_availability_groups", &TThis::SuppressedAvailabilityGroups)
+        .Default();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -319,6 +321,11 @@ void TUniversalComputationController::DoPartitioning(
             grouped.RangePartitions.clear();
         }
 
+        // A new leader starts its cooldown before using fresh job samples.
+        if (LastRepartitionTime_ == TInstant::Zero()) {
+            LastRepartitionTime_ = TInstant::Seconds(flowView->State->CurrentTimestamp.Underlying());
+        }
+
         TInputAutoPartitioningContext context(flowView, grouped.RangePartitions);
         InputAutoPartitioningCollectData(context);
         InputAutoPartitioningCalculateOptimalCount(context);
@@ -351,7 +358,7 @@ void TUniversalComputationController::DoPartitioning(
             for (const auto& [lower, upper] : context.NewRanges) {
                 CreateRangePartition(flowView, lower, upper, makeDynamicPartitionSpec(lower, upper));
             }
-            LastRepartitionTime_ = TInstant::Now();
+            LastRepartitionTime_ = TInstant::Seconds(flowView->State->CurrentTimestamp.Underlying());
             GetContext()->CommonContext->LastRepartitioningInstant = LastRepartitionTime_;
             LastCommonRepartitioningInstant_ = LastRepartitionTime_;
             // Merge (not replace) so a sink whose count is transiently unknown keeps its last-known
@@ -371,6 +378,10 @@ void TUniversalComputationController::DoPartitioning(
         }
 
         ProcessSourcePartitionStatuses(grouped.KeyPartitions, flowView);
+        if (const auto& suppressedAvailabilityGroups = GetSuppressedAvailabilityGroups()) {
+            PartitioningState_->SuppressedAvailabilityGroups = *suppressedAvailabilityGroups;
+        }
+        NotifySourcesAboutSuppressedGroups();
 
         auto expectedKeys = GetSourcePartitionKeys();
         if (expectedKeys) {
@@ -379,6 +390,10 @@ void TUniversalComputationController::DoPartitioning(
                 dynamicComputationPartitionSpec->ActiveSource = dynamicSourcePartitionSpec;
                 YT_VERIFY(dynamicComputationPartitionSpec->ActiveSource);
                 dynamicComputationPartitionSpec->BlockedOutputStreams = blockedStreamComputer->GetBlockedStreams(sourceKey);
+                auto availabilityGroupOrigin = GetAvailabilityGroupOrigin(sourceKey);
+                dynamicComputationPartitionSpec->AvailabilityGroupUnavailable = availabilityGroupOrigin &&
+                    PartitioningState_->SuppressedAvailabilityGroups.contains(
+                        MakeAvailabilityGroupKey(*availabilityGroupOrigin));
                 return ConvertTo<IMapNodePtr>(dynamicComputationPartitionSpec);
             };
 
@@ -390,7 +405,7 @@ void TUniversalComputationController::DoPartitioning(
                 }
                 auto partition = GetOrCrash(flowView->State->ExecutionSpec->Layout->Partitions, partitionId);
                 if (partition->State == EPartitionState::Completed) {
-                    YT_TLOG_EVENT_FLUENT(GetContext()->PublicLogger, NLogging::ELogLevel::Info, "Removing completed source partition")
+                    YT_TLOG_EVENT(GetContext()->PublicLogger, NLogging::ELogLevel::Info, "Removing completed source partition")
                         .With("PartitionId", partitionId)
                         .With("Partition", NYson::ConvertToYsonString(partition, EYsonFormat::Text));
                     flowView->State->ExecutionSpec->Layout->RemovePartition(partitionId);
@@ -425,22 +440,59 @@ void TUniversalComputationController::DoPartitioning(
     }
 }
 
+void TUniversalComputationController::NotifySourcesAboutSuppressedGroups()
+{
+    THashMap<TStreamId, THashSet<std::string>> groupsByStream;
+    for (const auto& availabilityGroup : PartitioningState_->SuppressedAvailabilityGroups) {
+        // A group whose partitions all vanished between the traverse and now has no origin left.
+        if (const auto* origin = AvailabilityGroupOrigins_.FindPtr(availabilityGroup)) {
+            groupsByStream[origin->StreamId].insert(origin->Group);
+        }
+    }
+
+    for (const auto& [streamId, source] : Sources_) {
+        source->ProcessSuppressedGroups(groupsByStream[streamId]);
+    }
+}
+
+std::optional<TUniversalComputationController::TAvailabilityGroupOrigin>
+TUniversalComputationController::GetAvailabilityGroupOrigin(const TKey& partitionKey) const
+{
+    auto [streamId, sourceKey] = SplitUniversalPartitionKey(partitionKey);
+    const auto* source = Sources_.FindPtr(streamId);
+    if (!source) {
+        return std::nullopt;
+    }
+    return TAvailabilityGroupOrigin{
+        .StreamId = streamId,
+        .Group = (*source)->GetGroup(sourceKey),
+    };
+}
+
+std::string TUniversalComputationController::MakeAvailabilityGroupKey(const TAvailabilityGroupOrigin& origin)
+{
+    return Format("%v-%v", origin.StreamId, origin.Group);
+}
+
 THashMap<std::string, std::vector<TNodeTraverseDataPtr>> TUniversalComputationController::GetNodesByAvailabilityGroup(
     const THashMap<TPartitionId, TNodeTraverseDataPtr>& traverseData,
     const TFlowViewPtr& flowView)
 {
     THashMap<std::string, std::vector<TNodeTraverseDataPtr>> grouped;
+    AvailabilityGroupOrigins_.clear();
     for (const auto& [partitionId, node] : traverseData) {
         const auto partition = GetOrCrash(flowView->State->ExecutionSpec->Layout->Partitions, partitionId);
         if (partition->SourceKey) {
-            auto [streamId, sourceKey] = SplitUniversalPartitionKey(*partition->SourceKey);
             // Source stream renamed in spec - the partition's encoded streamId no longer maps to a live
             // source controller. Skip; orphan partitions are eventually pruned by InterruptPartition path
             // in DoPartitioning.
-            if (!Sources_.contains(streamId)) {
+            auto origin = GetAvailabilityGroupOrigin(*partition->SourceKey);
+            if (!origin) {
                 continue;
             }
-            grouped[Format("%v-%v", streamId, GetOrCrash(Sources_, streamId)->GetGroup(sourceKey))].push_back(node);
+            auto availabilityGroup = MakeAvailabilityGroupKey(*origin);
+            AvailabilityGroupOrigins_.emplace(availabilityGroup, std::move(*origin));
+            grouped[availabilityGroup].push_back(node);
         } else {
             grouped["input-default"].push_back(node);
         }
@@ -510,7 +562,7 @@ THashMap<TStreamId, ISourceControllerPtr> TUniversalComputationController::Creat
         sourceContext->SourceSpec = sourceSpec;
         sourceContext->Profiler = sourceContext->Profiler.WithPrefix("/source").WithTag("stream_id", streamId.Underlying());
         sourceContext->StatusProfiler = sourceContext->StatusProfiler->WithPrefix(Format("/sources/%v", streamId));
-        sourceContext->Logger = sourceContext->Logger.WithTag("SourceStreamId: %v", streamId.Underlying());
+        sourceContext->Logger = sourceContext->Logger.WithTag("SourceStreamId", streamId);
         auto dynamicSourceContext = New<TDynamicSourceControllerContext>();
         dynamicSourceContext->DynamicSourceSpec = dynamicSourceSpec;
         sources[streamId] = TRegistry::Get()->CreateSourceController(sourceContext, dynamicSourceContext);
@@ -532,7 +584,7 @@ THashMap<TSinkId, ISinkControllerPtr> TUniversalComputationController::CreateSin
         sinkContext->SinkSpec = sinkSpec;
         sinkContext->Profiler = sinkContext->Profiler.WithPrefix("/sink").WithTag("sink_id", sinkId.Underlying());
         sinkContext->StatusProfiler = sinkContext->StatusProfiler->WithPrefix(Format("/sinks/%v", sinkId));
-        sinkContext->Logger = sinkContext->Logger.WithTag("SinkId: %v", sinkId.Underlying());
+        sinkContext->Logger = sinkContext->Logger.WithTag("SinkId", sinkId);
         auto dynamicSinkContext = New<TDynamicSinkControllerContext>();
         dynamicSinkContext->DynamicSinkSpec = dynamicSinkSpec;
         sinks[sinkId] = TRegistry::Get()->CreateSinkController(sinkContext, dynamicSinkContext);
@@ -609,7 +661,8 @@ void TUniversalComputationController::InputAutoPartitioningCollectData(TInputAut
         if (!context.AnotherComputationRecentlyRepartitioned) {
             baseInstant = std::max(baseInstant, GetContext()->CommonContext->LastRepartitioningInstant);
         }
-        context.NormalFlightDuration = TInstant::Now() - baseInstant;
+        // Both operands use the cluster clock; node-clock skew would corrupt the cooldown.
+        context.NormalFlightDuration = TInstant::Seconds(context.FlowView->State->CurrentTimestamp.Underlying()) - baseInstant;
         YT_TLOG_INFO("Partitioning: calculating normal flight duration")
             .With("PipelineState", pipelineState->GetValue())
             .With("LastRepartitionTime", LastRepartitionTime_)
@@ -821,7 +874,7 @@ void TUniversalComputationController::InputAutoPartitioningCalculateOptimalCount
                 // That would create a tension that would force all computations to repartition at the same time.
                 // That in turn would allow to avoid several sequential delays causes by sequential repartitioning
                 //  of different computation.
-                TDuration timeSinceAnyRepartitioning = TInstant::Now() - GetContext()->CommonContext->LastRepartitioningInstant;
+                TDuration timeSinceAnyRepartitioning = TInstant::Seconds(context.FlowView->State->CurrentTimestamp.Underlying()) - GetContext()->CommonContext->LastRepartitioningInstant;
                 TDuration crossComputationAffectDuration = std::min(referenceDelay, delay) / 2;
                 if (timeSinceAnyRepartitioning < crossComputationAffectDuration) {
                     // Approximate linearly from 0.5 to 1.

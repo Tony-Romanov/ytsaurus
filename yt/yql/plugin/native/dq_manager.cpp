@@ -41,7 +41,7 @@ void TDqManagerConfig::Register(TRegistrar registrar)
         .Default();
 
     registrar.Parameter("yt_backends", &TThis::YtBackends)
-        .NonEmpty();
+        .Default();
 
     registrar.Parameter("yt_coordinator", &TThis::YtCoordinator)
         .Default();
@@ -57,6 +57,7 @@ TDqManager::TDqManager(const TDqManagerConfigPtr& config)
     : Config_(config)
 {
     YT_VERIFY(Config_->FileStorage);
+    YT_VERIFY(!Config_->YtBackends.empty());
 
     NYson::TProtobufWriterOptions protobufWriterOptions;
     protobufWriterOptions.ConvertSnakeToCamelCase = true;
@@ -116,6 +117,10 @@ void TDqManager::Start()
             ConvertToYsonString(Config_->Scheduler),
             NYson::ReflectProtobufMessageType<NYql::NProto::TDqConfig::TScheduler>(),
             protobufWriterOptions));
+    }
+
+    if (!coordinatorConfig.HasProxyAddress()) {
+        *coordinatorConfig.MutableProxyAddress() = coordinatorConfig.GetClusterName();
     }
 
     if (!coordinatorConfig.HasToken()) {
@@ -197,6 +202,10 @@ void TDqManager::Start()
 
         if (!rmOptions.YtBackend.HasICSettings()) {
             *rmOptions.YtBackend.MutableICSettings() = iCSettings;
+        }
+
+        if (!rmOptions.YtBackend.HasProxyAddress()) {
+            *rmOptions.YtBackend.MutableProxyAddress() = rmOptions.YtBackend.GetClusterName();
         }
 
         if (!rmOptions.YtBackend.HasPrefix()) {

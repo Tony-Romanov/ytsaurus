@@ -33,9 +33,13 @@ cmd_configure() {
 core.net.http:timeout=5
 core.sources:download_urls=["origin", "https://c3i.jfrog.io/artifactory/conan-center-backup-sources"]
 EOF
+    # https://docs.conan.io/2/reference/config_files/remotes.html
+    conan remote update conancenter --url="https://center2.conan.io"
 
     local extra_cmake_args=()
     [ -n "${cxx_flags_init}" ] && extra_cmake_args+=(-DCMAKE_CXX_FLAGS_INIT="${cxx_flags_init}")
+
+    local llvm_bitcode_version=18
 
     cd "${build_path}"
     cmake \
@@ -44,7 +48,7 @@ EOF
         -DCMAKE_TOOLCHAIN_FILE="${source_path}/clang.toolchain" \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-        -DREQUIRED_LLVM_TOOLING_VERSION=18 \
+        -DREQUIRED_LLVM_TOOLING_VERSION="${llvm_bitcode_version}" \
         -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${source_path}/cmake/conan_provider.cmake" \
         "${extra_cmake_args[@]}" \
         "${source_path}"
@@ -132,6 +136,31 @@ cmd_move_binaries() {
     for ut_binary in $(find . -name "*-ut" -type f); do
         strip "${ut_binary}"
         mv "${ut_binary}" "${output_build_path}"
+    done
+
+    # Flow tests resolve these binaries by their build-tree paths.
+    local flow_server="yt/yt/flow/bin/flow_server/flow_server"
+    strip "${flow_server}"
+    mkdir -p "${output_build_path}/$(dirname "${flow_server}")"
+    mv "${flow_server}" "${output_build_path}/$(dirname "${flow_server}")"
+
+    for flow_example_dir in yt/yt/flow/examples/cpp/*/; do
+        local flow_example_binary="${flow_example_dir}$(basename "${flow_example_dir}")"
+        if [ -f "${flow_example_binary}" ]; then
+            strip "${flow_example_binary}"
+            mkdir -p "${output_build_path}/${flow_example_dir}"
+            mv "${flow_example_binary}" "${output_build_path}/${flow_example_dir}"
+        fi
+    done
+
+    for flow_unittest_dir in $(find yt/yt/flow/examples/cpp -type d -name unittest); do
+        for flow_unittest_binary in "${flow_unittest_dir}"/*; do
+            if [ -f "${flow_unittest_binary}" ] && [ -x "${flow_unittest_binary}" ]; then
+                strip "${flow_unittest_binary}"
+                mkdir -p "${output_build_path}/${flow_unittest_dir}"
+                mv "${flow_unittest_binary}" "${output_build_path}/${flow_unittest_dir}"
+            fi
+        done
     done
 
     local scheduler_simulator="yt/yt/tools/scheduler_simulator/bin/scheduler_simulator"

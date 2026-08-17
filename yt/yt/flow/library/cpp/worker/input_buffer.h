@@ -5,6 +5,8 @@
 #include <yt/yt/flow/library/cpp/common/public.h>
 #include <yt/yt/flow/library/cpp/common/stream_inflight_limits.h>
 
+#include <yt/yt/flow/library/cpp/buffers/public.h>
+
 #include <yt/yt/core/actions/future.h>
 #include <yt/yt/core/actions/invoker.h>
 
@@ -37,6 +39,9 @@ struct IInputBuffer
     // Pass-by-value so the caller can `std::move` ownership in; the implementation moves the
     // deque through Passed() into the SerializedInvoker BIND closure, avoiding a copy.
     virtual void MarkPersisted(std::deque<TMessageId> messageIds) = 0;
+    virtual void MarkDeduplicated(std::deque<TMessageId> messageIds) = 0;
+
+    virtual TFuture<THashMap<TStreamId, TInflightMetricsPtr>> GetInflightMetrics() = 0;
 
     virtual TFuture<std::vector<TInputMessageConstPtr>> GetInputBatch(const THashSet<TStreamId>& allowedStreams) = 0;
 
@@ -59,11 +64,16 @@ DEFINE_REFCOUNTED_TYPE(IInputBuffer);
 IInputBufferPtr CreateInputBuffer(
     TJobId jobId,
     NFlow::TStreamLimitUsageStateMap streamLimitUsageStates,
+    NFlow::TEpochCycleTrackerPtr epochCycleTracker,
+    THashMap<TStreamId, NFlow::TOfferedRateEstimatorPtr> offeredRateEstimators,
     TComputationSpecPtr computationSpec,
     TComputationId computationId,
     TDynamicComputationSpecPtr dynamicSpec,
     IInvokerPtr finalizerPoolInvoker,
-    NProfiling::TProfiler profiler);
+    NProfiling::TProfiler profiler,
+    std::function<TInstant()> timeProvider = [] {
+        return TInstant::Now();
+    });
 
 ////////////////////////////////////////////////////////////////////////////////
 

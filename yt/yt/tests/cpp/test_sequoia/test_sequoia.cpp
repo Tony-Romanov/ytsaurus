@@ -1148,7 +1148,7 @@ TEST_F(TSequoiaTest, TestSequoiaPrelockDisable)
 
         auto timestamp = WaitFor(nativeConnection->GetTimestampProvider()->GenerateTimestamps())
             .ValueOrThrow();
-        req->set_timestamp(timestamp);
+        req->set_timestamp(ToProto(timestamp));
         SetAllowResolveFromSequoiaObject(&req->Header(), true);
 
         auto batchReq = proxy.ExecuteBatch();
@@ -1327,8 +1327,6 @@ TEST_P(TSequoiaTestPrelocks, Test)
 
     auto finally = Finally(resetArtificialCommitDelay);
 
-    auto removalStarted = NewPromise<void>();
-
     auto threadPool = CreateThreadPool(2, "TestPrelocks");
 
     auto removalFinished = BIND([&] {
@@ -1347,7 +1345,6 @@ TEST_P(TSequoiaTestPrelocks, Test)
         TRemoveNodeOptions options;
         options.TransactionId = tx[ETestSequoiaPrelocksTransaction::Self]->GetId();
         auto future = Client_->RemoveNode(FromObjectId(targetNodeId), options);
-        removalStarted.Set();
         return future;
     })
         .AsyncVia(threadPool->GetInvoker())
@@ -1381,7 +1378,7 @@ TEST_P(TSequoiaTestPrelocks, Test)
 
         auto timestamp = WaitFor(nativeConnection->GetTimestampProvider()->GenerateTimestamps())
             .ValueOrThrow();
-        req->set_timestamp(timestamp);
+        req->set_timestamp(ToProto(timestamp));
         SetAllowResolveFromSequoiaObject(&req->Header(), true);
 
         auto batchReq = proxy.ExecuteBatch();
@@ -1390,10 +1387,8 @@ TEST_P(TSequoiaTestPrelocks, Test)
         batchReq->SetSuppressTransactionCoordinatorSync(true);
         batchReq->SetSuppressUpstreamSync(true);
 
-        WaitFor(removalStarted.ToFuture())
+        WaitFor(removalFinished)
             .ThrowOnError();
-
-        TDelayedExecutor::WaitForDuration(TDuration::MilliSeconds(200));
 
         auto batchRspOrError = WaitFor(batchReq->Invoke());
 
@@ -1407,7 +1402,6 @@ TEST_P(TSequoiaTestPrelocks, Test)
         .Run();
 
     WaitFor(removalFinished).ThrowOnError();
-
 
     auto error = WaitFor(lockAttemptFinished);
     if (!GetParam().ExpectedErrorMessage) {

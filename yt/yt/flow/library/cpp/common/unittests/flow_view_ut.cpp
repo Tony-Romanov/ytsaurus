@@ -1,5 +1,8 @@
 #include <yt/yt/flow/library/cpp/common/checksum.h>
 #include <yt/yt/flow/library/cpp/common/flow_view.h>
+#include <yt/yt/flow/library/cpp/common/unittests/mock/time_provider.h>
+
+#include <yt/yt/client/transaction_client/helpers.h>
 
 #include <yt/yt/core/test_framework/framework.h>
 
@@ -206,7 +209,7 @@ TEST(TFlowViewKeeperTest, SetFeedbackFencesOnStaleSpecVersion)
 
     // Barrier crossed: a new static spec is installed, dropping the previous feedback.
     auto specV1 = New<TVersionedPipelineSpec>();
-    specV1->BumpVersion();
+    specV1->Bump(TestVersionProvider());
     keeper->SetSpecs(specV1, std::nullopt);
     EXPECT_NE(expectedSpecVersion, keeper->GetFlowView()->CurrentSpec->GetVersion());
     EXPECT_TRUE(keeper->GetFlowView()->Feedback->PartitionJobStatuses.empty());
@@ -222,6 +225,107 @@ TEST(TFlowViewKeeperTest, SetFeedbackFencesOnStaleSpecVersion)
     freshFeedback->PartitionJobStatuses.emplace(TPartitionId(TGuid::Create()), New<TPartitionJobStatus>());
     EXPECT_TRUE(keeper->SetFeedback(freshFeedback, keeper->GetFlowView()->CurrentSpec->GetVersion()));
     EXPECT_EQ(keeper->GetFlowView()->Feedback->PartitionJobStatuses.size(), 1ull);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEST(TInputMetricsAggregationTest, IgnoresStaleJobStatuses)
+{
+    const TComputationId computationId("computation");
+    const TInstant staleUpdateTime = TInstant::Seconds(50);
+    const TInstant minUpdateTime = TInstant::Seconds(100);
+    const TInstant freshUpdateTime = TInstant::Seconds(200);
+
+    auto flowState = New<TFlowState>();
+    auto storageHandler = New<TStorageHandler>();
+    auto persistedControl = New<TPersistedStateControl<std::string>>(storageHandler);
+    flowState->AttachToControl(persistedControl);
+    persistedControl->Recover();
+    flowState->StartMutation();
+
+    auto addPartition = [&] {
+        auto partition = New<TPartition>();
+        partition->PartitionId = TPartitionId(TGuid::Create());
+        partition->ComputationId = computationId;
+        partition->State = EPartitionState::Executing;
+        partition->StateEpoch = 1;
+        partition->StateTimestamp = TInstant::Seconds(1);
+        flowState->ExecutionSpec->Layout->CreatePartition(partition);
+        return partition->PartitionId;
+    };
+
+    auto stalePartitionId = addPartition();
+    auto freshPartitionId = addPartition();
+    flowState->CommitMutation();
+
+    auto flowView = New<TFlowView>();
+    flowView->State = flowState;
+    flowView->Feedback = New<TFlowFeedback>();
+
+    auto addStatus = [&] (TPartitionId partitionId, TInstant updateTime, double messagesPerSecond) {
+        auto inputMetrics = New<TNodeInputMetrics>();
+        inputMetrics->Global.MessagesPerSecond = messagesPerSecond;
+
+        auto jobStatus = New<TJobStatus>();
+        jobStatus->InputMetrics = std::move(inputMetrics);
+
+        auto partitionJobStatus = New<TPartitionJobStatus>();
+        partitionJobStatus->CurrentJobStatusUpdateTime = updateTime;
+        partitionJobStatus->CurrentJobStatus = std::move(jobStatus);
+        flowView->Feedback->PartitionJobStatuses.emplace(partitionId, std::move(partitionJobStatus));
+    };
+
+    addStatus(stalePartitionId, staleUpdateTime, 100.0);
+    addStatus(freshPartitionId, freshUpdateTime, 5.0);
+
+    auto metrics = AggregateInputMetricsByComputation(flowView, minUpdateTime);
+    ASSERT_EQ(metrics.size(), 1u);
+    const auto& computationMetrics = GetOrCrash(metrics, computationId);
+    ASSERT_TRUE(computationMetrics->Global);
+    EXPECT_DOUBLE_EQ(computationMetrics->Global->Total.MessagesPerSecond, 5.0);
+    EXPECT_DOUBLE_EQ(computationMetrics->Global->Avg.MessagesPerSecond, 5.0);
+    EXPECT_DOUBLE_EQ(computationMetrics->Global->Max.MessagesPerSecond, 5.0);
+
+    EXPECT_TRUE(AggregateInputMetricsByComputation(flowView, freshUpdateTime + TDuration::Seconds(1)).empty());
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEST(TExecutionSpecEpochTest, AdvancesForEveryVersionComponent)
+{
+    auto versions = New<TExecutionSpecVersions>();
+    i64 nextClockVersion = static_cast<i64>(
+        NTransactionClient::TimestampFromUnixTime(1'784'633'264).Underlying());
+
+    auto updateClockVersion = [&] (TVersion& version) {
+        const auto previousEpoch = versions->GetEpoch();
+        version = TVersion(++nextClockVersion);
+        EXPECT_GT(versions->GetEpoch(), previousEpoch);
+    };
+
+    updateClockVersion(versions->PipelineStateVersion);
+    updateClockVersion(versions->PipelineSpecVersion);
+    updateClockVersion(versions->ExtendedPipelineSpecVersion);
+    updateClockVersion(versions->DynamicPipelineSpecVersion);
+
+    const auto previousEpoch = versions->GetEpoch();
+    versions->LayoutVersion = TVersion(1);
+    EXPECT_GT(versions->GetEpoch(), previousEpoch);
+}
+
+TEST(TExecutionSpecEpochTest, RemainsPositivePastTheOld2038OverflowBoundary)
+{
+    const i64 clockVersion = static_cast<i64>(
+        NTransactionClient::TimestampFromUnixTime(1ULL << 31).Underlying());
+    auto versions = New<TExecutionSpecVersions>();
+    versions->PipelineStateVersion = TVersion(clockVersion + 1);
+    versions->PipelineSpecVersion = TVersion(clockVersion + 2);
+    versions->ExtendedPipelineSpecVersion = TVersion(clockVersion + 3);
+    versions->DynamicPipelineSpecVersion = TVersion(clockVersion + 4);
+    versions->LayoutVersion = TVersion(5);
+
+    EXPECT_EQ(versions->GetEpoch(), clockVersion + 9);
+    EXPECT_GT(versions->GetEpoch(), 0);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -242,14 +346,14 @@ TEST(TFlowCoreTargetTest, EmptyTargetPasses)
 TEST(TFlowCoreTargetTest, MatchingTargetPasses)
 {
     auto flowView = CreateSyncedFlowView();
-    flowView->State->ExecutionSpec->FlowCoreTarget->SetValue(TFlowCoreTarget(GetBinaryChecksum()));
+    flowView->State->ExecutionSpec->FlowCoreTarget->TrySetValue(TFlowCoreTarget(GetBinaryChecksum()), TestVersionProvider());
     EXPECT_TRUE(CheckFlowCoreTarget(flowView, GetBinaryChecksum()));
 }
 
 TEST(TFlowCoreTargetTest, MismatchingTargetFails)
 {
     auto flowView = CreateSyncedFlowView();
-    flowView->State->ExecutionSpec->FlowCoreTarget->SetValue(TFlowCoreTarget("mismatch_version"));
+    flowView->State->ExecutionSpec->FlowCoreTarget->TrySetValue(TFlowCoreTarget("mismatch_version"), TestVersionProvider());
     EXPECT_FALSE(CheckFlowCoreTarget(flowView, GetBinaryChecksum()));
 }
 

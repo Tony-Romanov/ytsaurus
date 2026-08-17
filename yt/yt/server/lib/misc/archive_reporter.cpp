@@ -80,7 +80,7 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static YT_DEFINE_GLOBAL(const NLogging::TLogger, ArchiveReporterLogger, "ArchiveReporter");
+static YT_DEFINE_LEAKY_GLOBAL(const NLogging::TLogger, ArchiveReporterLogger, "ArchiveReporter");
 static constexpr int QueueIsTooLargeMultiplier = 2;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -116,7 +116,7 @@ public:
         NNative::IClientPtr client,
         IInvokerPtr invoker,
         const TProfiler& profiler)
-        : Logger(NServer::NDetail::ArchiveReporterLogger().WithTag("ReporterName: %v", std::move(reporterName)))
+        : Logger(NServer::NDetail::ArchiveReporterLogger().WithTag("ReporterName", std::move(reporterName)))
         , ReporterConfig_(std::move(reporterConfig))
         , HandlerConfig_(std::move(handlerConfig))
         , NameTable_(std::move(nameTable))
