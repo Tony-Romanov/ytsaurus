@@ -213,7 +213,7 @@ Every array item contains suggestion and type strings.
 Request errors are written to stderr and produce an empty response array.
     )");
     opts.AddSection("Example",
-        R"(Input: {"query":"SEL","position":3,schema:{}}
+        R"(Input: {"query":"SEL","position":3,"schema":{}}
 Output: [{"suggestion":"SELECT","type":"Keyword"}]
     )");
 
