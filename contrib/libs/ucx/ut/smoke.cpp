@@ -19,6 +19,8 @@ Y_UNIT_TEST_SUITE(TUcxSmokeTest)
         bool havePosix = false;
         bool haveSysv = false;
         bool haveTcp = false;
+        bool haveIb = false;
+        bool haveRdmaCm = false;
         for (unsigned index = 0; index < componentCount; ++index) {
             uct_component_attr_t attr = {};
             attr.field_mask = UCT_COMPONENT_ATTR_FIELD_NAME;
@@ -29,6 +31,8 @@ Y_UNIT_TEST_SUITE(TUcxSmokeTest)
             havePosix |= std::strcmp(attr.name, "posix") == 0;
             haveSysv |= std::strcmp(attr.name, "sysv") == 0;
             haveTcp |= std::strcmp(attr.name, "tcp") == 0;
+            haveIb |= std::strcmp(attr.name, "ib") == 0;
+            haveRdmaCm |= std::strcmp(attr.name, "rdmacm") == 0;
         }
         uct_release_component_list(components);
 
@@ -36,6 +40,8 @@ Y_UNIT_TEST_SUITE(TUcxSmokeTest)
         UNIT_ASSERT(havePosix);
         UNIT_ASSERT(haveSysv);
         UNIT_ASSERT(haveTcp);
+        UNIT_ASSERT(haveIb);
+        UNIT_ASSERT(haveRdmaCm);
 
         ucp_config_t* config = nullptr;
         UNIT_ASSERT_VALUES_EQUAL(

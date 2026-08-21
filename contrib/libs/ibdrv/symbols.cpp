@@ -46,7 +46,7 @@ const TInfinibandSymbols* IBSym() {
     return SingletonWithPriority<TSymbols, 100>();
 }
 
-#define LIBRDMACM_PATHS {"/usr/lib/librdmacm.so", "librdmacm.so"}
+#define LIBRDMACM_PATHS {"/usr/lib/librdmacm.so", "librdmacm.so", "librdmacm.so.1"}
 
 const TRdmaSymbols* RDSym() {
     struct TSymbols: TRdmaSymbols {
@@ -60,7 +60,7 @@ const TRdmaSymbols* RDSym() {
     return SingletonWithPriority<TSymbols, 100>();
 }
 
-#define LIBMLX5_PATHS {"/usr/lib/libmlx5.so", "libmlx5.so"}
+#define LIBMLX5_PATHS {"/usr/lib/libmlx5.so", "libmlx5.so", "libmlx5.so.1"}
 
 const TMlx5Symbols* M5Sym() {
     struct TSymbols: TMlx5Symbols {

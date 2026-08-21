@@ -20,6 +20,7 @@ ADDINCL(
 )
 
 PEERDIR(
+    contrib/libs/ibdrv
     contrib/libs/libcap
     contrib/libs/linux-headers
 )
@@ -161,6 +162,39 @@ IF (OS_LINUX)
         src/uct/tcp/tcp_sockcm.c
         src/uct/tcp/tcp_listener.c
         src/uct/tcp/tcp_sockcm_ep.c
+
+        src/uct/ib/base/ib_device.c
+        src/uct/ib/base/ib_iface.c
+        src/uct/ib/base/ib_log.c
+        GLOBAL src/uct/ib/base/ib_md.c
+        src/uct/ib/rc/base/rc_ep.c
+        src/uct/ib/rc/base/rc_iface.c
+        src/uct/ib/rc/verbs/rc_verbs_ep.c
+        GLOBAL src/uct/ib/rc/verbs/rc_verbs_iface.c
+        src/uct/ib/ud/base/ud_iface_common.c
+        src/uct/ib/ud/base/ud_iface.c
+        src/uct/ib/ud/base/ud_ep.c
+        src/uct/ib/ud/base/ud_log.c
+        GLOBAL src/uct/ib/ud/verbs/ud_verbs.c
+
+        src/uct/ib/mlx5/ib_mlx5_log.c
+        GLOBAL src/uct/ib/mlx5/ib_mlx5.c
+        src/uct/ib/mlx5/dv/ib_mlx5_dv.c
+        src/uct/ib/mlx5/dv/ib_mlx5dv_md.c
+        src/uct/ib/mlx5/rc/rc_mlx5_ep.c
+        GLOBAL src/uct/ib/mlx5/rc/rc_mlx5_iface.c
+        src/uct/ib/mlx5/rc/rc_mlx5_common.c
+        src/uct/ib/mlx5/rc/rc_mlx5_devx.c
+        GLOBAL src/uct/ib/mlx5/ud/ud_mlx5.c
+        src/uct/ib/mlx5/ud/ud_mlx5_common.c
+        src/uct/ib/mlx5/dc/dc_mlx5_ep.c
+        GLOBAL src/uct/ib/mlx5/dc/dc_mlx5.c
+        src/uct/ib/mlx5/dc/dc_mlx5_devx.c
+
+        src/uct/ib/rdmacm/rdmacm_cm.c
+        src/uct/ib/rdmacm/rdmacm_cm_ep.c
+        GLOBAL src/uct/ib/rdmacm/rdmacm_component.c
+        src/uct/ib/rdmacm/rdmacm_listener.c
 
         src/ucp/am/eager_single.c
         src/ucp/am/eager_multi.c

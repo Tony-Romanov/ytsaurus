@@ -109,7 +109,7 @@
 /* #undef HAVE_CURAND */
 
 /* DC DV support */
-/* #undef HAVE_DC_DV */
+#define HAVE_DC_DV 1
 
 /* Define to 1 if you have the declaration of `asprintf', and to 0 if you
    don't. */
@@ -193,11 +193,11 @@
 
 /* Define to 1 if you have the declaration of `IBV_ACCESS_ON_DEMAND', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_ACCESS_ON_DEMAND */
+#define HAVE_DECL_IBV_ACCESS_ON_DEMAND 1
 
 /* Define to 1 if you have the declaration of `IBV_ACCESS_RELAXED_ORDERING',
    and to 0 if you don't. */
-/* #undef HAVE_DECL_IBV_ACCESS_RELAXED_ORDERING */
+#define HAVE_DECL_IBV_ACCESS_RELAXED_ORDERING 1
 
 /* Define to 1 if you have the declaration of `ibv_advise_mr', and to 0 if you
    don't. */
@@ -217,11 +217,11 @@
 
 /* Define to 1 if you have the declaration of `ibv_create_cq_ex', and to 0 if
    you don't. */
-/* #undef HAVE_DECL_IBV_CREATE_CQ_EX */
+#define HAVE_DECL_IBV_CREATE_CQ_EX 1
 
 /* Define to 1 if you have the declaration of `ibv_create_qp_ex', and to 0 if
    you don't. */
-/* #undef HAVE_DECL_IBV_CREATE_QP_EX */
+#define HAVE_DECL_IBV_CREATE_QP_EX 1
 
 /* Define to 1 if you have the declaration of `ibv_create_srq', and to 0 if
    you don't. */
@@ -233,7 +233,7 @@
 
 /* Define to 1 if you have the declaration of `IBV_EVENT_GID_CHANGE', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_EVENT_GID_CHANGE */
+#define HAVE_DECL_IBV_EVENT_GID_CHANGE 1
 
 /* Define to 1 if you have the declaration of `IBV_EVENT_PORT_SPEED_CHANGE',
    and to 0 if you don't. */
@@ -241,34 +241,34 @@
 
 /* Define to 1 if you have the declaration of `ibv_event_type_str', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_EVENT_TYPE_STR */
+#define HAVE_DECL_IBV_EVENT_TYPE_STR 1
 
 /* Define to 1 if you have the declaration of `ibv_get_async_event', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_GET_ASYNC_EVENT */
+#define HAVE_DECL_IBV_GET_ASYNC_EVENT 1
 
 /* Define to 1 if you have the declaration of `ibv_get_device_name', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_GET_DEVICE_NAME */
+#define HAVE_DECL_IBV_GET_DEVICE_NAME 1
 
 /* Define to 1 if you have the declaration of `IBV_LINK_LAYER_ETHERNET', and
    to 0 if you don't. */
-/* #undef HAVE_DECL_IBV_LINK_LAYER_ETHERNET */
+#define HAVE_DECL_IBV_LINK_LAYER_ETHERNET 1
 
 /* Define to 1 if you have the declaration of `IBV_LINK_LAYER_INFINIBAND', and
    to 0 if you don't. */
-/* #undef HAVE_DECL_IBV_LINK_LAYER_INFINIBAND */
+#define HAVE_DECL_IBV_LINK_LAYER_INFINIBAND 1
 
 /* Define to 1 if you have the declaration of `IBV_QPF_GRH_REQUIRED', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_QPF_GRH_REQUIRED */
+#define HAVE_DECL_IBV_QPF_GRH_REQUIRED 1
 
 /* have upstream ibv_query_device_ex */
 /* #undef HAVE_DECL_IBV_QUERY_DEVICE_EX */
 
 /* Define to 1 if you have the declaration of `ibv_query_gid', and to 0 if you
    don't. */
-/* #undef HAVE_DECL_IBV_QUERY_GID */
+#define HAVE_DECL_IBV_QUERY_GID 1
 
 /* Define to 1 if you have the declaration of `ibv_query_port_speed', and to 0
    if you don't. */
@@ -280,23 +280,23 @@
 
 /* Define to 1 if you have the declaration of `ibv_set_ece', and to 0 if you
    don't. */
-/* #undef HAVE_DECL_IBV_SET_ECE */
+#define HAVE_DECL_IBV_SET_ECE 1
 
 /* Define to 1 if you have the declaration of `IBV_TRANSPORT_UNSPECIFIED', and
    to 0 if you don't. */
-/* #undef HAVE_DECL_IBV_TRANSPORT_UNSPECIFIED */
+#define HAVE_DECL_IBV_TRANSPORT_UNSPECIFIED 1
 
 /* Define to 1 if you have the declaration of `IBV_TRANSPORT_USNIC', and to 0
    if you don't. */
-/* #undef HAVE_DECL_IBV_TRANSPORT_USNIC */
+#define HAVE_DECL_IBV_TRANSPORT_USNIC 1
 
 /* Define to 1 if you have the declaration of `IBV_TRANSPORT_USNIC_UDP', and
    to 0 if you don't. */
-/* #undef HAVE_DECL_IBV_TRANSPORT_USNIC_UDP */
+#define HAVE_DECL_IBV_TRANSPORT_USNIC_UDP 1
 
 /* Define to 1 if you have the declaration of `ibv_wc_status_str', and to 0 if
    you don't. */
-/* #undef HAVE_DECL_IBV_WC_STATUS_STR */
+#define HAVE_DECL_IBV_WC_STATUS_STR 1
 
 /* Define to 1 if you have the declaration of `inotify_add_watch', and to 0 if
    you don't. */
@@ -328,23 +328,23 @@
 
 /* Define to 1 if you have the declaration of
    `MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE', and to 0 if you don't. */
-/* #undef HAVE_DECL_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE */
+#define HAVE_DECL_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE 1
 
 /* Define to 1 if you have the declaration of
    `MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE', and to 0 if you don't. */
-/* #undef HAVE_DECL_MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE */
+#define HAVE_DECL_MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE 1
 
 /* Define to 1 if you have the declaration of `mlx5dv_create_qp', and to 0 if
    you don't. */
-/* #undef HAVE_DECL_MLX5DV_CREATE_QP */
+#define HAVE_DECL_MLX5DV_CREATE_QP 1
 
 /* Define to 1 if you have the declaration of `MLX5DV_DCTYPE_DCT', and to 0 if
    you don't. */
-/* #undef HAVE_DECL_MLX5DV_DCTYPE_DCT */
+#define HAVE_DECL_MLX5DV_DCTYPE_DCT 1
 
 /* Define to 1 if you have the declaration of
    `mlx5dv_devx_subscribe_devx_event', and to 0 if you don't. */
-/* #undef HAVE_DECL_MLX5DV_DEVX_SUBSCRIBE_DEVX_EVENT */
+#define HAVE_DECL_MLX5DV_DEVX_SUBSCRIBE_DEVX_EVENT 1
 
 /* Define to 1 if you have the declaration of
    `mlx5dv_get_data_direct_sysfs_path', and to 0 if you don't. */
@@ -352,19 +352,19 @@
 
 /* Define to 1 if you have the declaration of `mlx5dv_init_obj', and to 0 if
    you don't. */
-/* #undef HAVE_DECL_MLX5DV_INIT_OBJ */
+#define HAVE_DECL_MLX5DV_INIT_OBJ 1
 
 /* Define to 1 if you have the declaration of `mlx5dv_is_supported', and to 0
    if you don't. */
-/* #undef HAVE_DECL_MLX5DV_IS_SUPPORTED */
+#define HAVE_DECL_MLX5DV_IS_SUPPORTED 1
 
 /* Define to 1 if you have the declaration of `MLX5DV_OBJ_AH', and to 0 if you
    don't. */
-/* #undef HAVE_DECL_MLX5DV_OBJ_AH */
+#define HAVE_DECL_MLX5DV_OBJ_AH 1
 
 /* Define to 1 if you have the declaration of
    `MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE', and to 0 if you don't. */
-/* #undef HAVE_DECL_MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE */
+#define HAVE_DECL_MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE 1
 
 /* Define to 1 if you have the declaration of `mlx5dv_reg_dmabuf_mr', and to 0
    if you don't. */
@@ -372,7 +372,7 @@
 
 /* Define to 1 if you have the declaration of `MLX5DV_UAR_ALLOC_TYPE_BF', and
    to 0 if you don't. */
-/* #undef HAVE_DECL_MLX5DV_UAR_ALLOC_TYPE_BF */
+#define HAVE_DECL_MLX5DV_UAR_ALLOC_TYPE_BF 1
 
 /* Define to 1 if you have the declaration of
    `MLX5DV_UAR_ALLOC_TYPE_NC_DEDICATED', and to 0 if you don't. */
@@ -466,7 +466,7 @@
 /* #undef HAVE_DETAILED_BACKTRACE */
 
 /* DEVX support */
-/* #undef HAVE_DEVX */
+#define HAVE_DEVX 1
 
 /* Define to 1 if you have the <dlfcn.h> header file. */
 #define HAVE_DLFCN_H 1
@@ -514,7 +514,7 @@
 #define HAVE_HW_TIMER 1
 
 /* IB support */
-/* #undef HAVE_IB */
+#define HAVE_IB 1
 
 /* Device Memory support */
 /* #undef HAVE_IBV_DM */
@@ -526,7 +526,7 @@
 /* #undef HAVE_IN6_ADDR_U6_ADDR32 */
 
 /* Define to 1 if you have the <infiniband/mlx5dv.h> header file. */
-/* #undef HAVE_INFINIBAND_MLX5DV_H */
+#define HAVE_INFINIBAND_MLX5DV_H 1
 
 /* Enable inotify support */
 #define HAVE_INOTIFY 1
@@ -592,10 +592,10 @@
 #define HAVE_MEMORY_H 1
 
 /* mlx5 DV support */
-/* #undef HAVE_MLX5_DV */
+#define HAVE_MLX5_DV 1
 
 /* mlx5 UD bare-metal support */
-/* #undef HAVE_MLX5_HW_UD */
+#define HAVE_MLX5_HW_UD 1
 
 /* MLX5_MMO support */
 /* #undef HAVE_MLX5_MMO */
@@ -698,7 +698,7 @@
 /* #undef HAVE_STRUCT_IBV_TM_CAPS_FLAGS */
 
 /* Define to 1 if `cq_uar' is a member of `struct mlx5dv_cq'. */
-/* #undef HAVE_STRUCT_MLX5DV_CQ_CQ_UAR */
+#define HAVE_STRUCT_MLX5DV_CQ_CQ_UAR 1
 
 /* Define to 1 if `ib_stride_index' is a member of `struct mlx5_cqe64'. */
 /* #undef HAVE_STRUCT_MLX5_CQE64_IB_STRIDE_INDEX */
@@ -743,16 +743,16 @@
 /* #undef HAVE_SYS_UIO_H */
 
 /* DC transport support */
-/* #undef HAVE_TL_DC */
+#define HAVE_TL_DC 1
 
 /* GGA transport support */
 /* #undef HAVE_TL_GGA */
 
 /* RC transport support */
-/* #undef HAVE_TL_RC */
+#define HAVE_TL_RC 1
 
 /* UD transport support */
-/* #undef HAVE_TL_UD */
+#define HAVE_TL_UD 1
 
 /* Defined if UGNI transport exists */
 /* #undef HAVE_TL_UGNI */
@@ -848,7 +848,7 @@
 /* #undef UCX_ALLOC_ALIGN */
 
 /* UCX configure flags */
-#define UCX_CONFIGURE_FLAGS "--disable-shared --enable-static --enable-mt --disable-cma --without-cuda --without-rocm --without-ze --without-verbs --without-rdmacm --without-knem --without-xpmem --without-ugni --without-gaudi --without-bfd --without-fuse3 --without-go --without-java --without-gdrcopy --without-mad --disable-examples --disable-test-apps --disable-doxygen-html --disable-doxygen-pdf"
+#define UCX_CONFIGURE_FLAGS "--disable-shared --enable-static --enable-mt --disable-cma --without-cuda --without-rocm --without-ze --with-verbs --with-rdmacm --without-knem --without-xpmem --without-ugni --without-gaudi --without-bfd --without-fuse3 --without-go --without-java --without-gdrcopy --without-mad --disable-examples --disable-test-apps --disable-doxygen-html --disable-doxygen-pdf"
 
 /* UCX module sub-directory */
 #define UCX_MODULE_SUBDIR "ucx"

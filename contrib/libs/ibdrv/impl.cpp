@@ -2,6 +2,8 @@
 
 #include <util/generic/yexception.h>
 
+#include <cerrno>
+
 template <typename Method, typename... Args>
 static auto Call(Method* m, Args&&... args) {
     Y_ENSURE(m);
@@ -83,7 +85,15 @@ int ibv_query_device(struct ibv_context *context, struct ibv_device_attr *device
 
 Y_HIDDEN
 struct ibv_device **ibv_get_device_list(int *num_devices) {
-    return Call(IBSym()->ibv_get_device_list, num_devices);
+    try {
+        return Call(IBSym()->ibv_get_device_list, num_devices);
+    } catch (...) {
+        if (num_devices) {
+            *num_devices = 0;
+        }
+        errno = ENOSYS;
+        return nullptr;
+    }
 }
 
 Y_HIDDEN
@@ -251,7 +261,12 @@ int rdma_create_qp(struct rdma_cm_id *id, struct ibv_pd *pd, struct ibv_qp_init_
 
 Y_HIDDEN
 struct rdma_event_channel *rdma_create_event_channel() {
-    return Call(RDSym()->rdma_create_event_channel);
+    try {
+        return Call(RDSym()->rdma_create_event_channel);
+    } catch (...) {
+        errno = ENOSYS;
+        return nullptr;
+    }
 }
 
 Y_HIDDEN
@@ -678,7 +693,11 @@ int mlx5dv_init_obj(struct mlx5dv_obj *obj, uint64_t obj_type) {
 
 Y_HIDDEN
 bool mlx5dv_is_supported(struct ibv_device *device) {
-    return Call(M5Sym()->mlx5dv_is_supported, device);
+    try {
+        return Call(M5Sym()->mlx5dv_is_supported, device);
+    } catch (...) {
+        return false;
+    }
 }
 
 Y_HIDDEN
