@@ -157,6 +157,9 @@
 #include <yt/yt/core/bus/tcp/server.h>
 #include <yt/yt/core/bus/tcp/dispatcher.h>
 
+#include <yt/yt/core/bus/ucx/config.h>
+#include <yt/yt/core/bus/ucx/server.h>
+
 #include <yt/yt/core/http/server.h>
 
 #include <yt/yt/core/https/server.h>
@@ -179,6 +182,8 @@
 
 #include <yt/yt/core/rpc/bus/channel.h>
 #include <yt/yt/core/rpc/bus/server.h>
+
+#include <yt/yt/ytlib/chunk_client/ucx_transport.h>
 #include <yt/yt/core/rpc/caching_channel_factory.h>
 #include <yt/yt/core/rpc/channel.h>
 #include <yt/yt/core/rpc/server.h>
@@ -532,6 +537,11 @@ public:
         return RpcServer_;
     }
 
+    const NRpc::IServerPtr& GetUcxRpcServer() const override
+    {
+        return UcxRpcServer_;
+    }
+
     const IBlockCachePtr& GetBlockCache() const override
     {
         return BlockCache_;
@@ -697,6 +707,7 @@ private:
 
     NYT::NBus::NTcp::IBusServerPtr BusServer_;
     NRpc::IServerPtr RpcServer_;
+    NRpc::IServerPtr UcxRpcServer_;
     NHttp::IServerPtr HttpServer_;
     NHttp::IServerPtr HttpsServer_;
 
@@ -810,6 +821,47 @@ private:
         {
             const auto& flavors = Config_->Flavors;
             Flavors_ = THashSet<ENodeFlavor>(flavors.begin(), flavors.end());
+        }
+
+        if (Config_->Ucx->Enabled && (IsDataNode() || IsExecNode())) {
+            try {
+                NChunkClient::ValidateUcxHardware();
+
+                NChunkClient::ConfigureUcxTransport(true, Config_->Ucx->Transports);
+
+                if (IsDataNode()) {
+                    auto busConfig = New<NYT::NBus::NUcx::TBusServerConfig>();
+                    busConfig->Port = Config_->Ucx->Port;
+                    busConfig->Transports = Config_->Ucx->Transports;
+                    UcxRpcServer_ = NRpc::NBus::CreateBusServer(NYT::NBus::NUcx::CreateBusServer(busConfig));
+                    UcxRpcServer_->Configure(Config_->RpcServer);
+
+                    auto host = GetLocalHostName();
+                    for (const auto& [network, address] : Config_->Addresses) {
+                        if (network == Config_->Ucx->NetworkName) {
+                            host = address;
+                            break;
+                        }
+                    }
+                    localRpcAddresses[Format("ucx/%v", Config_->Ucx->NetworkName)] =
+                        NNet::BuildServiceAddress(host, Config_->Ucx->Port);
+                }
+
+                YT_LOG_INFO("UCX transport enabled for node (DataNode: %v, ExecNode: %v, Endpoint: %v, Network: %v)",
+                    IsDataNode(),
+                    IsExecNode(),
+                    IsDataNode()
+                        ? localRpcAddresses[Format("ucx/%v", Config_->Ucx->NetworkName)]
+                        : std::string("outbound-only"),
+                    Config_->Ucx->NetworkName);
+            } catch (const std::exception& ex) {
+                UcxRpcServer_.Reset();
+                NChunkClient::ConfigureUcxTransport(false, {});
+                YT_LOG_WARNING(ex, "UCX transport is unavailable; node will use TCP");
+            }
+        } else {
+            NChunkClient::ConfigureUcxTransport(false, {});
+            YT_LOG_INFO("UCX transport is disabled by node configuration");
         }
 
         PrimaryMaster_ = Config_->ClusterConnection->Static->PrimaryMaster;
@@ -1300,6 +1352,16 @@ private:
 
         YT_LOG_INFO("Listening for RPC requests (Port: %v)", Config_->RpcPort);
         RpcServer_->Start();
+        if (UcxRpcServer_) {
+            try {
+                UcxRpcServer_->Start();
+                YT_LOG_INFO("Listening for UCX RPC requests (Port: %v)", Config_->Ucx->Port);
+            } catch (const std::exception& ex) {
+                UcxRpcServer_.Reset();
+                NChunkClient::ConfigureUcxTransport(false, {});
+                YT_LOG_WARNING(ex, "Failed to start UCX RPC server; node will use TCP");
+            }
+        }
 
         YT_LOG_INFO("Listening for HTTP requests (Port: %v)", Config_->MonitoringPort);
         HttpServer_->Start();
@@ -2007,6 +2069,11 @@ const NHttp::IServerPtr& TBootstrapBase::GetHttpServer() const
 const NRpc::IServerPtr& TBootstrapBase::GetRpcServer() const
 {
     return Bootstrap_->GetRpcServer();
+}
+
+const NRpc::IServerPtr& TBootstrapBase::GetUcxRpcServer() const
+{
+    return Bootstrap_->GetUcxRpcServer();
 }
 
 const IBlockCachePtr& TBootstrapBase::GetBlockCache() const

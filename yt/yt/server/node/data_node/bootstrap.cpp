@@ -275,6 +275,9 @@ public:
 
         DataNodeService_ = CreateDataNodeService(GetConfig()->DataNode, this);
         GetRpcServer()->RegisterService(DataNodeService_);
+        if (const auto& ucxRpcServer = ClusterNodeBootstrap_->GetUcxRpcServer()) {
+            ucxRpcServer->RegisterService(DataNodeService_);
+        }
 
         GetRpcServer()->RegisterService(CreateDataNodeNbdService(this, DataNodeLogger()));
 

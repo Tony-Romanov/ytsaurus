@@ -49,6 +49,7 @@
 #include <yt/yt/ytlib/chunk_client/job_io_meter.h>
 #include <yt/yt/ytlib/chunk_client/job_spec_extensions.h>
 #include <yt/yt/ytlib/chunk_client/traffic_meter.h>
+#include <yt/yt/ytlib/chunk_client/ucx_transport.h>
 
 #include <yt/yt/ytlib/controller_agent/helpers.h>
 
@@ -880,6 +881,20 @@ TJobResult TJobProxy::RunJob()
     IJobProxyEnvironmentPtr environment;
 
     try {
+        if (Config_->EnableUcx) {
+            try {
+                ValidateUcxHardware();
+                ConfigureUcxTransport(true, Config_->UcxTransports);
+                YT_LOG_INFO("UCX transport enabled for job proxy");
+            } catch (const std::exception& ex) {
+                ConfigureUcxTransport(false, {});
+                YT_LOG_WARNING(ex, "UCX transport is unavailable in job proxy; falling back to TCP");
+            }
+        } else {
+            ConfigureUcxTransport(false, {});
+            YT_LOG_INFO("UCX transport is disabled for job proxy by node configuration");
+        }
+
         if (Config_->TvmBridge && Config_->TvmBridgeConnection) {
             auto tvmBridgeClient = CreateBusClient(Config_->TvmBridgeConnection);
             auto tvmBridgeChannel = NRpc::NBus::CreateBusChannel(tvmBridgeClient);

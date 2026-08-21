@@ -10,6 +10,7 @@
 #include "helpers.h"
 #include "chunk_replica_cache.h"
 #include "chunk_fragment_read_controller.h"
+#include "ucx_transport.h"
 
 #include <yt/yt/ytlib/chunk_client/proto/data_node_service.pb.h>
 #include <yt/yt/ytlib/chunk_client/medium_directory.h>
@@ -1553,7 +1554,13 @@ private:
         (isHedged ? BackendHedgingReadRequestCount_ : BackendReadRequestCount_) += requestCount;
 
         for (const auto& [peerInfo, plan] : peerInfoToPlan) {
-            TDataNodeServiceProxy proxy(peerInfo->Channel);
+            auto channel = peerInfo->Channel;
+            if (const auto* descriptor = Reader_->NodeDirectory_->FindDescriptor(peerInfo->NodeId)) {
+                if (auto ucxChannel = FindUcxChannel(*descriptor, Reader_->Networks_)) {
+                    channel = std::move(ucxChannel);
+                }
+            }
+            TDataNodeServiceProxy proxy(channel);
             proxy.SetDefaultTimeout(Reader_->Config_->GetChunkFragmentSetRpcTimeout);
 
             auto req = proxy.GetChunkFragmentSet();

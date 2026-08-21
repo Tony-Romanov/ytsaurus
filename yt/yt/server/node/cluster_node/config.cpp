@@ -30,6 +30,23 @@ namespace NYT::NClusterNode {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void TUcxConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("enabled", &TThis::Enabled)
+        .Default(false);
+    registrar.Parameter("port", &TThis::Port)
+        .Default(9020)
+        .InRange(1, 65535);
+    registrar.Parameter("network_name", &TThis::NetworkName)
+        .Default("default")
+        .NonEmpty();
+    registrar.Parameter("transports", &TThis::Transports)
+        .Default("rc,dc,ud,self,sm")
+        .NonEmpty();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void TMemoryLimit::Register(TRegistrar registrar)
 {
     registrar.Parameter("type", &TThis::Type)
@@ -306,6 +323,8 @@ void TClusterNodeBootstrapConfig::Register(TRegistrar registrar)
         .DefaultNew();
     registrar.Parameter("addresses", &TThis::Addresses)
         .Default();
+    registrar.Parameter("ucx", &TThis::Ucx)
+        .DefaultNew();
     registrar.Parameter("tags", &TThis::Tags)
         .Default();
     registrar.Parameter("host_name", &TThis::HostName)

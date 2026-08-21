@@ -135,6 +135,7 @@ struct IBootstrapBase
     // Servers.
     virtual const NHttp::IServerPtr& GetHttpServer() const = 0;
     virtual const NRpc::IServerPtr& GetRpcServer() const = 0;
+    virtual const NRpc::IServerPtr& GetUcxRpcServer() const = 0;
 
     // Block tracker.
     virtual const IMemoryUsageTrackerPtr& GetRpcMemoryUsageTracker() const = 0;
@@ -299,6 +300,7 @@ public:
 
     const NHttp::IServerPtr& GetHttpServer() const override;
     const NRpc::IServerPtr& GetRpcServer() const override;
+    const NRpc::IServerPtr& GetUcxRpcServer() const override;
 
     const IMemoryUsageTrackerPtr& GetRpcMemoryUsageTracker() const override;
     const IMemoryUsageTrackerPtr& GetReadBlockMemoryUsageTracker() const override;

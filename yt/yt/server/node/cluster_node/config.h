@@ -62,6 +62,29 @@ namespace NYT::NClusterNode {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+DECLARE_REFCOUNTED_STRUCT(TUcxConfig)
+
+struct TUcxConfig
+    : public NYTree::TYsonStruct
+{
+    //! Enables UCX only for bulk chunk traffic on DataNode and ExecNode processes.
+    //! All other RPC traffic keeps using the regular TCP transport.
+    bool Enabled;
+    //! DataNode listener port. Exec-only nodes use UCX in outbound mode.
+    int Port;
+    //! Existing node network whose host address is reused for the UCX endpoint.
+    std::string NetworkName;
+    //! UCX_TLS value. The default intentionally contains no TCP transport.
+    std::string Transports;
+
+    REGISTER_YSON_STRUCT(TUcxConfig);
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TUcxConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct TMemoryLimit
     : public NYTree::TYsonStruct
 {
@@ -331,6 +354,9 @@ struct TClusterNodeBootstrapConfig
 
     //! Known node addresses.
     NNodeTrackerClient::TNetworkAddressList Addresses;
+
+    //! Optional UCX endpoint used exclusively by bulk DataNode traffic.
+    TUcxConfigPtr Ucx;
 
     //! A set of tags to be assigned to this node.
     /*!

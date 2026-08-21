@@ -219,6 +219,9 @@ SRCS(
 )
 
 PEERDIR(
+    contrib/libs/ibdrv
+    yt/yt/core/bus/ucx
+    yt/yt/core/rpc/ucx
     yt/yt/core/https
     yt/yt/core/service_discovery/yp
 

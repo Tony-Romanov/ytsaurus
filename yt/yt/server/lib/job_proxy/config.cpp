@@ -337,6 +337,12 @@ void TJobProxyInternalConfig::Register(TRegistrar registrar)
     registrar.Parameter("supervisor_rpc_timeout", &TThis::SupervisorRpcTimeout)
         .Default(TDuration::Seconds(30));
 
+    registrar.Parameter("enable_ucx", &TThis::EnableUcx)
+        .Default(false);
+
+    registrar.Parameter("ucx_transports", &TThis::UcxTransports)
+        .Default("rc,dc,ud,self,sm");
+
     registrar.Parameter("heartbeat_period", &TThis::HeartbeatPeriod)
         .Default(TDuration::Seconds(5));
 

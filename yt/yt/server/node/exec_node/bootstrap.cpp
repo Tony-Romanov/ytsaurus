@@ -534,6 +534,8 @@ private:
         }
 
         newJobProxyConfigTemplate->SupervisorRpcTimeout = GetConfig()->ExecNode->JobProxy->SupervisorRpcTimeout;
+        newJobProxyConfigTemplate->EnableUcx = GetConfig()->Ucx->Enabled;
+        newJobProxyConfigTemplate->UcxTransports = GetConfig()->Ucx->Transports;
 
         newJobProxyConfigTemplate->HeartbeatPeriod = GetConfig()->ExecNode->JobProxy->JobProxyHeartbeatPeriod;
 

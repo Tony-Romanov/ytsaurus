@@ -869,6 +869,20 @@ PEERDIR(
     yt/yt/flow/library/cpp/native_client
 )
 
+IF (OS_LINUX)
+    SRCS(
+        chunk_client/ucx_transport.cpp
+    )
+    PEERDIR(
+        contrib/libs/ibdrv
+        yt/yt/core/bus/ucx
+    )
+ELSE()
+    SRCS(
+        chunk_client/ucx_transport_stub.cpp
+    )
+ENDIF()
+
 END()
 
 RECURSE(

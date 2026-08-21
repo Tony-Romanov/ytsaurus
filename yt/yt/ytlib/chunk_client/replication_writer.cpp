@@ -1,4 +1,5 @@
 #include "replication_writer.h"
+#include "ucx_transport.h"
 
 #include "block_cache.h"
 #include "block_reorderer.h"
@@ -1489,8 +1490,11 @@ void TGroup::PutGroup(const TReplicationWriterPtr& writer, const IChunkWriter::T
 
     std::vector<TFuture<TDataNodeServiceProxy::TRspPutBlocksPtr>> putBlocksFutures;
     for (const auto& node : selectedNodes) {
-        TDataNodeServiceProxy proxy(node->GetChannel());
+        auto channel = FindUcxChannel(node->GetDescriptor(), writer->Networks_);
+        bool useUcx = static_cast<bool>(channel);
+        TDataNodeServiceProxy proxy(channel ? channel : node->GetChannel());
         auto req = proxy.PutBlocks();
+        req->RequestAttachmentsDptParameters().Enabled = useUcx;
         req->SetResponseHeavy(true);
         req->SetMultiplexingBand(EMultiplexingBand::Heavy);
         req->SetTimeout(writer->Config_->NodeRpcTimeout);

@@ -450,6 +450,9 @@ struct TJobProxyInternalConfig
     NBus::NTcp::TBusClientConfigPtr SupervisorConnection;
     TDuration SupervisorRpcTimeout;
 
+    bool EnableUcx;
+    std::string UcxTransports;
+
     NBus::NTcp::TBusClientConfigPtr TvmBridgeConnection;
     NAuth::TTvmBridgeConfigPtr TvmBridge;
 

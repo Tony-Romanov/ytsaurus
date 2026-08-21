@@ -2,6 +2,7 @@
 
 #include "private.h"
 #include "traffic_meter.h"
+#include "ucx_transport.h"
 #include "block_cache.h"
 #include "block_id.h"
 #include "chunk_reader.h"
@@ -1237,6 +1238,22 @@ protected:
         }
     }
 
+    IChannelPtr GetBulkChannel(const TPeer& peer)
+    {
+        auto reader = Reader_.Lock();
+        if (!reader || peer.Id.IsOffshore || reader->Options_->UseProxyingDataNodeService) {
+            return GetChannel(peer.Id);
+        }
+
+        if (peer.NodeDescriptor) {
+            if (auto channel = FindUcxChannel(*peer.NodeDescriptor, reader->Networks_)) {
+                return channel;
+            }
+        }
+
+        return GetChannel(peer.Id);
+    }
+
     template <class T>
     void ProcessError(const TErrorOr<T>& rspOrError, const TPeer& peer, const TError& wrappingError)
     {
@@ -1333,16 +1350,20 @@ protected:
     IChannelPtr MakePeersChannel(
         const TPeer& primaryPeer,
         const std::optional<TPeer>& backupPeer,
-        const std::optional<THedgingChannelOptions>& hedgingOptions)
+        const std::optional<THedgingChannelOptions>& hedgingOptions,
+        bool useBulkTransport = false)
     {
+        auto getChannel = [&] (const TPeer& peer) {
+            return useBulkTransport ? GetBulkChannel(peer) : GetChannel(peer.Id);
+        };
         if (backupPeer && hedgingOptions) {
             return CreateHedgingChannel(
-                GetChannel(primaryPeer.Id),
-                GetChannel(backupPeer->Id),
+                getChannel(primaryPeer),
+                getChannel(*backupPeer),
                 *hedgingOptions);
         }
 
-        return GetChannel(primaryPeer.Id);
+        return getChannel(primaryPeer);
     }
 
     void NextRetry()
@@ -2584,7 +2605,7 @@ private:
         {
             return Session_->RequestBatcher_->GetBlockSet(
                 IRequestBatcher::TRequest{
-                    .Channel = Session_->GetChannel(peer.Id),
+                    .Channel = Session_->GetBulkChannel(peer),
                     .BlockIndexes = BlockIndexes_,
                     .Session = Session_,
                     .Barriers = Barriers_,
@@ -3185,7 +3206,7 @@ private:
                 })
                 : std::nullopt;
 
-            auto channel = MakePeersChannel(primaryPeer, backupPeer, hedgingOptions);
+            auto channel = MakePeersChannel(primaryPeer, backupPeer, hedgingOptions, /*useBulkTransport*/ true);
             YT_VERIFY(channel);
 
             const auto& primaryPeerId = primaryPeer.Id;
@@ -3212,7 +3233,7 @@ private:
 
             future = RequestBatcher_->GetBlockSet(
                 IRequestBatcher::TRequest{
-                    .Channel = GetChannel(primaryPeerId),
+                    .Channel = channel,
                     .BlockIndexes = blockIndexes,
                     .Session = MakeStrong(this),
                     .Barriers = FillP2PBarriers(peers, blockIndexes),

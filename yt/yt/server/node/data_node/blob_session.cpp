@@ -19,6 +19,7 @@
 #include <yt/yt/ytlib/chunk_client/block_cache.h>
 #include <yt/yt/ytlib/chunk_client/deferred_chunk_meta.h>
 #include <yt/yt/ytlib/chunk_client/helpers.h>
+#include <yt/yt/ytlib/chunk_client/ucx_transport.h>
 
 #include <yt/yt/client/node_tracker_client/node_directory.h>
 
@@ -936,11 +937,16 @@ TFuture<TBlobSession::TSendBlocksResult> TBlobSession::DoSendBlocks(
         ->GetClient()
         ->GetNativeConnection()
         ->GetChannelFactory();
-    auto channel = channelFactory->CreateChannel(targetDescriptor.GetAddressOrThrow(Bootstrap_->GetLocalNetworks()));
+    auto channel = FindUcxChannel(targetDescriptor, Bootstrap_->GetLocalNetworks());
+    bool useUcx = static_cast<bool>(channel);
+    if (!channel) {
+        channel = channelFactory->CreateChannel(targetDescriptor.GetAddressOrThrow(Bootstrap_->GetLocalNetworks()));
+    }
     TDataNodeServiceProxy proxy(channel);
     proxy.SetDefaultTimeout(requestTimeout);
 
     auto req = proxy.PutBlocks();
+    req->RequestAttachmentsDptParameters().Enabled = useUcx;
     req->SetResponseHeavy(true);
     req->SetMultiplexingBand(EMultiplexingBand::Heavy);
     ToProto(req->mutable_session_id(), SessionId_);
