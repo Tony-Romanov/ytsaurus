@@ -341,7 +341,7 @@ void TJobProxyInternalConfig::Register(TRegistrar registrar)
         .Default(false);
 
     registrar.Parameter("ucx_transports", &TThis::UcxTransports)
-        .Default("rc,dc,ud,self,sm");
+        .Default("rc,dc,ud,sm");
 
     registrar.Parameter("heartbeat_period", &TThis::HeartbeatPeriod)
         .Default(TDuration::Seconds(5));

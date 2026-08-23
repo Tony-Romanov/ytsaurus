@@ -41,7 +41,7 @@ void TUcxConfig::Register(TRegistrar registrar)
         .Default("default")
         .NonEmpty();
     registrar.Parameter("transports", &TThis::Transports)
-        .Default("rc,dc,ud,self,sm")
+        .Default("rc,dc,ud,sm")
         .NonEmpty();
 }
 

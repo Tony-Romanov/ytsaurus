@@ -9,6 +9,16 @@ namespace NYT::NBus::NUcx {
 struct TBusConfig
     : public NYTree::TYsonStruct
 {
+    //! Comma-separated UCX_TLS allow list. The transports built into YTsaurus are:
+    //! - rc (rc_mlx5 and rc_verbs): reliable RDMA connection;
+    //! - dc (dc_mlx5): dynamically connected Mellanox RDMA transport;
+    //! - ud (ud_mlx5 and ud_verbs): unreliable-datagram RDMA transport;
+    //! - tcp: TCP sockets managed by UCX;
+    //! - sm/shm/mm (posix and sysv): shared memory between local processes;
+    //! - self: loopback within one UCP worker; it is not usable for the current
+    //!   client/server node-to-node integration.
+    //! The ib alias enables all built RDMA transports, while all enables every
+    //! built transport. Exact transport names listed in parentheses are accepted too.
     std::string Transports;
 
     REGISTER_YSON_STRUCT(TBusConfig);

@@ -15,6 +15,7 @@
 
 #include <util/system/thread.h>
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -49,6 +50,48 @@ void CheckUcx(ucs_status_t status, TStringBuf message)
     if (status != UCS_OK) {
         THROW_ERROR MakeUcxError(message, status);
     }
+}
+
+void LogEndpointTransports(ucp_ep_h endpoint, TStringBuf endpointDescription)
+{
+    // UCP currently supports at most 64 lanes per endpoint. Keep this helper
+    // on the public ucp_ep_query API instead of depending on UCP internals.
+    std::array<ucp_transport_entry_t, 64> entries{};
+    ucp_ep_attr_t attributes{};
+    attributes.field_mask = UCP_EP_ATTR_FIELD_TRANSPORTS;
+    attributes.transports.entries = entries.data();
+    attributes.transports.num_entries = entries.size();
+    attributes.transports.entry_size = sizeof(entries[0]);
+
+    auto status = ucp_ep_query(endpoint, &attributes);
+    if (status != UCS_OK) {
+        YT_LOG_WARNING(
+            MakeUcxError("Cannot query UCX endpoint transports", status),
+            "Failed to query transports for established UCX connection (Endpoint: %v)",
+            endpointDescription);
+        return;
+    }
+
+    std::string transportSummary;
+    for (unsigned index = 0; index < attributes.transports.num_entries; ++index) {
+        const auto& entry = entries[index];
+        if (!transportSummary.empty()) {
+            transportSummary += ", ";
+        }
+        transportSummary += entry.transport_name ? entry.transport_name : "<unknown>";
+        if (entry.device_name && entry.device_name[0] != '\0') {
+            transportSummary += "/";
+            transportSummary += entry.device_name;
+        }
+    }
+    if (transportSummary.empty()) {
+        transportSummary = "<none>";
+    }
+
+    YT_LOG_INFO(
+        "UCX connection established (Endpoint: %v, Transports: %v)",
+        endpointDescription,
+        transportSummary);
 }
 
 template <class T>
@@ -152,6 +195,7 @@ public:
     DEFINE_SIGNAL_OVERRIDE(void(const TError&), Terminated);
 
     void HandlePayload(TSharedRef payload);
+    void LogTransportsOnce();
     ucp_ep_h GetEndpoint() const;
 
 private:
@@ -162,6 +206,7 @@ private:
     const IAttributeDictionaryPtr EndpointAttributes_;
     const IMessageHandlerPtr Handler_;
     std::atomic<bool> IsTerminated_ = false;
+    std::atomic<bool> AreTransportsLogged_ = false;
     std::mutex StateLock_;
     TError TerminationError_;
 };
@@ -303,15 +348,17 @@ public:
         CheckUcx(ucp_listener_create(ListenerWorker_, &params, &Listener_), "Cannot create UCX listener");
     }
 
-    TFuture<void> Send(ucp_ep_h endpoint, TSharedRefArray message)
+    TFuture<void> Send(const TUcxBusPtr& bus, TSharedRefArray message)
     {
         struct TSendContext
         {
+            TUcxBusPtr Bus;
             TSharedMutableRef Payload;
             i64 MessageSize = 0;
             TPromise<void> Promise = NewPromise<void>();
         };
         auto context = std::make_unique<TSendContext>();
+        context->Bus = bus;
         context->MessageSize = GetByteSize(message);
         context->Payload = SerializeMessage(message);
         auto future = context->Promise.ToFuture();
@@ -322,6 +369,7 @@ public:
         params.cb.send = [] (void* request, ucs_status_t status, void* userData) {
             std::unique_ptr<TSendContext> context(static_cast<TSendContext*>(userData));
             if (status == UCS_OK) {
+                context->Bus->LogTransportsOnce();
                 UcxSentBytes.Increment(context->MessageSize);
                 UcxSentMessages.Increment();
                 context->Promise.Set();
@@ -333,7 +381,7 @@ public:
         params.user_data = context.get();
         params.flags = UCP_AM_SEND_FLAG_REPLY;
         auto* request = ucp_am_send_nbx(
-            endpoint,
+            bus->GetEndpoint(),
             ActiveMessageId,
             nullptr,
             0,
@@ -343,6 +391,7 @@ public:
         if (UCS_PTR_IS_ERR(request)) {
             context->Promise.Set(MakeUcxError("Cannot start UCX send", UCS_PTR_STATUS(request)));
         } else if (request == nullptr) {
+            context->Bus->LogTransportsOnce();
             UcxSentBytes.Increment(context->MessageSize);
             UcxSentMessages.Increment();
             context->Promise.Set();
@@ -528,7 +577,7 @@ TFuture<void> TUcxBus::Send(TSharedRefArray message, const TSendOptions&)
         std::lock_guard guard(StateLock_);
         return MakeFuture<void>(TerminationError_);
     }
-    return Engine_->Send(Endpoint_, std::move(message));
+    return Engine_->Send(MakeStrong(this), std::move(message));
 }
 void TUcxBus::SetTosLevel(TTosLevel) { }
 ucp_ep_h TUcxBus::GetEndpoint() const { return Endpoint_; }
@@ -555,6 +604,7 @@ void TUcxBus::Terminate(const TError& error)
 
 void TUcxBus::HandlePayload(TSharedRef payload)
 {
+    LogTransportsOnce();
     auto messageOrError = DeserializeMessage(std::move(payload));
     if (!messageOrError.IsOK()) {
         Terminate(messageOrError);
@@ -563,6 +613,13 @@ void TUcxBus::HandlePayload(TSharedRef payload)
     UcxReceivedBytes.Increment(GetByteSize(messageOrError.Value()));
     UcxReceivedMessages.Increment();
     Handler_->HandleMessage(std::move(messageOrError.Value()), MakeStrong(this), nullptr, TPacketId::Create());
+}
+
+void TUcxBus::LogTransportsOnce()
+{
+    if (!AreTransportsLogged_.exchange(true)) {
+        LogEndpointTransports(Endpoint_, EndpointDescription_);
+    }
 }
 
 class TBusClient

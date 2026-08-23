@@ -5,7 +5,7 @@ namespace NYT::NBus::NUcx {
 void TBusConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("transports", &TThis::Transports)
-        .Default("rc,dc,ud,self,sm");
+        .Default("rc,dc,ud,sm");
 }
 
 void TBusClientConfig::Register(TRegistrar registrar)
