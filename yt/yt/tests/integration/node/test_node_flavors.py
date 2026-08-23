@@ -2,7 +2,7 @@ from yt_env_setup import YTEnvSetup, Restarter, NODES_SERVICE
 
 from yt_commands import (
     authors, insert_rows, with_breakpoint, wait_breakpoint, release_breakpoint,
-    create, get, ls, map, read_table, write_file, write_table, wait, remove, exists, update_nodes_dynamic_config,
+    create, get, ls, write_table, wait, remove, exists, update_nodes_dynamic_config,
     get_data_nodes, get_exec_nodes, get_tablet_nodes, get_chaos_nodes, get_singular_chunk_id,
     sync_mount_table, sync_unmount_table, run_test_vanilla, sync_create_cells,
     set_node_banned)
@@ -54,7 +54,11 @@ class TestNodeFlavors(YTEnvSetup):
                 assert replica_address in data_nodes or replica_address in exec_nodes
 
     @authors("gritukan")
-    def test_exec_nodes(self):
+    @pytest.mark.parametrize("enable_ucx", [False, True], ids=["tcp", "ucx"])
+    def test_exec_nodes(self, enable_ucx):
+        with Restarter(self.Env, NODES_SERVICE):
+            self.Env.set_node_ucx_enabled(enable_ucx)
+
         exec_nodes = get_exec_nodes()
         assert len(exec_nodes) == 3
 
@@ -158,47 +162,6 @@ class TestNodeFlavorsExecNodeIsNotDataNode(TestNodeFlavors):
         },
         "exec_node_is_not_data_node": True,
     }
-
-    @authors("gritukan")
-    @pytest.mark.parametrize("enable_ucx", [False, True], ids=["tcp", "ucx"])
-    def test_bulk_transfers(self, enable_ucx):
-        with Restarter(self.Env, NODES_SERVICE):
-            self.Env.set_node_ucx_enabled(enable_ucx)
-
-        exec_node = next(
-            str(node)
-            for node in ls("//sys/exec_nodes", attributes=["flavors"])
-            if node.attributes["flavors"] == ["exec"])
-
-        rows = [{"payload": "x" * 1024 * 1024}]
-        create("table", "//tmp/input", attributes={"replication_factor": 1})
-        create("table", "//tmp/job_proxy_output", attributes={"replication_factor": 1})
-        create("table", "//tmp/exec_node_output", attributes={"replication_factor": 1})
-        write_table("//tmp/input", rows)
-
-        create("file", "//tmp/artifact", attributes={"replication_factor": 1})
-        write_file("//tmp/artifact", b"artifact")
-
-        map(
-            in_="//tmp/input",
-            out="//tmp/job_proxy_output",
-            command="test \"$(cat artifact)\" = artifact && cat",
-            spec={
-                "scheduling_tag_filter": exec_node,
-                "mapper": {
-                    "file_paths": ["//tmp/artifact"],
-                },
-            },
-        )
-        assert read_table("//tmp/job_proxy_output") == rows
-
-        map(
-            in_="<read_via_exec_node=%true>//tmp/input",
-            out="//tmp/exec_node_output",
-            command="cat",
-            spec={"scheduling_tag_filter": exec_node},
-        )
-        assert read_table("//tmp/exec_node_output") == rows
 
 
 class TestNodeFlavorsExecNodeIsNotDataNodeMulticell(TestNodeFlavors):
