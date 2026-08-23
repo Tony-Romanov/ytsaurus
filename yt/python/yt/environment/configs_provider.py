@@ -1146,6 +1146,15 @@ def _build_node_configs(multidaemon_config_output,
         config["monitoring_port"] = next(ports_generator)
         config["skynet_http_port"] = next(ports_generator)
 
+        if yt_config.enable_ucx:
+            # Every local node shares the same host, so the production default
+            # UCX port cannot be reused. All other UCX settings intentionally
+            # remain at their C++ defaults.
+            config["ucx"] = {
+                "enabled": True,
+                "port": next(ports_generator),
+            }
+
         addresses.append("{0}:{1}".format(yt_config.fqdn, config["rpc_port"]))
 
         config["cluster_connection"] = \

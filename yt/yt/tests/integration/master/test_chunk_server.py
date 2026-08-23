@@ -232,11 +232,15 @@ class TestChunkServer(YTEnvSetup):
         wait(lambda: get_missing_repair_queue_size() == 0)
 
     @authors("aleksandra-zh")
-    def test_replication_queue_size_profiling(self):
+    @pytest.mark.parametrize("enable_ucx", [False, True], ids=["tcp", "ucx"])
+    def test_replication_queue_size_profiling(self, enable_ucx):
+        with Restarter(self.Env, NODES_SERVICE):
+            self.Env.set_node_ucx_enabled(enable_ucx)
+
         set("//sys/@config/chunk_manager/destroyed_replicas_profiling_period", 100)
 
         create("table", "//tmp/t", attributes={"replication_factor": 3})
-        write_table("//tmp/t", {"a": "b"})
+        write_table("//tmp/t", {"a": "b" * 1024 * 1024})
 
         chunk_id = get_singular_chunk_id("//tmp/t")
         wait(lambda: len(get(f"#{chunk_id}/@stored_replicas")) == 3)

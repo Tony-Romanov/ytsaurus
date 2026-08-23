@@ -466,6 +466,7 @@ class YTEnvSetup(object):
     CLASS_TEST_LIMIT = 8 * 60  # limits all test cases in class duration inside partition (seconds)
     NODE_IO_ENGINE_TYPE = None  # use "thread_pool" or "uring"
     NODE_USE_DIRECT_IO_FOR_READS = "never"
+    ENABLE_UCX = False
 
     # COMPAT(kvk1920)
     TEST_MAINTENANCE_FLAGS = False
@@ -801,6 +802,7 @@ class YTEnvSetup(object):
             job_proxy_log_location_count=cls.get_param("JOB_PROXY_LOG_LOCATION_COUNT", index),
             node_io_engine_type=cls.get_param("NODE_IO_ENGINE_TYPE", index),
             node_use_direct_io_for_reads=cls.get_param("NODE_USE_DIRECT_IO_FOR_READS", index),
+            enable_ucx=cls.get_param("ENABLE_UCX", index),
             cluster_name=cls.get_cluster_name(index),
             enable_resource_tracking=cls.get_param("ENABLE_RESOURCE_TRACKING", index),
             enable_tvm_only_proxies=cls.get_param("ENABLE_TVM_ONLY_PROXIES", index),

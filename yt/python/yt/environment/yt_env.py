@@ -876,6 +876,18 @@ class YTInstance(object):
     def rewrite_node_configs(self):
         self._prepare_nodes(self._cluster_configuration["node"], force_overwrite=True)
 
+    def set_node_ucx_enabled(self, enabled):
+        """Configure UCX for all regular nodes before restarting them."""
+        for config in self._cluster_configuration["node"]:
+            ucx_config = config.setdefault("ucx", {})
+            ucx_config["enabled"] = enabled
+            if enabled and "port" not in ucx_config:
+                # Ports allocated here are retained when UCX is disabled, so a
+                # parametrized test can switch modes repeatedly without leaks.
+                ucx_config["port"] = next(self._open_port_iterator)
+        self.yt_config.enable_ucx = enabled
+        self.rewrite_node_configs()
+
     def rewrite_chaos_node_configs(self):
         self._prepare_chaos_nodes(self._cluster_configuration["chaos_node"], force_overwrite=True)
 
