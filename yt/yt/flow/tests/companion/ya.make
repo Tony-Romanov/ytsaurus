@@ -4,7 +4,11 @@ RECURSE(
     resource/common
     resource/cpp
     resource/cpp/companion
+    resource/python
+    resource/python/pipeline
     types/common
+    types/java
+    types/java/companion
     types/python
     types/python/pipeline
 )
@@ -16,7 +20,5 @@ IF (NOT OPENSOURCE)
         retries
         types/go
         types/go/pipeline
-        types/java
-        types/java/companion
     )
 ENDIF()

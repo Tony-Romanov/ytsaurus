@@ -52,7 +52,7 @@ message TReqStartChunk
     required TSessionId session_id = 7;
     required NYT.NProto.TWorkloadDescriptor workload_descriptor = 2;
     optional bool sync_on_close = 3 [default = true];
-    optional bool enable_direct_io = 8 [default = false];
+    reserved 8;
     optional bool enable_multiplexing = 4 [default = false];
     optional NYT.NProto.TGuid placement_id = 6;
     optional bool disable_send_blocks = 9 [default = false];
@@ -77,6 +77,9 @@ message TReqFinishChunk
     optional TChunkMeta chunk_meta = 2;
     optional int32 block_count = 3;
     optional bool ignore_missing_session = 5 [default = false];
+
+    optional int64 io_consumed = 7;
+    optional double io_fair_share_weight = 8;
 
     reserved 6;
 }
@@ -105,6 +108,9 @@ message TReqProbePutBlocks
 {
     required TSessionId session_id = 1;
     required int64 cumulative_block_size = 2;
+
+    optional int64 io_consumed = 3;
+    optional double io_fair_share_weight = 4;
 }
 
 message TProbePutBlocksState
@@ -257,9 +263,7 @@ message TReqProbeBlockSet
     optional bool enable_p2p = 5 [default = true];
     optional bool fetch_node_descriptors = 6 [default = false];
 
-    optional int64 io_consumed = 7;
-
-    optional double io_fair_share_weight = 8;
+    reserved 7, 8;
 }
 
 message TRspProbeBlockSet
@@ -435,13 +439,9 @@ message TReqLookupRows
 
     optional bool populate_cache = 11 [default = true];
 
-    optional int64 io_consumed = 15;
-
-    optional double io_fair_share_weight = 16;
-
     // Lookup keys are passed via attachments.
 
-    reserved 12;
+    reserved 12, 15, 16;
 }
 
 message TRspLookupRows
@@ -486,7 +486,8 @@ message TReqGetChunkMeta
     // If true, then extension_tags are ignored and
     // the whole available meta is returned.
     optional bool all_extension_tags = 3 [default = false];
-    reserved 4;
+    // COMPAT(apollo1321): Remove after the 26.2 branch is created.
+    optional int32 partition_tag = 4;
     repeated int32 partition_tags = 9;
     required NYT.NProto.TWorkloadDescriptor workload_descriptor = 5;
 

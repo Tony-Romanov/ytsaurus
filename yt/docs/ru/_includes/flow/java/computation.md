@@ -189,6 +189,8 @@
 - `onMessages(List<ExtendedMessage> messages, OutputCollector output, RuntimeContext ctx)` — вызывается для батча сообщений.
 - `onTimers(List<Timer> timers, OutputCollector output, RuntimeContext ctx)` — вызывается для батча таймеров.
 
+Батч соответствует одному запросу воркера и может содержать сообщения с разными [ключами](../../../flow/concepts/glossary.md#key); группировка по ключам при необходимости выполняется в коде функции (см. [Companion](../../../flow/concepts/companion.md#schema)).
+
 #### Пример batch-функции
 
 {% list tabs group=lang %}
@@ -405,9 +407,9 @@
 "CompanionManager" = {
     "resource_class_name" = "NYT::NFlow::NCompanion::TJavaCompanionManager";
     "parameters" = {
+        "main_class" = "tech.ytsaurus.flow.examples.waitclickjoin.PipelineMain";
         "timeout" = "10s";
         "jdk_bin_path" = "/app/ytflow/jdk/bin/java";
-        "main_class" = "tech.ytsaurus.flow.examples.waitclickjoin.NodeCompanionMain";
         "classpath" = "/app/ytflow/lib/*";
     };
     "dependencies" = {};

@@ -2,13 +2,9 @@ import yt.yson as yson
 
 
 # TODO(babenko): drop settings mirrored in get_dynamic_master_config below
-# COMPAT(aleksandra-zh): enable_secondary_master_registration should be removed after compat tests
-# are bumped to 25.1.
 def get_master_config():
     return {
         "enable_provision_lock": False,
-
-        "enable_secondary_master_registration": True,
 
         "timestamp_provider": {
             "soft_backoff_time": 100,
@@ -55,6 +51,7 @@ def get_master_config():
             "snapshot_background_thread_count": 4,
             "leader_sync_delay": 0,
             "minimize_commit_latency": True,
+            "enable_state_hash_checker_during_recovery": True,
         },
 
         "world_initializer": {
@@ -229,12 +226,6 @@ def get_dynamic_master_config():
 def get_scheduler_config():
     return {
         "cluster_connection": {},
-
-        "response_keeper": {
-            "enable_warmup": False,
-            "expiration_time": 25000,
-            "warmup_time": 30000,
-        },
 
         "rpc_server": {
             "tracing_mode": "force",
@@ -702,6 +693,13 @@ def get_chaos_node_config():
 
 
 def get_master_cache_config():
+    return {
+        "cluster_connection": {
+        },
+    }
+
+
+def get_chaos_cache_config():
     return {
         "cluster_connection": {
         },

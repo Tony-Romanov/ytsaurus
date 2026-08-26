@@ -242,7 +242,7 @@ TFuture<void> TSessionBase::Start()
 {
     YT_ASSERT_THREAD_AFFINITY_ANY();
 
-    YT_LOG_DEBUG("Starting session");
+    YT_TLOG_DEBUG("Starting session");
 
     return
         BIND(&TSessionBase::DoStart, MakeStrong(this))
@@ -255,12 +255,13 @@ TFuture<void> TSessionBase::Start()
                 Active_ = true;
 
                 if (!error.IsOK()) {
-                    YT_LOG_DEBUG(error, "Session has failed to start");
+                    YT_TLOG_DEBUG("Session has failed to start")
+                        .With(error);
                     Cancel(error);
                     THROW_ERROR(error);
                 }
 
-                YT_LOG_DEBUG("Session started");
+                YT_TLOG_DEBUG("Session started");
 
                 if (!PendingCancelationError_.IsOK()) {
                     Cancel(PendingCancelationError_);
@@ -292,12 +293,16 @@ void TSessionBase::Cancel(const TError& error)
             }
 
             if (!Active_) {
-                YT_LOG_DEBUG(error, "Session will be canceled after becoming active (SessionId: %v)", SessionId_);
+                YT_TLOG_DEBUG("Session will be canceled after becoming active")
+                    .With("SessionId", SessionId_)
+                    .With(error);
                 PendingCancelationError_ = error;
                 return;
             }
 
-            YT_LOG_DEBUG(error, "Canceling session (SessionId: %v)", SessionId_);
+            YT_TLOG_DEBUG("Canceling session")
+                .With("SessionId", SessionId_)
+                .With(error);
 
             TLeaseManager::CloseLease(Lease_);
             Active_ = false;
@@ -331,7 +336,8 @@ TFuture<void> TSessionBase::GetUnregisteredEvent()
 
 TFuture<ISession::TFinishResult> TSessionBase::Finish(
     const TRefCountedChunkMetaPtr& chunkMeta,
-    std::optional<int> blockCount)
+    std::optional<int> blockCount,
+    std::optional<NIO::TIOFairShareState> fairShareState)
 {
     YT_ASSERT_THREAD_AFFINITY_ANY();
 
@@ -341,13 +347,13 @@ TFuture<ISession::TFinishResult> TSessionBase::Finish(
 
             ValidateActive();
 
-            YT_LOG_DEBUG("Finishing session");
+            YT_TLOG_DEBUG("Finishing session");
 
             TLeaseManager::CloseLease(Lease_);
             Active_ = false;
             Location_->RemoveProbePutBlocksRequestSupplier(ProbePutBlocksRequestSupplier_);
 
-            return DoFinish(chunkMeta, blockCount);
+            return DoFinish(chunkMeta, blockCount, fairShareState);
         })
         .AsyncVia(SessionInvoker_)
         .Run();
@@ -383,17 +389,20 @@ bool TSessionBase::ShouldUseProbePutBlocks() const
     return UseProbePutBlocks_;
 }
 
-void TSessionBase::ProbePutBlocks(i64 requestedCumulativeMemorySize)
+void TSessionBase::ProbePutBlocks(
+    i64 requestedCumulativeMemorySize,
+    std::optional<NIO::TIOFairShareState> fairShareState)
 {
     YT_ASSERT_THREAD_AFFINITY_ANY();
 
-    YT_LOG_INFO("ProbePutBlocks request pushed "
-        "(SessionId: %v, RequestedCumulativeBlockSize: %v)",
-        SessionId_, requestedCumulativeMemorySize);
+    YT_TLOG_INFO("ProbePutBlocks request pushed")
+        .With("SessionId", SessionId_)
+        .With("RequestedCumulativeBlockSize", requestedCumulativeMemorySize);
 
     ProbePutBlocksRequestSupplier_->PushRequest({
         .CumulativeBlockSize = requestedCumulativeMemorySize,
         .WorkloadDescriptor = GetWorkloadDescriptor(),
+        .FairShareState = fairShareState,
     });
 
     Location_->PushProbePutBlocksRequestSupplier(ProbePutBlocksRequestSupplier_);
@@ -403,6 +412,7 @@ TFuture<NIO::TIOCounters> TSessionBase::PutBlocks(
     int startBlockIndex,
     std::vector<TBlock> blocks,
     i64 cumulativeBlockSize,
+    std::optional<NIO::TIOFairShareState> fairShareState,
     bool enableCaching)
 {
     YT_ASSERT_THREAD_AFFINITY_ANY();
@@ -419,7 +429,12 @@ TFuture<NIO::TIOCounters> TSessionBase::PutBlocks(
             ValidateActive();
             Ping();
 
-            return DoPutBlocks(startBlockIndex, std::move(blocks), cumulativeBlockSize, enableCaching);
+            return DoPutBlocks(
+                startBlockIndex,
+                std::move(blocks),
+                cumulativeBlockSize,
+                fairShareState,
+                enableCaching);
         })
         .AsyncVia(SessionInvoker_)
         .Run();
@@ -429,8 +444,7 @@ TFuture<TSessionBase::TSendBlocksResult> TSessionBase::SendBlocks(
     int startBlockIndex,
     int blockCount,
     i64 cumulativeBlockSize,
-    std::optional<i64> ioConsumed,
-    std::optional<double> ioFairShareWeight,
+    std::optional<NIO::TIOFairShareState> fairShareState,
     TDuration requestTimeout,
     bool instantReplyOnThrottling,
     const TNodeDescriptor& targetDescriptor)
@@ -444,7 +458,14 @@ TFuture<TSessionBase::TSendBlocksResult> TSessionBase::SendBlocks(
             ValidateActive();
             Ping();
 
-            return DoSendBlocks(startBlockIndex, blockCount, cumulativeBlockSize, ioConsumed, ioFairShareWeight, requestTimeout, instantReplyOnThrottling, targetDescriptor);
+            return DoSendBlocks(
+                startBlockIndex,
+                blockCount,
+                cumulativeBlockSize,
+                fairShareState,
+                requestTimeout,
+                instantReplyOnThrottling,
+                targetDescriptor);
         })
         .AsyncVia(SessionInvoker_)
         .Run();

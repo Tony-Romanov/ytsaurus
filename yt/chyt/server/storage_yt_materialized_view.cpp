@@ -6,7 +6,19 @@
 #include "table.h"
 #include "yt_database_base.h"
 
+#include <yt/yt/ytlib/api/native/client.h>
+
+#include <yt/yt/client/api/client.h>
+
+#include <yt/yt/client/cypress_client/public.h>
+
+#include <yt/yt/client/tablet_client/table_mount_cache.h>
+
+#include <yt/yt/core/concurrency/scheduler.h>
+
 #include <yt/yt/core/ypath/public.h>
+
+#include <yt/yt/core/ytree/convert.h>
 
 #include <Databases/DatabaseOnDisk.h>
 
@@ -14,21 +26,37 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterCreateQuery.h>
+#include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/getHeaderForProcessingStage.h>
 
+#include <Parsers/ASTExpressionList.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 
 #include <Storages/SelectQueryDescription.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Storages/StorageFactory.h>
 #include <Storages/StorageMaterializedView.h>
 #include <Storages/StorageSnapshot.h>
+
+#include <optional>
+#include <utility>
 
 namespace NYT::NClickHouseServer {
 
 using namespace NYPath;
+using namespace NApi;
+using namespace NConcurrency;
+using namespace NCypressClient;
+using namespace NObjectClient;
+using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -46,7 +74,139 @@ void RemoveNonCommonColumns(const DB::Block& sourceHeader, DB::Block& targetHead
     targetHeader.erase(targetOnlyPositions);
 }
 
+const DB::ASTSelectQuery& GetSingleSelectQuery(const DB::ASTCreateQuery& create)
+{
+    const auto* selectWithUnion = create.select
+        ? create.select->as<const DB::ASTSelectWithUnionQuery>()
+        : nullptr;
+    if (!selectWithUnion ||
+        !selectWithUnion->list_of_selects ||
+        selectWithUnion->list_of_selects->children.size() != 1)
+    {
+        THROW_ERROR_EXCEPTION("Materialized view SELECT must contain a single query");
+    }
+
+    const auto* select = selectWithUnion->list_of_selects->children[0]->as<const DB::ASTSelectQuery>();
+    if (!select) {
+        THROW_ERROR_EXCEPTION("Materialized view SELECT must contain a simple SELECT query");
+    }
+
+    return *select;
+}
+
+struct TMaterializedViewSource
+{
+    EMaterializedViewSourceType Type;
+    std::optional<DB::StorageID> TableId;
+    TYPath TableRangePath;
+};
+
+TMaterializedViewSource GetMaterializedViewSource(
+    const DB::ASTCreateQuery& create,
+    const DB::ContextPtr& context)
+{
+    const auto* tableExpression = GetSingleTableExpression(&GetSingleSelectQuery(create));
+    if (!tableExpression) {
+        THROW_ERROR_EXCEPTION("Materialized view SELECT has malformed table expression");
+    }
+
+    if (tableExpression->table_function) {
+        const auto* function = tableExpression->table_function->as<const DB::ASTFunction>();
+        if (!function || function->name != "concatYtTablesRange") {
+            THROW_ERROR_EXCEPTION(
+                "Materialized view SELECT must read from a single YT table or concatYtTablesRange");
+        }
+
+        const auto& arguments = function->arguments->as<const DB::ASTExpressionList&>().children;
+        if (arguments.size() != 1) {
+            THROW_ERROR_EXCEPTION(
+                "Materialized view concatYtTablesRange source requires exactly one directory argument");
+        }
+
+        auto argument = arguments[0]->clone();
+        argument = DB::evaluateConstantExpressionOrIdentifierAsLiteral(argument, context);
+        const auto* literal = argument->as<const DB::ASTLiteral>();
+        if (!literal || literal->value.getType() != DB::Field::Types::String) {
+            THROW_ERROR_EXCEPTION("Materialized view concatYtTablesRange directory must be a constant string");
+        }
+
+        return {
+            .Type = EMaterializedViewSourceType::TableRange,
+            .TableRangePath = TRichYPath::Parse(literal->value.safeGet<std::string>()).GetPath(),
+        };
+    }
+
+    const auto* identifier = tableExpression->database_and_table_name
+        ? tableExpression->database_and_table_name->as<const DB::ASTTableIdentifier>()
+        : nullptr;
+    if (!identifier) {
+        THROW_ERROR_EXCEPTION(
+            "Materialized view SELECT must read from a single YT table or concatYtTablesRange");
+    }
+
+    auto tableId = identifier->getTableId();
+    if (tableId.database_name.empty()) {
+        tableId.database_name = context->getCurrentDatabase();
+    }
+    return {
+        .Type = EMaterializedViewSourceType::StaticTable,
+        .TableId = std::move(tableId),
+    };
+}
+
+TObjectId GetTableRangeObjectId(TQueryContext* queryContext, const TYPath& path)
+{
+    TListNodeOptions listOptions;
+    static_cast<TMasterReadOptions&>(listOptions) = *queryContext->SessionSettings->CypressReadOptions;
+    listOptions.Attributes = {"path", "type", "dynamic"};
+    auto children = ConvertTo<IListNodePtr>(WaitFor(queryContext->Client()->ListNode(path, listOptions))
+        .ValueOrThrow())
+        ->GetChildren();
+
+    for (const auto& child : children) {
+        const auto& attributes = child->Attributes();
+        if (attributes.Get<EObjectType>("type") != EObjectType::Table) {
+            continue;
+        }
+        THROW_ERROR_EXCEPTION_IF(attributes.Find<bool>("dynamic").value_or(false),
+            "Materialized view concatYtTablesRange source contains a dynamic table")
+            .With("source_path", attributes.Get<TYPath>("path"));
+    }
+
+    TGetNodeOptions getOptions;
+    static_cast<TMasterReadOptions&>(getOptions) = *queryContext->SessionSettings->CypressReadOptions;
+    return ConvertTo<TObjectId>(WaitFor(queryContext->Client()->GetNode(path + "/@id", getOptions))
+        .ValueOrThrow());
+}
+
 } // namespace
+
+////////////////////////////////////////////////////////////////////////////////
+
+const DB::ASTTableExpression* GetSingleTableExpression(const DB::ASTSelectQuery* selectQuery)
+{
+    if (!selectQuery) {
+        return nullptr;
+    }
+
+    const auto& tables = selectQuery->tables();
+    if (!tables || tables->children.size() != 1) {
+        THROW_ERROR_EXCEPTION("Materialized view SELECT must read from a single source");
+    }
+
+    const auto* element = tables->children[0]->as<const DB::ASTTablesInSelectQueryElement>();
+    if (!element || !element->table_expression) {
+        return nullptr;
+    }
+
+    return element->table_expression->as<const DB::ASTTableExpression>();
+}
+
+DB::ASTTableExpression* GetSingleTableExpression(DB::ASTSelectQuery* selectQuery)
+{
+    return const_cast<DB::ASTTableExpression*>(
+        GetSingleTableExpression(static_cast<const DB::ASTSelectQuery*>(selectQuery)));
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -57,20 +217,29 @@ class TStorageYtMaterializedView
 public:
     TStorageYtMaterializedView(
         const DB::StorageID& storageId,
-        DB::ContextPtr localContext,
         const DB::ASTCreateQuery& createQuery,
         const DB::ColumnsDescription& columns,
-        DB::StorageID targetTableId)
+        DB::StorageID targetTableId,
+        const std::string& comment = {})
         : DB::IStorage(storageId)
         , TargetTableId_(std::move(targetTableId))
     {
         DB::StorageInMemoryMetadata storageMetadata;
         storageMetadata.setColumns(columns);
-        // getSelectQueryFromASTForMatView may modify the passed context.
-        storageMetadata.setSelectQuery(DB::SelectQueryDescription::getSelectQueryFromASTForMatView(
-            createQuery.select->clone(),
-            /*refreshable*/ false,
-            DB::Context::createCopy(localContext)));
+        if (!createQuery.select) {
+            THROW_ERROR_EXCEPTION("Materialized view SELECT query is not specified");
+        }
+
+        DB::SelectQueryDescription selectQueryDescription;
+        selectQueryDescription.select_query = createQuery.select->clone();
+        selectQueryDescription.inner_query = GetSingleSelectQuery(createQuery).clone();
+        storageMetadata.setSelectQuery(std::move(selectQueryDescription));
+        if (createQuery.sql_security) {
+            storageMetadata.setSQLSecurity(createQuery.sql_security->as<DB::ASTSQLSecurity&>());
+        }
+        if (!comment.empty()) {
+            storageMetadata.setComment(comment);
+        }
         setInMemoryMetadata(storageMetadata);
     }
 
@@ -169,12 +338,40 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void RegisterStorageYtMaterializedView(DB::StorageFactory& factory)
+{
+    factory.registerStorage("MaterializedView", [] (const DB::StorageFactory::Arguments& args) -> DB::StoragePtr {
+        auto database = DB::DatabaseCatalog::instance().getDatabase(args.table_id.database_name);
+        if (dynamic_cast<TYtDatabaseBase*>(database.get())) {
+            return std::make_shared<TStorageYtMaterializedView>(
+                args.table_id,
+                args.query,
+                args.columns,
+                args.query.getTargetTableID(DB::ViewTarget::To),
+                args.comment);
+        }
+
+        return std::make_shared<DB::StorageMaterializedView>(
+            args.table_id,
+            args.getLocalContext(),
+            args.query,
+            args.columns,
+            args.mode,
+            args.comment,
+            args.is_restore_from_backup);
+    });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 TMaterializedViewConfiguration BuildMaterializedViewConfiguration(
     const DB::ContextPtr& context,
     const DB::StoragePtr& table,
     const DB::ASTPtr& query)
 {
     auto* queryContext = GetQueryContext(context);
+    auto materializedView = dynamic_pointer_cast<IStorageYtMaterializedView>(table);
+    YT_VERIFY(materializedView);
 
     const auto& create = query->as<const DB::ASTCreateQuery&>();
     if (create.is_populate) {
@@ -211,46 +408,52 @@ TMaterializedViewConfiguration BuildMaterializedViewConfiguration(
             user);
     }
 
-    auto materializedView = dynamic_pointer_cast<DB::StorageMaterializedView>(table);
-    YT_VERIFY(materializedView);
+    auto source = GetMaterializedViewSource(clonedCreate, context);
 
-    auto resolveYtPath = [] (const DB::StorageID& storageId, TStringBuf role) {
-        auto database = DB::DatabaseCatalog::instance().getDatabase(storageId.database_name);
-        if (!dynamic_cast<TYtDatabaseBase*>(database.get())) {
-            THROW_ERROR_EXCEPTION("Materialized view %v table %Qv must reside in a YT database",
-                role,
-                storageId.getFullTableName());
-        }
-        return TYPath(database->getTableDataPath(storageId.table_name));
+    auto getSingleTable = [] (const IStorageDistributorPtr& distributor, TStringBuf role) {
+        THROW_ERROR_EXCEPTION_IF(!distributor,
+            "Materialized view %v table must be a YT table",
+            role);
+
+        auto tables = distributor->GetTables();
+        THROW_ERROR_EXCEPTION_IF(tables.size() != 1,
+            "Materialized view %v table must resolve to a single YT table",
+            role);
+        return tables[0];
     };
 
-    auto selectTableId = materializedView->getInMemoryMetadataPtr()->getSelectQuery().select_table_id;
-    if (selectTableId.empty()) {
-        THROW_ERROR_EXCEPTION("Materialized view SELECT must read from a single YT table");
-    }
-    auto sourcePath = resolveYtPath(selectTableId, "source");
-    auto targetPath = resolveYtPath(materializedView->getTargetTableId(), "target");
-
-    std::vector<TTablePtr> sourceAndTarget;
-    try {
-        sourceAndTarget = FetchTablesSoft(
-            queryContext,
-            {TRichYPath::Parse(sourcePath), TRichYPath::Parse(targetPath)},
-            /*skipUnsuitableNodes*/ false,
-            /*enableDynamicStoreRead*/ true,
-            queryContext->Logger);
-    } catch (const std::exception& ex) {
-        THROW_ERROR_EXCEPTION("Materialized view target table must exist and source table must be readable")
-            .With(ex);
+    TTablePtr sourceTable;
+    TYPath sourcePath;
+    if (source.Type == EMaterializedViewSourceType::StaticTable) {
+        auto sourceStorage = DB::DatabaseCatalog::instance().getTable(*source.TableId, context);
+        sourceTable = getSingleTable(
+            std::dynamic_pointer_cast<IStorageDistributor>(sourceStorage),
+            "source");
+        sourcePath = sourceTable->GetPath();
+    } else {
+        sourcePath = source.TableRangePath;
     }
 
-    YT_VERIFY(sourceAndTarget.size() == 2);
-    const auto& sourceTable = sourceAndTarget[0];
-    const auto& targetTable = sourceAndTarget[1];
+    auto targetTable = getSingleTable(
+        materializedView->ResolveTargetDistributor(context),
+        "target");
+    auto targetPath = targetTable->GetPath();
     if (targetTable->Dynamic) {
         THROW_ERROR_EXCEPTION("Materialized view target table must be static")
             .With("target_path", targetPath);
     }
+
+    if (source.Type == EMaterializedViewSourceType::TableRange) {
+        auto sourceObjectId = GetTableRangeObjectId(queryContext, sourcePath);
+        return {
+            .CreateStatement = DB::getObjectDefinitionFromCreateQuery(cloned),
+            .SourceType = source.Type,
+            .SourcePath = sourcePath,
+            .TargetPath = targetPath,
+            .SourceObjectId = sourceObjectId,
+        };
+    }
+
     if (sourceTable->Dynamic) {
         THROW_ERROR_EXCEPTION("Materialized view source table must be static")
             .With("source_path", sourcePath);
@@ -262,10 +465,10 @@ TMaterializedViewConfiguration BuildMaterializedViewConfiguration(
 
     return {
         .CreateStatement = DB::getObjectDefinitionFromCreateQuery(cloned),
+        .SourceType = source.Type,
         .SourcePath = sourcePath,
         .TargetPath = targetPath,
         .SourceObjectId = sourceTable->ObjectId,
-        .TargetObjectId = targetTable->ObjectId,
     };
 }
 
@@ -284,7 +487,6 @@ DB::StoragePtr CreateStorageYtMaterializedView(
 
     return std::make_shared<TStorageYtMaterializedView>(
         storageId,
-        context,
         createQuery,
         columns,
         DB::StorageID("YT", std::move(targetPath)));

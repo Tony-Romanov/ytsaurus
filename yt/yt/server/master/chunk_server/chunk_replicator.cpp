@@ -412,20 +412,21 @@ TChunkReplicator::TChunkReplicator(
     , ChunksAwaitingRequisitionUpdateScheduling_(std::make_unique<TChunkScanQueue>(
         Bootstrap_,
         EChunkScanKind::RequisitionUpdate))
-    , MissingPartChunkRepairQueueBalancer_(
-        Config_->RepairQueueBalancerWeightDecayFactor,
-        Config_->RepairQueueBalancerWeightDecayInterval)
-    , DecommissionedPartChunkRepairQueueBalancer_(
-        Config_->RepairQueueBalancerWeightDecayFactor,
-        Config_->RepairQueueBalancerWeightDecayInterval)
 {
     BlobRefreshQueueWaitTime_ = ChunkServerProfiler().TimeGauge("/blob_refresh_queue_wait_time");
     JournalRefreshQueueWaitTime_ = ChunkServerProfiler().TimeGauge("/journal_refresh_queue_wait_time");
 
-    for (int i = 0; i < MaxMediumCount; ++i) {
-        // We "balance" medium indexes, not the repair queues themselves.
-        MissingPartChunkRepairQueueBalancer_.AddContender(i);
-        DecommissionedPartChunkRepairQueueBalancer_.AddContender(i);
+    ChunkRepairQueues_.resize(RepairPriorityCount);
+    ChunkRepairQueueBalancers_.reserve(RepairPriorityCount);
+    for (int priority = 0; priority < RepairPriorityCount; ++priority) {
+        ChunkRepairQueueBalancers_.emplace_back(
+            Config_->RepairQueueBalancerWeightDecayFactor,
+            Config_->RepairQueueBalancerWeightDecayInterval);
+
+        for (int medium = 0; medium < MaxMediumCount; ++medium) {
+            // We "balance" medium indexes, not the repair queues themselves.
+            ChunkRepairQueueBalancers_[priority].AddContender(medium);
+        }
     }
 
     const auto& configManager = Bootstrap_->GetConfigManager();
@@ -521,17 +522,17 @@ void TChunkReplicator::OnEpochFinished()
     ChunksAwaitingRequisitionUpdateScheduling_->Clear();
     ChunkListIdsWithFinishedRequisitionTraverse_.clear();
 
-    for (auto queueKind : TEnumTraits<EChunkRepairQueue>::GetDomainValues()) {
-        for (auto& queue : ChunkRepairQueues(queueKind)) {
+    for (int priority = 0; priority < RepairPriorityCount; ++priority) {
+        for (auto& queue : ChunkRepairQueues(priority)) {
             for (auto chunkWithIndexes : queue) {
                 chunkWithIndexes.GetPtr()->SetRepairQueueIterator(
                     chunkWithIndexes.GetMediumIndex(),
-                    queueKind,
+                    priority,
                     TChunkRepairQueueIterator());
             }
             queue.clear();
         }
-        ChunkRepairQueueBalancer(queueKind).ResetWeights();
+        ChunkRepairQueueBalancer(priority).ResetWeights();
     }
 
     ChunkIdsPendingEndorsementRegistration_.clear();
@@ -564,9 +565,9 @@ void TChunkReplicator::OnIncumbencyStarted(int shardIndex)
 
     SequoiaChunkRefresher_->AdjustRefresherState();
 
-    YT_LOG_INFO("Incumbency started (ShardIndex: %v, JobEpoch: %v)",
-        shardIndex,
-        jobEpoch);
+    YT_TLOG_INFO("Incumbency started")
+        .With("ShardIndex", shardIndex)
+        .With("JobEpoch", jobEpoch);
 }
 
 void TChunkReplicator::OnIncumbencyFinished(int shardIndex)
@@ -586,9 +587,9 @@ void TChunkReplicator::OnIncumbencyFinished(int shardIndex)
 
     SequoiaChunkRefresher_->AdjustRefresherState();
 
-    YT_LOG_INFO("Incumbency finished (ShardIndex: %v, JobEpoch: %v)",
-        shardIndex,
-        previousJobEpoch);
+    YT_TLOG_INFO("Incumbency finished")
+        .With("ShardIndex", shardIndex)
+        .With("JobEpoch", previousJobEpoch);
 }
 
 void TChunkReplicator::TouchChunk(TChunk* chunk)
@@ -638,10 +639,9 @@ void TChunkReplicator::OnNodeDisposedOrRestarted(TNode* node)
                 ScheduleChunkRefresh(chunk);
             }
 
-            YT_LOG_DEBUG("Unlocked removing replicas for chunk on node unregistration"
-                " (ChunkId: %v, NodeAddress: %v)",
-                chunkId,
-                node->GetDefaultAddress());
+            YT_TLOG_DEBUG("Unlocked removing replicas for chunk on node unregistration")
+                .With("ChunkId", chunkId)
+                .With("NodeAddress", node->GetDefaultAddress());
         }
     };
 
@@ -808,11 +808,10 @@ EMisscheduleReason TChunkReplicator::TryScheduleReplicationJob(
             minRackAwareReplicaCount}) - replicaCount;
 
         if (replicasNeeded < 0) {
-            YT_LOG_ALERT(
-                "Chunk replicas needed count is negative (ChunkId: %v, MediumIndex: %v, MediumStatus: %v)",
-                chunkId,
-                targetMediumIndex,
-                mediumStatistics.Status);
+            YT_TLOG_ALERT("Chunk replicas needed count is negative")
+                .With("ChunkId", chunkId)
+                .With("MediumIndex", targetMediumIndex)
+                .With("MediumStatus", mediumStatistics.Status);
             return EMisscheduleReason::None;
         }
     } else if (Any(mediumStatistics.Status & (EChunkStatus::UnsafelyPlaced | EChunkStatus::InconsistentlyPlaced))) {
@@ -871,14 +870,13 @@ EMisscheduleReason TChunkReplicator::TryScheduleReplicationJob(
         targetNodeId);
     context->ScheduleJob(job);
 
-    YT_LOG_DEBUG("Replication job scheduled "
-        "(JobId: %v, JobEpoch: %v, Address: %v, ChunkId: %v, TargetAddresses: %v, IsPullReplicationJob: %v)",
-        job->GetJobId(),
-        job->GetJobEpoch(),
-        sourceNode->GetDefaultAddress(),
-        chunkWithIndex,
-        MakeFormattableView(targetNodes, TNodePtrAddressFormatter()),
-        isPullReplicationJob);
+    YT_TLOG_DEBUG("Replication job scheduled")
+        .With("JobId", job->GetJobId())
+        .With("JobEpoch", job->GetJobEpoch())
+        .With("Address", sourceNode->GetDefaultAddress())
+        .With("ChunkId", chunkWithIndex)
+        .With("TargetAddresses", MakeFormattableView(targetNodes, TNodePtrAddressFormatter()))
+        .With("IsPullReplicationJob", isPullReplicationJob);
 
     if (targetNode) {
         replicasNeeded = 1;
@@ -939,19 +937,18 @@ EMisscheduleReason TChunkReplicator::TryScheduleRemovalJob(
         EmplaceOrCrash(RemovalLockedChunkIds_, chunkIdWithIndexes.Id);
     }
 
-    YT_LOG_DEBUG("Removal job scheduled "
-        "(JobId: %v, JobEpoch: %v, Address: %v, ChunkId: %v)",
-        job->GetJobId(),
-        job->GetJobEpoch(),
-        context->GetNode()->GetDefaultAddress(),
-        chunkIdWithIndexes);
+    YT_TLOG_DEBUG("Removal job scheduled")
+        .With("JobId", job->GetJobId())
+        .With("JobEpoch", job->GetJobEpoch())
+        .With("Address", context->GetNode()->GetDefaultAddress())
+        .With("ChunkId", chunkIdWithIndexes);
 
     return EMisscheduleReason::None;
 }
 
 EMisscheduleReason TChunkReplicator::TryScheduleRepairJob(
     IJobSchedulingContext* context,
-    EChunkRepairQueue repairQueue,
+    int priority,
     TChunkPtrWithReplicaAndMediumIndex chunkWithIndexes,
     const TStoredChunkReplicaList& replicas)
 {
@@ -976,21 +973,17 @@ EMisscheduleReason TChunkReplicator::TryScheduleRepairJob(
     int mediumIndex = chunkWithIndexes.GetMediumIndex();
     auto* medium = chunkManager->FindMediumByIndex(mediumIndex);
     if (!IsObjectAlive(medium)) {
-        YT_LOG_ALERT(
-            "Attempted to schedule repair job for non-existent medium, ignored "
-            "(ChunkId: %v, MediumIndex: %v)",
-            chunk->GetId(),
-            mediumIndex);
+        YT_TLOG_ALERT("Attempted to schedule repair job for non-existent medium, ignored")
+            .With("ChunkId", chunk->GetId())
+            .With("MediumIndex", mediumIndex);
         return EMisscheduleReason::None;
     }
     if (medium->IsOffshore()) {
-        YT_LOG_ALERT(
-            "Attempted to schedule repair job for offshore medium, ignored "
-            "(ChunkId: %v, MediumIndex: %v, MediumName: %v, MediumType: %v)",
-            chunk->GetId(),
-            medium->GetIndex(),
-            medium->GetName(),
-            medium->GetType());
+        YT_TLOG_ALERT("Attempted to schedule repair job for offshore medium, ignored")
+            .With("ChunkId", chunk->GetId())
+            .With("MediumIndex", medium->GetIndex())
+            .With("MediumName", medium->GetName())
+            .With("MediumType", medium->GetType());
         return EMisscheduleReason::None;
     }
 
@@ -1028,8 +1021,8 @@ EMisscheduleReason TChunkReplicator::TryScheduleRepairJob(
         // Try popping decommissioned replicas as long repair cannot be performed.
         do {
             if (mediumStatistics.DecommissionedReplicaCount[erasedPartIndexes.back()] == 0) {
-                YT_LOG_ERROR("Erasure chunk has not enough replicas to repair (ChunkId: %v)",
-                    chunk->GetId());
+                YT_TLOG_ERROR("Erasure chunk has not enough replicas to repair")
+                    .With("ChunkId", chunk->GetId());
                 return EMisscheduleReason::None;
             }
             erasedPartIndexes.pop_back();
@@ -1067,21 +1060,20 @@ EMisscheduleReason TChunkReplicator::TryScheduleRepairJob(
         GetDynamicConfig()->RepairJobMemoryUsage,
         chunk,
         targetReplicas,
-        repairQueue == EChunkRepairQueue::Decommissioned);
+        priority == ErasureChunkDecommissionPriority);
     context->ScheduleJob(job);
 
-    ChunkRepairQueueBalancer(repairQueue).AddWeight(
+    ChunkRepairQueueBalancer(priority).AddWeight(
         mediumIndex,
         job->ResourceUsage().repair_data_size() * job->TargetReplicas().size());
 
-    YT_LOG_DEBUG("Repair job scheduled "
-        "(JobId: %v, JobEpoch: %v, Address: %v, ChunkId: %v, Targets: %v, ErasedPartIndexes: %v)",
-        job->GetJobId(),
-        job->GetJobEpoch(),
-        context->GetNode()->GetDefaultAddress(),
-        chunkWithIndexes,
-        MakeFormattableView(targetNodes, TNodePtrAddressFormatter()),
-        erasedPartIndexes);
+    YT_TLOG_DEBUG("Repair job scheduled")
+        .With("JobId", job->GetJobId())
+        .With("JobEpoch", job->GetJobEpoch())
+        .With("Address", context->GetNode()->GetDefaultAddress())
+        .With("ChunkId", chunkWithIndexes)
+        .With("Targets", MakeFormattableView(targetNodes, TNodePtrAddressFormatter()))
+        .With("ErasedPartIndexes", erasedPartIndexes);
 
     return EMisscheduleReason::None;
 }
@@ -1331,11 +1323,9 @@ void TChunkReplicator::ScheduleReplicationJobs(IJobSchedulingContext* context)
                 if (mediumIndexSet.test(mediumIndex)) {
                     auto* medium = chunkManager->FindMediumByIndex(mediumIndex);
                     if (!IsObjectAlive(medium)) {
-                        YT_LOG_ALERT(
-                            "Attempted to schedule replication job for non-existent medium, ignored "
-                            "(ChunkId: %v, MediumIndex: %v)",
-                            chunk->GetId(),
-                            mediumIndex);
+                        YT_TLOG_ALERT("Attempted to schedule replication job for non-existent medium, ignored")
+                            .With("ChunkId", chunk->GetId())
+                            .With("MediumIndex", mediumIndex);
                         ++misscheduledPushReplicationJobsPerPriority[priority];
                         ++MisscheduledJobs_[EJobType::ReplicateChunk][EMisscheduleReason::MissingMedium];
 
@@ -1346,13 +1336,11 @@ void TChunkReplicator::ScheduleReplicationJobs(IJobSchedulingContext* context)
                     }
 
                     if (medium->IsOffshore()) {
-                        YT_LOG_ALERT(
-                            "Attempted to schedule replication job for offshore medium, ignored "
-                            "(ChunkId: %v, MediumIndex: %v, MediumName: %v, MediumType: %v)",
-                            chunk->GetId(),
-                            medium->GetIndex(),
-                            medium->GetName(),
-                            medium->GetType());
+                        YT_TLOG_ALERT("Attempted to schedule replication job for offshore medium, ignored")
+                            .With("ChunkId", chunk->GetId())
+                            .With("MediumIndex", medium->GetIndex())
+                            .With("MediumName", medium->GetName())
+                            .With("MediumType", medium->GetType());
                         ++misscheduledPushReplicationJobsPerPriority[priority];
                         ++MisscheduledJobs_[EJobType::ReplicateChunk][EMisscheduleReason::MissingMedium];
 
@@ -1509,9 +1497,8 @@ void TChunkReplicator::ScheduleRemovalJobs(IJobSchedulingContext* context)
                     ++misscheduledRemovalJobs;
                     ++MisscheduledJobs_[EJobType::RemoveChunk][EMisscheduleReason::RefreshNotActual];
                 } else if (chunksBeingRemoved.contains(chunkIdWithIndexes)) {
-                    YT_LOG_ALERT(
-                        "Trying to schedule a removal job for a chunk that is already being removed (ChunkId: %v)",
-                        chunkIdWithIndexes);
+                    YT_TLOG_ALERT("Trying to schedule a removal job for a chunk that is already being removed")
+                        .With("ChunkId", chunkIdWithIndexes);
                 } else {
                     auto misscheduleReason = TryScheduleRemovalJob(context, chunkIdWithIndexes, location);
                     if (misscheduleReason == EMisscheduleReason::None) {
@@ -1548,22 +1535,22 @@ void TChunkReplicator::ScheduleRepairJobs(IJobSchedulingContext* context)
     };
 
     std::vector<TEphemeralObjectPtr<TChunk>> chunks;
-    THashMap<TChunkId, std::vector<std::pair<int, EChunkRepairQueue>>> chunkPartsInfo;
+    THashMap<TChunkId, std::vector<std::pair<int, int>>> chunkPartsInfo;
 
     // Schedule repair jobs.
     // NB: The order of the enum items is crucial! Part-missing chunks must
     // be repaired before part-decommissioned chunks.
-    for (auto queue : TEnumTraits<EChunkRepairQueue>::GetDomainValues()) {
+    for (int priority = 0; priority < RepairPriorityCount; ++priority) {
         TMediumMap<std::pair<TChunkRepairQueue::iterator, TChunkRepairQueue::iterator>> iteratorPerRepairQueue;
         for (int mediumIndex = 0; mediumIndex < MaxMediumCount; ++mediumIndex) {
-            auto& chunkRepairQueue = ChunkRepairQueue(mediumIndex, queue);
+            auto& chunkRepairQueue = ChunkRepairQueue(mediumIndex, priority);
             if (!chunkRepairQueue.empty()) {
                 iteratorPerRepairQueue[mediumIndex] = std::pair(chunkRepairQueue.begin(), chunkRepairQueue.end());
             }
         }
 
         while (std::ssize(chunks) < maxRepairJobs) {
-            auto winner = ChunkRepairQueueBalancer(queue).TakeWinnerIf(
+            auto winner = ChunkRepairQueueBalancer(priority).TakeWinnerIf(
                 [&] (int mediumIndex) {
                     // Don't repair chunks on nodes without relevant medium.
                     // In particular, this avoids repairing non-cloud tables in the cloud.
@@ -1588,7 +1575,7 @@ void TChunkReplicator::ScheduleRepairJobs(IJobSchedulingContext* context)
             }
 
             chunks.emplace_back(chunk);
-            chunkPartsInfo[chunk->GetId()].emplace_back(mediumIndex, queue);
+            chunkPartsInfo[chunk->GetId()].emplace_back(mediumIndex, priority);
         }
     }
 
@@ -1706,12 +1693,10 @@ void TChunkReplicator::RefreshChunk(
     auto durabilityRequired = IsDurabilityRequired(chunk, chunkReplicas);
 
     auto alertNonChunkLocationReplica = [&] (const auto& replica) {
-        YT_LOG_ALERT(
-            "Non-chunk location stored replica was found during refresh of chunk "
-            "(ChunkId: %v, ReplicaMediumIndex: %v, ReplicaIndex: %v)",
-            chunk->GetId(),
-            replica.GetEffectiveMediumIndex(),
-            replica.GetReplicaIndex());
+        YT_TLOG_ALERT("Non-chunk location stored replica was found during refresh of chunk")
+            .With("ChunkId", chunk->GetId())
+            .With("ReplicaMediumIndex", replica.GetEffectiveMediumIndex())
+            .With("ReplicaIndex", replica.GetReplicaIndex());
     };
 
     for (auto entry : replication) {
@@ -1794,9 +1779,9 @@ void TChunkReplicator::RefreshChunk(
                         for (auto replica : statistics.MissingReplicas) {
                             auto* node = replica.GetPtr();
                             if (!node->ReportedDataNodeHeartbeat()) {
-                                YT_LOG_ALERT("Trying to place a chunk on a node that did not report a heartbeat (ChunkId: %v, NodeId: %v)",
-                                    chunkId,
-                                    node->GetId());
+                                YT_TLOG_ALERT("Trying to place a chunk on a node that did not report a heartbeat")
+                                    .With("ChunkId", chunkId)
+                                    .With("NodeId", node->GetId());
                                 continue;
                             }
 
@@ -1844,9 +1829,21 @@ void TChunkReplicator::RefreshChunk(
             if (None(statistics.Status & EChunkStatus::Lost) && chunk->IsSealed()) {
                 TChunkPtrWithMediumIndex chunkWithIndex(chunk, mediumIndex);
                 if (Any(statistics.Status & (EChunkStatus::DataMissing | EChunkStatus::ParityMissing))) {
-                    AddToChunkRepairQueue(chunkWithIndex, EChunkRepairQueue::Missing);
+                    auto* codec = NErasure::GetCodec(chunk->GetErasureCodec());
+
+                    int missingPartCount = 0;
+                    for (int i = 0; i < codec->GetTotalPartCount(); ++i) {
+                        if (statistics.ReplicaCount[i] == 0) {
+                            ++missingPartCount;
+                        }
+                    }
+
+                    int guaranteedRepairableCount = codec->GetGuaranteedRepairablePartCount();
+                    int canStillLose = std::max(0, guaranteedRepairableCount - missingPartCount);
+                    int priority = std::min(canStillLose, RepairPriorityCount - 2);
+                    AddToChunkRepairQueue(chunkWithIndex, priority);
                 } else if (Any(statistics.Status & (EChunkStatus::DataDecommissioned | EChunkStatus::ParityDecommissioned))) {
-                    AddToChunkRepairQueue(chunkWithIndex, EChunkRepairQueue::Decommissioned);
+                    AddToChunkRepairQueue(chunkWithIndex, ErasureChunkDecommissionPriority);
 
                     if (config->EnableRepairViaReplication) {
                         for (auto replica : chunkReplicas) {
@@ -1901,17 +1898,15 @@ void TChunkReplicator::RefreshChunk(
         YT_VERIFY(LostChunks_.insert(chunk).second);
         if (durabilityRequired) {
             YT_VERIFY(LostVitalChunks_.insert(chunk).second);
-            YT_LOG_DEBUG_IF(std::ssize(LostVitalChunks_) <= maxLostVitalChunksToLog,
-                "Chunk is lost (ChunkId: %v, WasLostVital: %v, ChunkReplicas: %v)",
-                chunk->GetId(),
-                wasLostVital,
-                MakeFormattableView(chunkReplicas, TDefaultFormatter{}));
+            YT_TLOG_DEBUG_IF(std::ssize(LostVitalChunks_) <= maxLostVitalChunksToLog, "Chunk is lost")
+                .With("ChunkId", chunk->GetId())
+                .With("WasLostVital", wasLostVital)
+                .With("ChunkReplicas", MakeFormattableView(chunkReplicas, TDefaultFormatter{}));
         }
     } else if (wasLostVital) {
-        YT_LOG_DEBUG_IF(std::ssize(LostVitalChunks_) < maxLostVitalChunksToLog,
-            "Chunk is no longer lost (ChunkId: %v, ChunkReplicas: %v)",
-            chunk->GetId(),
-            MakeFormattableView(chunkReplicas, TDefaultFormatter{}));
+        YT_TLOG_DEBUG_IF(std::ssize(LostVitalChunks_) < maxLostVitalChunksToLog, "Chunk is no longer lost")
+            .With("ChunkId", chunk->GetId())
+            .With("ChunkReplicas", MakeFormattableView(chunkReplicas, TDefaultFormatter{}));
     }
 
     if (Any(allMediaStatistics.Status & ECrossMediumChunkStatus::DataMissing)) {
@@ -2116,7 +2111,8 @@ void TChunkReplicator::DoRefreshLocationSequoiaUnsafe(TNodeId nodeId, TChunkLoca
     auto sequoiaReplicasFuture = chunkReplicaFetcher->GetSequoiaLocationReplicas(nodeId, locationIndex);
     auto sequoiaReplicasOrError = WaitFor(sequoiaReplicasFuture);
     if (!sequoiaReplicasOrError.IsOK()) {
-        YT_LOG_ERROR(sequoiaReplicasOrError, "Error getting Sequoia node replicas");
+        YT_TLOG_ERROR("Error getting Sequoia node replicas")
+            .With(sequoiaReplicasOrError);
         return;
     }
 
@@ -2130,7 +2126,7 @@ void TChunkReplicator::DoRefreshLocationSequoiaUnsafe(TNodeId nodeId, TChunkLoca
 
 void TChunkReplicator::ScheduleGlobalChunkRefresh()
 {
-    YT_LOG_INFO("Scheduling global chunk refresh");
+    YT_TLOG_INFO("Scheduling global chunk refresh");
     const auto& chunkManager = Bootstrap_->GetChunkManager();
     for (int shardIndex = 0; shardIndex < ChunkShardCount; ++shardIndex) {
         if (IsShardActive(shardIndex)) {
@@ -2144,11 +2140,11 @@ void TChunkReplicator::OnRefresh()
 {
     auto config = GetDynamicConfig();
     if (!config->EnableChunkRefresh) {
-        YT_LOG_DEBUG("Chunk refresh disabled");
+        YT_TLOG_DEBUG("Chunk refresh disabled");
         return;
     }
 
-    YT_LOG_DEBUG("Chunk refresh iteration started");
+    YT_TLOG_DEBUG("Chunk refresh iteration started");
 
     auto now = GetCpuInstant();
 
@@ -2172,10 +2168,10 @@ void TChunkReplicator::OnRefresh()
         if (globalRefreshStartTime > start) {
             deadline = start;
         }
-        YT_LOG_TRACE("Chunk refresh iteration deadline (GlobalRefreshStartTime: %v, Start: %v, Deadline: %v)",
-                CpuInstantToInstant(globalRefreshStartTime),
-                CpuInstantToInstant(start),
-                CpuInstantToInstant(deadline));
+        YT_TLOG_TRACE("Chunk refresh iteration deadline")
+            .With("GlobalRefreshStartTime", CpuInstantToInstant(globalRefreshStartTime))
+            .With("Start", CpuInstantToInstant(start))
+            .With("Deadline", CpuInstantToInstant(deadline));
 
         while (*totalCount < maxChunksPerRefresh && scanner->HasUnscannedChunk(deadline)) {
             ++(*totalCount);
@@ -2194,12 +2190,10 @@ void TChunkReplicator::OnRefresh()
                 auto waitTime = CpuDurationToDuration(now - *enqueueInstant);
                 refreshQueueWaitTime.Update(waitTime);
                 if (waitTime > allowedWaitTime) {
-                    YT_LOG_ALERT(
-                        "Chunk has been waiting in refresh queue for too long "
-                        "(ChunkId: %v, WaitTime: %v, AllowedWaitTime: %v)",
-                        chunk->GetId(),
-                        waitTime,
-                        allowedWaitTime);
+                    YT_TLOG_ALERT("Chunk has been waiting in refresh queue for too long")
+                        .With("ChunkId", chunk->GetId())
+                        .With("WaitTime", waitTime)
+                        .With("AllowedWaitTime", allowedWaitTime);
                 } else {
                     YT_VERBOSE_LOG_CHUNK_EVENT(chunk,
                         "Chunk has been dequeued from refresh queue (ChunkId: %v, WaitTime: %v, AllowedWaitTime: %v)",
@@ -2219,10 +2213,10 @@ void TChunkReplicator::OnRefresh()
                 // ChunkRefreshDelay significantly smaller then ReplicaApproveTimeout, so the refresh delay is not doubled here,
                 // but the long term plan is to make a queue a priority queue instead.
                 auto delay = DurationToCpuDuration(config->ChunkRefreshDelay);
-                YT_LOG_DEBUG("Chunk refresh is delayed (ChunkId: %v, Delay: %v, EnqueueInstant: %v)",
-                    chunk->GetId(),
-                    delay,
-                    enqueueInstant);
+                YT_TLOG_DEBUG("Chunk refresh is delayed")
+                    .With("ChunkId", chunk->GetId())
+                    .With("Delay", delay)
+                    .With("EnqueueInstant", enqueueInstant);
                 scanner->EnqueueChunk(
                     {chunk, errorCount},
                     delay,
@@ -2253,10 +2247,10 @@ void TChunkReplicator::OnRefresh()
             if (!replicasOrError.IsOK()) {
                 auto refreshErrorCount = GetOrCrash(chunkIdToErrorCount, chunk->GetId());
                 if (refreshErrorCount >= config->MaxUnsuccessfullRefreshAttempts) {
-                    YT_LOG_ALERT("Too many unsuccessful refresh attempts for chunk (ChunkId: %v, RefreshErrorCount: %v, LastError: %v)",
-                        chunk->GetId(),
-                        refreshErrorCount,
-                        replicasOrError);
+                    YT_TLOG_ALERT("Too many unsuccessful refresh attempts for chunk")
+                        .With("ChunkId", chunk->GetId())
+                        .With("RefreshErrorCount", refreshErrorCount)
+                        .With("LastError", replicasOrError);
                 }
                 auto it = chunkIdToEnqueueInstant.find(chunk->GetId());
                 // TODO(aleksandra-zh): GetOrCrash is valid here, but all maps will become one, so whatever.
@@ -2301,13 +2295,13 @@ void TChunkReplicator::OnRefresh()
 
     FlushEndorsementQueue();
 
-    YT_LOG_DEBUG("Chunk refresh iteration completed (TotalBlobCount: %v, AliveBlobCount: %v, ReplicasErrorCount: %v, TotalJournalCount: %v, AliveJournalCount: %v, JournalReplicasErrorCount: %v)",
-        totalBlobCount,
-        aliveBlobCount,
-        replicasErrorCount,
-        totalJournalCount,
-        aliveJournalCount,
-        journalReplicasErrorCount);
+    YT_TLOG_DEBUG("Chunk refresh iteration completed")
+        .With("TotalBlobCount", totalBlobCount)
+        .With("AliveBlobCount", aliveBlobCount)
+        .With("ReplicasErrorCount", replicasErrorCount)
+        .With("TotalJournalCount", totalJournalCount)
+        .With("AliveJournalCount", aliveJournalCount)
+        .With("JournalReplicasErrorCount", journalReplicasErrorCount);
 }
 
 const ISequoiaChunkRefresherPtr& TChunkReplicator::GetSequoiaChunkRefresher() const
@@ -2374,7 +2368,8 @@ void TChunkReplicator::OnCheckEnabled()
             OnCheckEnabledSecondary();
         }
     } catch (const std::exception& ex) {
-        YT_LOG_ERROR(ex, "Error updating chunk replicator state, disabling until the next attempt");
+        YT_TLOG_ERROR("Error updating chunk replicator state, disabling until the next attempt")
+            .With(ex);
         ReplicatorEnabled_ = false;
     }
 }
@@ -2403,9 +2398,9 @@ void TChunkReplicator::OnCheckEnabledSecondary()
     auto faultyStorageDCs = ConvertTo<THashSet<std::string>>(TYsonString(faultyStorageDCsRsp->value()));
     if (!ReplicatorEnabled_ || enabled != *ReplicatorEnabled_) {
         if (enabled) {
-            YT_LOG_INFO("Chunk replicator enabled at primary master");
+            YT_TLOG_INFO("Chunk replicator enabled at primary master");
         } else {
-            YT_LOG_INFO("Chunk replicator disabled at primary master");
+            YT_TLOG_INFO("Chunk replicator disabled at primary master");
         }
     }
     if (enabled) {
@@ -2431,21 +2426,17 @@ void TChunkReplicator::TryRescheduleChunkRemoval(const TJobPtr& unsucceededJob)
         const auto& dataNodeTracker = Bootstrap_->GetDataNodeTracker();
         auto* location = dataNodeTracker->FindChunkLocationByUuid(locationUuid);
         if (!IsObjectAlive(location)) {
-            YT_LOG_ALERT(
-                "Cannot reschedule chunk removal job; location not found "
-                "(Chunk: %v, LocationUuid: %v)",
-                replica,
-                locationUuid);
+            YT_TLOG_ALERT("Cannot reschedule chunk removal job; location not found")
+                .With("Chunk", replica)
+                .With("LocationUuid", locationUuid);
             return;
         }
 
         if (location->GetEffectiveMediumIndex() != replica.MediumIndex) {
-            YT_LOG_DEBUG(
-                "Chunk removal job was not rescheduled because location's medium has been changed "
-                "(Chunk: %v, LocationUuid: %v, LocationMediumIndex: %v)",
-                replica,
-                locationUuid,
-                location->GetEffectiveMediumIndex());
+            YT_TLOG_DEBUG("Chunk removal job was not rescheduled because location's medium has been changed")
+                .With("Chunk", replica)
+                .With("LocationUuid", locationUuid)
+                .With("LocationMediumIndex", location->GetEffectiveMediumIndex());
             return;
         }
         location->AddToChunkRemovalQueue(replica);
@@ -2461,10 +2452,10 @@ void TChunkReplicator::OnProfiling(TSensorBuffer* buffer, TSensorBuffer* detaile
     buffer->AddGauge("/journal_refresh_queue_size", JournalRefreshScanner_->GetQueueSize());
     buffer->AddGauge("/journal_requisition_update_queue_size", JournalRequisitionUpdateScanner_->GetQueueSize());
 
-    for (auto queueKind : TEnumTraits<EChunkRepairQueue>::GetDomainValues()) {
-        TWithTagGuard tagGuard(buffer, "repair_queue", FormatEnum(queueKind));
+    for (int priority = 0; priority < RepairPriorityCount; ++priority) {
+        TWithTagGuard tagGuard(buffer, "repair_queue_priority", ToString(priority));
 
-        const auto& repairQueues = ChunkRepairQueues(queueKind);
+        const auto& repairQueues = ChunkRepairQueues(priority);
         for (int mediumIndex = 0; mediumIndex < std::ssize(repairQueues); ++mediumIndex) {
             TWithTagGuard mediumIndexTagGuard(buffer, "medium_index", ToString(mediumIndex));
             buffer->AddGauge("/repair_queue_size", repairQueues[mediumIndex].size());
@@ -2545,12 +2536,12 @@ void TChunkReplicator::OnJobWaiting(const TJobPtr& job, IJobControllerCallbacks*
 void TChunkReplicator::OnJobRunning(const TJobPtr& job, IJobControllerCallbacks* callbacks)
 {
     if (TInstant::Now() - job->GetStartTime() > GetDynamicConfig()->JobTimeout) {
-        YT_LOG_WARNING("Job timed out, aborting (JobId: %v, JobType: %v, Address: %v, Duration: %v, ChunkId: %v)",
-            job->GetJobId(),
-            job->GetType(),
-            job->NodeAddress(),
-            TInstant::Now() - job->GetStartTime(),
-            job->GetChunkIdWithIndexes());
+        YT_TLOG_WARNING("Job timed out, aborting")
+            .With("JobId", job->GetJobId())
+            .With("JobType", job->GetType())
+            .With("Address", job->NodeAddress())
+            .With("Duration", TInstant::Now() - job->GetStartTime())
+            .With("ChunkId", job->GetChunkIdWithIndexes());
 
         callbacks->AbortJob(job);
     }
@@ -2592,12 +2583,11 @@ void TChunkReplicator::MaybeUpdateChunkRemovalLock(const TJobPtr& job)
         auto sequenceNumber = job->GetSequenceNumber();
         awaitingChunkIds.emplace(sequenceNumber, chunkId);
 
-        YT_LOG_DEBUG("Chunk removal job lock sequence number updated"
-            " (ChunkId: %v, JobId: %v, NodeAddress: %v, SequenceNumber: %v)",
-            chunkId,
-            job->GetJobId(),
-            node->GetDefaultAddress(),
-            sequenceNumber);
+        YT_TLOG_DEBUG("Chunk removal job lock sequence number updated")
+            .With("ChunkId", chunkId)
+            .With("JobId", job->GetJobId())
+            .With("NodeAddress", node->GetDefaultAddress())
+            .With("SequenceNumber", sequenceNumber);
     }
 }
 
@@ -2750,16 +2740,16 @@ void TChunkReplicator::OnScheduleChunkRequisitionUpdatesFlush()
         return;
     }
 
-    YT_LOG_DEBUG("Flushing chunks scheduled for requisition update (Count: %v)",
-        request.chunk_ids_size());
+    YT_TLOG_DEBUG("Flushing chunks scheduled for requisition update")
+        .With("Count", request.chunk_ids_size());
 
     const auto& chunkManager = Bootstrap_->GetChunkManager();
     auto mutation = chunkManager->CreateScheduleChunkRequisitionUpdatesMutation(request);
     mutation->SetAllowLeaderForwarding(true);
     auto rspOrError = WaitFor(mutation->CommitAndLog(Logger()));
     if (!rspOrError.IsOK()) {
-        YT_LOG_WARNING(rspOrError,
-            "Failed to schedule chunk requisition update flush");
+        YT_TLOG_WARNING("Failed to schedule chunk requisition update flush")
+            .With(rspOrError);
 
         for (const auto& protoChunkId : request.chunk_ids()) {
             auto* chunk = chunkManager->FindChunk(FromProto<TChunkId>(protoChunkId));
@@ -2785,7 +2775,7 @@ void TChunkReplicator::ScheduleGlobalRequisitionUpdate()
 void TChunkReplicator::OnRequisitionUpdate()
 {
     if (!GetDynamicConfig()->EnableChunkRequisitionUpdate) {
-        YT_LOG_DEBUG("Chunk requisition update disabled");
+        YT_TLOG_DEBUG("Chunk requisition update disabled");
         return;
     }
 
@@ -2793,7 +2783,7 @@ void TChunkReplicator::OnRequisitionUpdate()
     const auto& multicellManager = Bootstrap_->GetMulticellManager();
     request.set_cell_tag(ToProto(multicellManager->GetCellTag()));
 
-    YT_LOG_DEBUG("Chunk requisition update iteration started");
+    YT_TLOG_DEBUG("Chunk requisition update iteration started");
 
     TmpRequisitionRegistry_.Clear();
 
@@ -2845,12 +2835,12 @@ void TChunkReplicator::OnRequisitionUpdate()
 
     FillChunkRequisitionDict(&request, TmpRequisitionRegistry_);
 
-    YT_LOG_DEBUG("Chunk requisition update iteration completed (TotalBlobCount: %v, AliveBlobCount: %v, TotalJournalCount: %v, AliveJournalCount: %v, UpdateCount: %v)",
-        totalBlobCount,
-        aliveBlobCount,
-        totalJournalCount,
-        aliveJournalCount,
-        request.updates_size());
+    YT_TLOG_DEBUG("Chunk requisition update iteration completed")
+        .With("TotalBlobCount", totalBlobCount)
+        .With("AliveBlobCount", aliveBlobCount)
+        .With("TotalJournalCount", totalJournalCount)
+        .With("AliveJournalCount", aliveJournalCount)
+        .With("UpdateCount", request.updates_size());
 
     if (request.updates_size() > 0) {
         const auto& chunkManager = Bootstrap_->GetChunkManager();
@@ -2858,8 +2848,8 @@ void TChunkReplicator::OnRequisitionUpdate()
         mutation->SetAllowLeaderForwarding(true);
         auto rspOrError = WaitFor(mutation->CommitAndLog(Logger()));
         if (!rspOrError.IsOK()) {
-            YT_LOG_WARNING(rspOrError,
-                "Failed to update chunk requisition; Scheduling global scan");
+            YT_TLOG_WARNING("Failed to update chunk requisition; Scheduling global scan")
+                .With(rspOrError);
             ScheduleGlobalRequisitionUpdate();
         }
     }
@@ -2937,15 +2927,13 @@ TChunkRequisition TChunkReplicator::ComputeChunkRequisition(const TChunk* chunk)
             found = true;
             auto isHunkChunkList = owningNode->GetHunkChunkList() == chunkList;
 
-            YT_LOG_ALERT_IF(isHunkChunk && !isHunkChunkList,
-                "Encountered a hunk chunk in non-hunk chunk list tree (NodeId: %v, ChunkId: %v)",
-                owningNode->GetId(),
-                chunk->GetId());
-            YT_LOG_ALERT_IF(isHunkChunkList && !(isHunkChunk || isJournalChunk),
-                "Encountered chunk of a wrong type in hunk chunk list tree (NodeId: %v, ChunkId: %v, ChunkType: %v)",
-                owningNode->GetId(),
-                chunk->GetId(),
-                chunk->GetChunkType());
+            YT_TLOG_ALERT_IF(isHunkChunk && !isHunkChunkList, "Encountered a hunk chunk in non-hunk chunk list tree")
+                .With("NodeId", owningNode->GetId())
+                .With("ChunkId", chunk->GetId());
+            YT_TLOG_ALERT_IF(isHunkChunkList && !(isHunkChunk || isJournalChunk), "Encountered chunk of a wrong type in hunk chunk list tree")
+                .With("NodeId", owningNode->GetId())
+                .With("ChunkId", chunk->GetId())
+                .With("ChunkType", chunk->GetChunkType());
 
             if (auto* account = owningNode->Account().Get()) {
                 const auto& replication = isHunkChunkList &&
@@ -2967,11 +2955,10 @@ TChunkRequisition TChunkReplicator::ComputeChunkRequisition(const TChunk* chunk)
     if (!found || !requisition.ToReplication().IsValid()) {
         // Chunk that *are* linked to a trunk owner yet still somehow end up
         // having an invalid requisition mean there's a bug.
-        YT_LOG_ALERT_IF(found,
-            "Invalid requisition computed for a chunk (ChunkId: %v, ChunkType: %v, UseHunkSpecificMediaForRequisitionUpdates: %v)",
-            chunk->GetId(),
-            chunk->GetChunkType(),
-            GetDynamicConfig()->UseHunkSpecificMediaForRequisitionUpdates);
+        YT_TLOG_ALERT_IF(found, "Invalid requisition computed for a chunk")
+            .With("ChunkId", chunk->GetId())
+            .With("ChunkType", chunk->GetChunkType())
+            .With("UseHunkSpecificMediaForRequisitionUpdates", GetDynamicConfig()->UseHunkSpecificMediaForRequisitionUpdates);
 
         // Chunks that *aren't* linked to any trunk owner are assigned empty
         // requisition. This doesn't mean the replicator will act upon it, though,
@@ -3031,8 +3018,8 @@ void TChunkReplicator::ConfirmChunkListRequisitionTraverseFinished(
     const TEphemeralObjectPtr<TChunkList>& chunkList)
 {
     auto chunkListId = chunkList->GetId();
-    YT_LOG_DEBUG("Chunk list requisition traverse finished (ChunkListId: %v)",
-        chunkListId);
+    YT_TLOG_DEBUG("Chunk list requisition traverse finished")
+        .With("ChunkListId", chunkListId);
     ChunkListIdsWithFinishedRequisitionTraverse_.push_back(chunkListId);
 }
 
@@ -3050,8 +3037,8 @@ void TChunkReplicator::OnFinishedRequisitionTraverseFlush()
         return;
     }
 
-    YT_LOG_DEBUG("Flushing finished chunk lists requisition traverse confirmations (Count: %v)",
-        ChunkListIdsWithFinishedRequisitionTraverse_.size());
+    YT_TLOG_DEBUG("Flushing finished chunk lists requisition traverse confirmations")
+        .With("Count", ChunkListIdsWithFinishedRequisitionTraverse_.size());
 
     TReqConfirmChunkListsRequisitionTraverseFinished request;
     ToProto(request.mutable_chunk_list_ids(), ChunkListIdsWithFinishedRequisitionTraverse_);
@@ -3062,8 +3049,8 @@ void TChunkReplicator::OnFinishedRequisitionTraverseFlush()
     mutation->SetAllowLeaderForwarding(true);
     auto rspOrError = WaitFor(mutation->CommitAndLog(Logger()));
     if (!rspOrError.IsOK()) {
-        YT_LOG_WARNING(rspOrError,
-            "Failed to flush finished requisition traverse");
+        YT_TLOG_WARNING("Failed to flush finished requisition traverse")
+            .With(rspOrError);
         return;
     }
 }
@@ -3084,14 +3071,14 @@ TChunkList* TChunkReplicator::FollowParentLinks(TChunkList* chunkList)
     return chunkList;
 }
 
-void TChunkReplicator::AddToChunkRepairQueue(TChunkPtrWithMediumIndex chunkWithIndex, EChunkRepairQueue queue)
+void TChunkReplicator::AddToChunkRepairQueue(TChunkPtrWithMediumIndex chunkWithIndex, int priority)
 {
     auto* chunk = chunkWithIndex.GetPtr();
     int mediumIndex = chunkWithIndex.GetMediumIndex();
-    YT_VERIFY(chunk->GetRepairQueueIterator(mediumIndex, queue) == TChunkRepairQueueIterator());
-    auto& chunkRepairQueue = ChunkRepairQueue(mediumIndex, queue);
+    YT_VERIFY(chunk->GetRepairQueueIterator(mediumIndex, priority) == TChunkRepairQueueIterator());
+    auto& chunkRepairQueue = ChunkRepairQueue(mediumIndex, priority);
     auto it = chunkRepairQueue.insert(chunkRepairQueue.end(), chunkWithIndex);
-    chunk->SetRepairQueueIterator(mediumIndex, queue, it);
+    chunk->SetRepairQueueIterator(mediumIndex, priority, it);
 }
 
 void TChunkReplicator::RemoveFromChunkRepairQueues(TChunk* chunk)
@@ -3104,17 +3091,14 @@ void TChunkReplicator::RemoveFromChunkRepairQueues(TChunk* chunk)
     // before the subsequent refresh. Which means that the requisition and
     // replication/repair/etc. queues may be inconsistent. Do not rely on the
     // requisition when dealing with replicator queues!
-    for (auto queue : TEnumTraits<EChunkRepairQueue>::GetDomainValues()) {
-        auto queueIterators = *chunk->SelectRepairQueueIteratorMap(queue);
-        for (auto [mediumIndex, repairIt] : queueIterators) {
-            if (repairIt == TChunkRepairQueueIterator()) {
-                continue;
-            }
-            auto& repairQueue = ChunkRepairQueue(mediumIndex, queue);
-            repairQueue.erase(repairIt);
-            // Just to be safe.
-            chunk->SetRepairQueueIterator(mediumIndex, queue, TChunkRepairQueueIterator());
-        }
+    auto queueIterators = chunk->SelectRepairQueueIteratorMap();
+    for (auto [encodedKey, repairIt] : queueIterators) {
+        auto [mediumIndex, priority] = DecodeRepairQueueKey(encodedKey);
+
+        auto& repairQueue = ChunkRepairQueue(mediumIndex, priority);
+        repairQueue.erase(repairIt);
+        // Just to be safe.
+        chunk->SetRepairQueueIterator(mediumIndex, priority, TChunkRepairQueueIterator());
     }
 }
 
@@ -3126,18 +3110,14 @@ void TChunkReplicator::TouchChunkInRepairQueues(TChunk* chunk)
 
     // NB: See RemoveFromChunkRepairQueues for the comment on why the chunk's
     // requisition should not be used here.
-    for (auto queue : TEnumTraits<EChunkRepairQueue>::GetDomainValues()) {
-        auto queueIterators = *chunk->SelectRepairQueueIteratorMap(queue);
-        for (auto [mediumIndex, repairIt] : queueIterators) {
-            if (repairIt == TChunkRepairQueueIterator()) {
-                continue;
-            }
-            auto& repairQueue = ChunkRepairQueue(mediumIndex, queue);
-            repairQueue.erase(repairIt);
-            TChunkPtrWithMediumIndex chunkWithIndex(chunk, mediumIndex);
-            auto newRepairIt = repairQueue.insert(repairQueue.begin(), chunkWithIndex);
-            chunk->SetRepairQueueIterator(mediumIndex, queue, newRepairIt);
-        }
+    for (auto [encodedKey, repairIt] : chunk->SelectRepairQueueIteratorMap()) {
+        auto [mediumIndex, priority] = DecodeRepairQueueKey(encodedKey);
+
+        auto& repairQueue = ChunkRepairQueue(mediumIndex, priority);
+        repairQueue.erase(repairIt);
+        TChunkPtrWithMediumIndex chunkWithIndex(chunk, mediumIndex);
+        auto newRepairIt = repairQueue.insert(repairQueue.begin(), chunkWithIndex);
+        chunk->SetRepairQueueIterator(mediumIndex, priority, newRepairIt);
     }
 }
 
@@ -3151,8 +3131,8 @@ void TChunkReplicator::FlushEndorsementQueue()
     ToProto(req.mutable_chunk_ids(), ChunkIdsPendingEndorsementRegistration_);
     ChunkIdsPendingEndorsementRegistration_.clear();
 
-    YT_LOG_DEBUG("Scheduled chunk endorsement registration (EndorsementCount: %v)",
-        req.chunk_ids_size());
+    YT_TLOG_DEBUG("Scheduled chunk endorsement registration")
+        .With("EndorsementCount", req.chunk_ids_size());
 
     const auto& chunkManager = Bootstrap_->GetChunkManager();
     auto mutation = chunkManager->CreateRegisterChunkEndorsementsMutation(req);
@@ -3162,9 +3142,8 @@ void TChunkReplicator::FlushEndorsementQueue()
     YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger())
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TErrorOr<TMutationResponse>& error) {
             if (!error.IsOK()) {
-                YT_LOG_WARNING(error,
-                    "Failed to commit chunk endorsment registration mutation; "
-                    "scheduling global refresh");
+                YT_TLOG_WARNING("Failed to commit chunk endorsment registration mutation; scheduling global refresh")
+                    .With(error);
                 ScheduleGlobalChunkRefresh();
             }
         }).AsyncVia(invoker)));
@@ -3185,33 +3164,19 @@ TChunkRequisitionRegistry* TChunkReplicator::GetChunkRequisitionRegistry() const
     return Bootstrap_->GetChunkManager()->GetChunkRequisitionRegistry();
 }
 
-TChunkRepairQueue& TChunkReplicator::ChunkRepairQueue(int mediumIndex, EChunkRepairQueue queue)
+TChunkRepairQueue& TChunkReplicator::ChunkRepairQueue(int mediumIndex, int priority)
 {
-    return ChunkRepairQueues(queue)[mediumIndex];
+    return ChunkRepairQueues_[priority][mediumIndex];
 }
 
-std::array<TChunkRepairQueue, MaxMediumCount>& TChunkReplicator::ChunkRepairQueues(EChunkRepairQueue queue)
+std::array<TChunkRepairQueue, MaxMediumCount>& TChunkReplicator::ChunkRepairQueues(int priority)
 {
-    switch (queue) {
-        case EChunkRepairQueue::Missing:
-            return MissingPartChunkRepairQueues_;
-        case EChunkRepairQueue::Decommissioned:
-            return DecommissionedPartChunkRepairQueues_;
-        default:
-            YT_ABORT();
-    }
+    return ChunkRepairQueues_[priority];
 }
 
-TDecayingMaxMinBalancer<int, double>& TChunkReplicator::ChunkRepairQueueBalancer(EChunkRepairQueue queue)
+TDecayingMaxMinBalancer<int, double>& TChunkReplicator::ChunkRepairQueueBalancer(int priority)
 {
-    switch (queue) {
-        case EChunkRepairQueue::Missing:
-            return MissingPartChunkRepairQueueBalancer_;
-        case EChunkRepairQueue::Decommissioned:
-            return DecommissionedPartChunkRepairQueueBalancer_;
-        default:
-            YT_ABORT();
-    }
+    return ChunkRepairQueueBalancers_[priority];
 }
 
 const TDynamicChunkManagerConfigPtr& TChunkReplicator::GetDynamicConfig() const
@@ -3284,8 +3249,8 @@ void TChunkReplicator::StartRefreshes(int shardIndex)
     BlobRefreshScanner_->Start(chunkManager->GetGlobalBlobChunkScanDescriptor(shardIndex));
     JournalRefreshScanner_->Start(chunkManager->GetGlobalJournalChunkScanDescriptor(shardIndex));
 
-    YT_LOG_INFO("Chunk refreshes started (ShardIndex: %v)",
-        shardIndex);
+    YT_TLOG_INFO("Chunk refreshes started")
+        .With("ShardIndex", shardIndex);
 }
 
 void TChunkReplicator::StopRefreshes(int shardIndex)
@@ -3327,8 +3292,8 @@ void TChunkReplicator::StopRefreshes(int shardIndex)
     }
     OldestPartMissingChunks_ = std::move(newOldestPartMissingChunks);
 
-    YT_LOG_INFO("Chunk refreshes stopped (ShardIndex: %v)",
-        shardIndex);
+    YT_TLOG_INFO("Chunk refreshes stopped")
+        .With("ShardIndex", shardIndex);
 }
 
 void TChunkReplicator::StartRequisitionUpdates(int shardIndex)
@@ -3343,8 +3308,8 @@ void TChunkReplicator::StartRequisitionUpdates(int shardIndex)
         chunkManager->RescheduleChunkListRequisitionTraversals();
     }
 
-    YT_LOG_INFO("Chunk requisition updates started (ShardIndex: %v)",
-        shardIndex);
+    YT_TLOG_INFO("Chunk requisition updates started")
+        .With("ShardIndex", shardIndex);
 }
 
 void TChunkReplicator::StopRequisitionUpdates(int shardIndex)
@@ -3352,15 +3317,15 @@ void TChunkReplicator::StopRequisitionUpdates(int shardIndex)
     BlobRequisitionUpdateScanner_->Stop(shardIndex);
     JournalRequisitionUpdateScanner_->Stop(shardIndex);
 
-    YT_LOG_INFO("Chunk requisition updates stopped (ShardIndex: %v)",
-        shardIndex);
+    YT_TLOG_INFO("Chunk requisition updates stopped")
+        .With("ShardIndex", shardIndex);
 }
 
 bool TChunkReplicator::ComputeReplicatorEnablement() const
 {
     if (!GetDynamicConfig()->EnableChunkReplicator) {
         if (!ReplicatorEnabled_ || *ReplicatorEnabled_) {
-            YT_LOG_INFO("Chunk replicator disabled");
+            YT_TLOG_INFO("Chunk replicator disabled");
         }
         return false;
     }
@@ -3405,7 +3370,7 @@ bool TChunkReplicator::ComputeReplicatorEnablement() const
     }
 
     if (!ReplicatorEnabled_ || !*ReplicatorEnabled_) {
-        YT_LOG_INFO("Chunk replicator enabled");
+        YT_TLOG_INFO("Chunk replicator enabled");
     }
     return true;
 }

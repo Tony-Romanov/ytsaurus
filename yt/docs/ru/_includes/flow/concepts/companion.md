@@ -24,6 +24,8 @@
 
 Computation на стороне Worker-a собирает батч сообщений, обогащает его всей необходимой для обработки информацией (стейты, параметры, значения watermarks и т.п.) и отправляет его компаньону по gRPC локально в рамках одного хоста.
 
+Батч формируется без учёта [ключей](../../../flow/concepts/glossary.md#key): один запрос может содержать сообщения с разными ключами. Так воркер собирает батчи для любых компьютейшенов — это не особенность компаньона. Batch-функции SDK (`onMessages` в Java, `on_messages` в Python, `OnMessages` в Go) получают такой батч целиком — как `IBatchProcessFunction` в C++ — и по умолчанию все его сообщения становятся родителями каждого выходного сообщения. Отличие от C++ API в том, что там группировку по ключам можно поручить хосту (`IKeyedBatchProcessFunction`), а в SDK компаньонов такой опции нет: если бизнес-логике нужна обработка по ключам, группировка выполняется в пользовательском коде — см. пример для [Python](../../../flow/python/computation.md#batch-function). Когда родителей вывода необходимо задавать явно (в Swift-компьютейшене — обязательно) и что именно указывать — см. [Когда задавать lineage явно](../../../flow/concepts/lineage.md#explicit-lineage).
+
 В дальнейшем планируется использовать и unix sockets.
 
 ![](../../../flow/images/companion_v1.svg)
@@ -38,9 +40,9 @@ Computation на стороне Worker-a собирает батч сообще�
 "CompanionManager" = {
     "resource_class_name" = "NYT::NFlow::NCompanion::TJavaCompanionManager";
     "parameters" = {
+        "main_class" = "tech.ytsaurus.flow.examples.wordcount.WordCountApplication";
         "timeout" = "10s";
         "jdk_bin_path" = "/app/ytflow/jdk/bin/java";
-        "main_class" = "tech.ytsaurus.flow.examples.wordcount.NodeCompanionMain";
         "classpath" = "/app/ytflow/lib/*";
     };
     "dependencies" = {};

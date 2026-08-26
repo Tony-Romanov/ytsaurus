@@ -55,9 +55,9 @@ public:
             TNbdProfilerCounters::MakeTagSet(SensorTag_), "/device/created")
                 .Increment(1);
 
-        YT_LOG_INFO("Created chunk block device (Size: %v, Filesystem: %v)",
-            Config_->Size,
-            Config_->FsType);
+        YT_TLOG_INFO("Created chunk block device")
+            .With("Size", Config_->Size)
+            .With("Filesystem", Config_->FsType);
     }
 
     ~TChunkBlockDevice()
@@ -66,9 +66,9 @@ public:
             TNbdProfilerCounters::MakeTagSet(SensorTag_), "/device/removed")
                 .Increment(1);
 
-        YT_LOG_INFO("Destructing chunk block device (Size: %v, Filesystem: %v)",
-            Config_->Size,
-            Config_->FsType);
+        YT_TLOG_INFO("Destructing chunk block device")
+            .With("Size", Config_->Size)
+            .With("Filesystem", Config_->FsType);
     }
 
     i64 GetTotalSize() const override
@@ -99,16 +99,16 @@ public:
 
     TFuture<TReadResponse> Read(i64 offset, i64 length, const TReadOptions& options) override
     {
-        YT_LOG_DEBUG("Started reading from chunk (Offset: %v, Length: %v, Cookie: %x)",
-            offset,
-            length,
-            options.Cookie);
+        YT_TLOG_DEBUG("Started reading from chunk")
+            .With("Offset", offset)
+            .With("Length", length)
+            .WithFormat("Cookie", "%x", options.Cookie);
 
         if (length == 0) {
-            YT_LOG_DEBUG("Finished reading from chunk (Offset: %v, Length: %v, Cookie: %x)",
-                offset,
-                length,
-                options.Cookie);
+            YT_TLOG_DEBUG("Finished reading from chunk")
+                .With("Offset", offset)
+                .With("Length", length)
+                .WithFormat("Cookie", "%x", options.Cookie);
 
             return MakeFuture<TReadResponse>({});
         }
@@ -161,12 +161,13 @@ public:
                                 auto throttleWaitDuration = throttleTimer.GetElapsedTime();
 
                                 if (!throttleError.IsOK()) {
-                                    YT_LOG_WARNING(throttleError, "Failed to read from chunk (Offset: %v, ExpectedLength: %v, ConflictWaitDuration: %v, ThrottleWaitDuration: %v, Cookie: %x)",
-                                        offset,
-                                        length,
-                                        conflictWaitDuration,
-                                        throttleWaitDuration,
-                                        options.Cookie);
+                                    YT_TLOG_WARNING("Failed to read from chunk")
+                                        .With("Offset", offset)
+                                        .With("ExpectedLength", length)
+                                        .With("ConflictWaitDuration", conflictWaitDuration)
+                                        .With("ThrottleWaitDuration", throttleWaitDuration)
+                                        .WithFormat("Cookie", "%x", options.Cookie)
+                                        .With(throttleError);
 
                                     pipeline.Guard.SetError(throttleError);
                                     THROW_ERROR throttleError;
@@ -197,13 +198,14 @@ public:
                                 auto rpcWaitDuration = rpcTimer.GetElapsedTime();
 
                                 if (!rspOrError.IsOK()) {
-                                    YT_LOG_WARNING(rspOrError, "Failed to read from chunk (Offset: %v, ExpectedLength: %v, ConflictWaitDuration: %v, ThrottleWaitDuration: %v, RpcWaitDuration: %v, Cookie: %x)",
-                                        offset,
-                                        length,
-                                        conflictWaitDuration,
-                                        throttleWaitDuration,
-                                        rpcWaitDuration,
-                                        options.Cookie);
+                                    YT_TLOG_WARNING("Failed to read from chunk")
+                                        .With("Offset", offset)
+                                        .With("ExpectedLength", length)
+                                        .With("ConflictWaitDuration", conflictWaitDuration)
+                                        .With("ThrottleWaitDuration", throttleWaitDuration)
+                                        .With("RpcWaitDuration", rpcWaitDuration)
+                                        .WithFormat("Cookie", "%x", options.Cookie)
+                                        .With(rspOrError);
 
                                     pipeline.Guard.SetError(TError(rspOrError));
                                     THROW_ERROR rspOrError;
@@ -211,15 +213,15 @@ public:
 
                                 const auto& response = rspOrError.Value();
 
-                                YT_LOG_DEBUG("Finished reading from chunk (Offset: %v, ExpectedLength: %v, ResultLength: %v, ShouldStopUsingDevice: %v, ConflictWaitDuration: %v, ThrottleWaitDuration: %v, RpcWaitDuration: %v, Cookie: %x)",
-                                    offset,
-                                    length,
-                                    response.Data.Size(),
-                                    response.ShouldStopUsingDevice,
-                                    conflictWaitDuration,
-                                    throttleWaitDuration,
-                                    rpcWaitDuration,
-                                    options.Cookie);
+                                YT_TLOG_DEBUG("Finished reading from chunk")
+                                    .With("Offset", offset)
+                                    .With("ExpectedLength", length)
+                                    .With("ResultLength", response.Data.Size())
+                                    .With("ShouldStopUsingDevice", response.ShouldStopUsingDevice)
+                                    .With("ConflictWaitDuration", conflictWaitDuration)
+                                    .With("ThrottleWaitDuration", throttleWaitDuration)
+                                    .With("RpcWaitDuration", rpcWaitDuration)
+                                    .WithFormat("Cookie", "%x", options.Cookie);
 
                                 return response;
                                 // pipeline (guard + reader lock) is destroyed here.
@@ -229,16 +231,16 @@ public:
 
     TFuture<TWriteResponse> Write(i64 offset, const TSharedRef& data, const TWriteOptions& options) override
     {
-        YT_LOG_DEBUG("Started writing to chunk (Offset: %v, Length: %v, Cookie: %x)",
-            offset,
-            data.size(),
-            options.Cookie);
+        YT_TLOG_DEBUG("Started writing to chunk")
+            .With("Offset", offset)
+            .With("Length", data.size())
+            .WithFormat("Cookie", "%x", options.Cookie);
 
         if (data.size() == 0) {
-            YT_LOG_DEBUG("Finished writing to chunk (Offset: %v, Length: %v, Cookie: %x)",
-                offset,
-                data.size(),
-                options.Cookie);
+            YT_TLOG_DEBUG("Finished writing to chunk")
+                .With("Offset", offset)
+                .With("Length", data.size())
+                .WithFormat("Cookie", "%x", options.Cookie);
 
             return MakeFuture<TWriteResponse>({});
         }
@@ -292,12 +294,13 @@ public:
                                 auto throttleWaitDuration = throttleTimer.GetElapsedTime();
 
                                 if (!throttleError.IsOK()) {
-                                    YT_LOG_WARNING(throttleError, "Failed to write to chunk (Offset: %v, Length: %v, ConflictWaitDuration: %v, ThrottleWaitDuration: %v, Cookie: %x)",
-                                        offset,
-                                        data.size(),
-                                        conflictWaitDuration,
-                                        throttleWaitDuration,
-                                        options.Cookie);
+                                    YT_TLOG_WARNING("Failed to write to chunk")
+                                        .With("Offset", offset)
+                                        .With("Length", data.size())
+                                        .With("ConflictWaitDuration", conflictWaitDuration)
+                                        .With("ThrottleWaitDuration", throttleWaitDuration)
+                                        .WithFormat("Cookie", "%x", options.Cookie)
+                                        .With(throttleError);
 
                                     pipeline.Guard.SetError(throttleError);
                                     THROW_ERROR throttleError;
@@ -328,13 +331,14 @@ public:
                                 auto rpcWaitDuration = rpcTimer.GetElapsedTime();
 
                                 if (!rspOrError.IsOK()) {
-                                    YT_LOG_WARNING(rspOrError, "Failed to write to chunk (Offset: %v, Length: %v, ConflictWaitDuration: %v, ThrottleWaitDuration: %v, RpcWaitDuration: %v, Cookie: %x)",
-                                        offset,
-                                        data.size(),
-                                        conflictWaitDuration,
-                                        throttleWaitDuration,
-                                        rpcWaitDuration,
-                                        options.Cookie);
+                                    YT_TLOG_WARNING("Failed to write to chunk")
+                                        .With("Offset", offset)
+                                        .With("Length", data.size())
+                                        .With("ConflictWaitDuration", conflictWaitDuration)
+                                        .With("ThrottleWaitDuration", throttleWaitDuration)
+                                        .With("RpcWaitDuration", rpcWaitDuration)
+                                        .WithFormat("Cookie", "%x", options.Cookie)
+                                        .With(rspOrError);
 
                                     pipeline.Guard.SetError(TError(rspOrError));
                                     THROW_ERROR rspOrError;
@@ -342,14 +346,14 @@ public:
 
                                 const auto& response = rspOrError.Value();
 
-                                YT_LOG_DEBUG("Finished writing to chunk (Offset: %v, Length: %v, ShouldStopUsingDevice: %v, ConflictWaitDuration: %v, ThrottleWaitDuration: %v, RpcWaitDuration: %v, Cookie: %x)",
-                                    offset,
-                                    data.size(),
-                                    response.ShouldStopUsingDevice,
-                                    conflictWaitDuration,
-                                    throttleWaitDuration,
-                                    rpcWaitDuration,
-                                    options.Cookie);
+                                YT_TLOG_DEBUG("Finished writing to chunk")
+                                    .With("Offset", offset)
+                                    .With("Length", data.size())
+                                    .With("ShouldStopUsingDevice", response.ShouldStopUsingDevice)
+                                    .With("ConflictWaitDuration", conflictWaitDuration)
+                                    .With("ThrottleWaitDuration", throttleWaitDuration)
+                                    .With("RpcWaitDuration", rpcWaitDuration)
+                                    .WithFormat("Cookie", "%x", options.Cookie);
 
                                 return response;
                             }));
@@ -445,14 +449,16 @@ private:
     class TInflightRequestGuard
     {
     public:
-        TInflightRequestGuard(TInflightList* list, TSpinLock* lock, TInflightList::iterator it)
-            : List_(list)
+        TInflightRequestGuard(IBlockDevicePtr owner, TInflightList* list, TSpinLock* lock, TInflightList::iterator it)
+            : Owner_(std::move(owner))
+            , List_(list)
             , Lock_(lock)
             , It_(it)
         { }
 
         TInflightRequestGuard(TInflightRequestGuard&& other) noexcept
-            : List_(other.List_)
+            : Owner_(std::move(other.Owner_))
+            , List_(other.List_)
             , Lock_(other.Lock_)
             , It_(other.It_)
             , Error_(std::move(other.Error_))
@@ -492,6 +498,9 @@ private:
         TInflightRequestGuard& operator=(TInflightRequestGuard&&) = delete;
 
     private:
+        //! The list, the lock and the iterator point into the device; a dropped request
+        //! callback may hold its last reference, so the guard keeps the device alive.
+        IBlockDevicePtr Owner_;
         TInflightList* const List_;
         TSpinLock* const Lock_;
         const TInflightList::iterator It_;
@@ -572,7 +581,7 @@ private:
         });
         auto it = std::prev(InflightRequests_.end());
 
-        return {TInflightRequestGuard(&InflightRequests_, &InflightLock_, it), std::move(conflicts)};
+        return {TInflightRequestGuard(MakeStrong(this), &InflightRequests_, &InflightLock_, it), std::move(conflicts)};
     }
 
 };

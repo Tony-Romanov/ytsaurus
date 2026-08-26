@@ -36,6 +36,8 @@
 
 #include <yt/yt/library/auth_server/helpers.h>
 
+#include <yt/yt/library/formats/format.h>
+
 #include <yt/yt/client/arrow/arrow_row_stream_decoder.h>
 #include <yt/yt/client/arrow/arrow_row_stream_encoder.h>
 
@@ -79,6 +81,8 @@
 #include <yt/yt/client/table_client/helpers.h>
 #include <yt/yt/client/table_client/name_table.h>
 #include <yt/yt/client/table_client/schema.h>
+#include <yt/yt/client/table_client/table_output.h>
+#include <yt/yt/client/table_client/value_consumer.h>
 #include <yt/yt/client/table_client/wire_protocol.h>
 
 #include <yt/yt/client/tablet_client/table_mount_cache.h>
@@ -123,6 +127,7 @@ using namespace NChunkClient;
 using namespace NCodegen;
 using namespace NCompression;
 using namespace NConcurrency;
+using namespace NFormats;
 using namespace NHydra;
 using namespace NLogging;
 using namespace NObjectClient;
@@ -356,6 +361,56 @@ IRowStreamDecoderPtr CreateRowStreamDecoder(
     }
 }
 
+IUnversionedRowsetPtr DeserializeFormatRowset(
+    TTableSchemaPtr schema,
+    const TFormat& format,
+    const TSharedRef& data,
+    const TLogger& logger)
+{
+    auto typeConversionConfig = ConvertTo<TTypeConversionConfigPtr>(format.Attributes());
+    TBuildingValueConsumer valueConsumer(
+        schema,
+        logger,
+        /*convertNullToEntity*/ false,
+        typeConversionConfig);
+    valueConsumer.SetTreatMissingAsNull(true);
+
+    TTableOutput output(CreateParserForFormat(format, &valueConsumer));
+    output.Write(data.Begin(), data.Size());
+    output.Finish();
+
+    auto rowBuffer = New<TRowBuffer>(TApiServiceBufferTag());
+    auto capturedRows = rowBuffer->CaptureRows(valueConsumer.GetRows());
+    auto rows = MakeSharedRange(
+        std::vector<TUnversionedRow>(capturedRows.begin(), capturedRows.end()),
+        std::move(rowBuffer));
+    return CreateRowset(std::move(schema), std::move(rows));
+}
+
+IUnversionedRowsetPtr DeserializeRowset(
+    const NApi::NRpcProxy::NProto::TRowsetDescriptor& descriptor,
+    TTableSchemaPtr schema,
+    const std::optional<TFormat>& format,
+    const TSharedRef& data,
+    const TLogger& logger)
+{
+    switch (descriptor.rowset_format()) {
+        case NApi::NRpcProxy::NProto::RF_YT_WIRE:
+            return NApi::NRpcProxy::DeserializeRowset<TUnversionedRow>(descriptor, data);
+
+        case NApi::NRpcProxy::NProto::RF_FORMAT:
+            if (!format) {
+                THROW_ERROR_EXCEPTION("Format is missing for rowset format %Qv",
+                    NApi::NRpcProxy::NProto::ERowsetFormat_Name(descriptor.rowset_format()));
+            }
+            return DeserializeFormatRowset(std::move(schema), *format, data, logger);
+
+        default:
+            THROW_ERROR_EXCEPTION("Unsupported rowset format %Qv",
+                NApi::NRpcProxy::NProto::ERowsetFormat_Name(descriptor.rowset_format()));
+    }
+}
+
 bool IsColumnarRowsetFormat(NApi::NRpcProxy::NProto::ERowsetFormat format)
 {
     return format == NApi::NRpcProxy::NProto::RF_ARROW;
@@ -510,7 +565,7 @@ public:
         if (Client_ && Client_->GetNativeConnection()->IsTerminated()) {
             auto replyError = TError(NRpc::EErrorCode::TransportError, "Connection to cluster %v was terminated", ClientClusterName_);
             if (!error.IsOK()) {
-                replyError <<= error;
+                replyError.Add(error);
             }
             TBase::Reply(replyError);
         } else {
@@ -556,7 +611,8 @@ public:
                 DoEmitError();
             }
         } catch (const std::exception& ex) {
-            YT_LOG_ERROR(ex, "Error while logging structured event");
+            YT_TLOG_ERROR("Error while logging structured event")
+                .With(ex);
         }
     }
 
@@ -1317,10 +1373,9 @@ void TApiService::OnDynamicConfigChanged(const TApiServiceDynamicConfigPtr& conf
 
     auto oldConfig = Config_.Acquire();
 
-    YT_LOG_DEBUG(
-        "Updating API service config (OldConfig: %v, NewConfig: %v)",
-        ConvertToYsonString(oldConfig, EYsonFormat::Text),
-        ConvertToYsonString(config, EYsonFormat::Text));
+    YT_TLOG_DEBUG("Updating API service config")
+        .With("OldConfig", ConvertToYsonString(oldConfig, EYsonFormat::Text))
+        .With("NewConfig", ConvertToYsonString(config, EYsonFormat::Text));
 
     AuthenticatedClientCache_->Reconfigure(config->ClientCache);
 
@@ -1365,9 +1420,9 @@ void TApiService::AllocateTestData(const TTraceContextPtr& traceContext)
 
         MakeTestHeapAllocation(size, delay);
 
-        YT_LOG_DEBUG("Test heap allocation is finished (AllocationSize: %v, AllocationReleaseDelay: %v)",
-            size,
-            delay);
+        YT_TLOG_DEBUG("Test heap allocation is finished")
+            .With("AllocationSize", size)
+            .With("AllocationReleaseDelay", delay);
     }
 }
 
@@ -1507,9 +1562,9 @@ NNative::IClientPtr TApiService::GetAuthenticatedClientOrThrow(
 
     // Pretty-printing Protobuf requires a bunch of effort, so we make it conditional.
     if (config->VerboseLogging) {
-        YT_LOG_DEBUG("RequestId: %v, RequestBody: %v",
-            context->GetRequestId(),
-            request->ShortDebugString());
+        YT_TLOG_DEBUG("Request body")
+            .With("RequestId", context->GetRequestId())
+            .With("RequestBody", request->ShortDebugString());
     }
 
     NApi::NNative::IConnectionPtr connection;
@@ -1756,10 +1811,9 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, GenerateTimestamps)
                         return MakeFuture(std::move(providerResult));
                     }
 
-                    YT_LOG_WARNING(
-                        providerResult,
-                        "Wrong clock cluster tag %v, trying to generate timestamps via direct call",
-                        clockClusterTag);
+                    YT_TLOG_WARNING("Wrong clock cluster tag, trying to generate timestamps via direct call")
+                        .With("ClockClusterTag", clockClusterTag)
+                        .With(providerResult);
 
                     auto alienClient = connection->GetClockManager()->GetTimestampProviderOrThrow(clockClusterTag);
                     return alienClient->GenerateTimestamps(count);
@@ -4743,10 +4797,17 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, SelectRows)
             TTruncatedStringView(query, queryTruncateLimit),
             options.Timestamp,
             options.PlaceholderValues);
+        YT_TLOG_DEBUG("Untruncated select query")
+            .With("Query", query)
+            .With("Timestamp", options.Timestamp)
+            .With("PlaceholderValues", options.PlaceholderValues);
     } else {
         context->SetRequestInfo("Query: %v, Timestamp: %v",
             TTruncatedStringView(query, queryTruncateLimit),
             options.Timestamp);
+        YT_TLOG_DEBUG("Untruncated select query")
+            .With("Query", query)
+            .With("Timestamp", options.Timestamp);
     }
 
     ExecuteCall(
@@ -5046,9 +5107,19 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PushQueueProducer)
         /*options*/ std::nullopt,
         /*searchInPool*/ true);
 
-    auto rowset = NApi::NRpcProxy::DeserializeRowset<TUnversionedRow>(
+    auto format = GetFormat(context, request);
+
+    auto tableMountCache = client->GetTableMountCache();
+    auto queueTableInfoFuture = tableMountCache->GetTableInfo(queuePath.GetPath());
+    auto queueTableInfo = WaitFor(queueTableInfoFuture)
+        .ValueOrThrow("Path %v does not point to a valid queue", queuePath);
+
+    auto rowset = DeserializeRowset(
         request->rowset_descriptor(),
-        MergeRefsToRef<TApiServiceBufferTag>(request->Attachments()));
+        queueTableInfo->Schemas[ETableSchemaKind::WriteViaQueueProducer],
+        format,
+        MergeRefsToRef<TApiServiceBufferTag>(request->Attachments()),
+        Logger);
 
     ExecuteCall(
         context,
@@ -5469,7 +5540,7 @@ void TApiService::DoModifyRows(
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION("Error sending rows for table %v",
             path)
-            .With(TError(ex));
+            .With(ex);
     }
 
     auto rowsetRows = rowset->GetRows();

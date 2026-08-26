@@ -15,6 +15,7 @@
 #include <yt/yt/core/ytree/yson_struct.h>
 
 #include <yt/yt/core/misc/fs.h>
+#include <yt/yt/core/misc/shutdown.h>
 
 #include <yt/yt/client/misc/workload.h>
 
@@ -28,6 +29,8 @@
 #include <util/generic/xrange.h>
 
 #include <array>
+#include <cmath>
+#include <functional>
 
 #ifdef _linux_
     #include <sys/uio.h>
@@ -276,12 +279,11 @@ TInternalReadResponse DoRead(
                 sensors->RegisterReadBytes(reallyRead, category);
             }
 
-            YT_LOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive,
-                "Finished reading from disk (Handle: %v, ReadBytes: %v, ReadSessionId: %v, ReadTime: %v)",
-                static_cast<FHANDLE>(*request.Handle),
-                reallyRead,
-                sessionId,
-                statsGuard.GetElapsedTime());
+            YT_TLOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive, "Finished reading from disk")
+                .With("Handle", static_cast<FHANDLE>(*request.Handle))
+                .With("ReadBytes", reallyRead)
+                .With("ReadSessionId", sessionId)
+                .With("ReadTime", statsGuard.GetElapsedTime());
 
             if (useDirectIO && reallyRead < toRead && fileOffset + reallyRead != request.Handle->GetLength()) {
                 THROW_ERROR_EXCEPTION(NFS::EErrorCode::IOError, "DirectIO call failed")
@@ -414,6 +416,8 @@ TWriteResponse DoWriteAligned(
 
     auto fileOffset = request.Offset;
     YT_VERIFY(fileOffset % directIoBlockSize == 0);
+
+    maxBytesPerWrite = AlignDown<i64>(maxBytesPerWrite, directIoBlockSize);
 
     TWriteResponse response;
 
@@ -690,7 +694,8 @@ TFuture<TReadResponse> IIOEngine::ReadAll(
     const std::string& path,
     EWorkloadCategory category,
     TIOSessionId sessionId,
-    TFairShareSlotId fairShareSlot)
+    TFairShareSlotId fairShareSlot,
+    std::optional<TIOFairShareState> fairShareState)
 {
     return Open({path, OpenExisting | RdOnly | Seq | CloseOnExec}, category)
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TIOEngineHandlePtr& handle) {
@@ -702,6 +707,7 @@ TFuture<TReadResponse> IIOEngine::ReadAll(
                     0,
                     handle->GetLength(),
                     fairShareSlot,
+                    fairShareState,
                 }},
                 category,
                 GetRefCountedTypeCookie<TReadAllBufferTag>(),
@@ -731,7 +737,7 @@ struct TThreadPoolIOEngineConfig
     int WriteThreadCount;
     int FairShareThreadCount;
 
-    int DirectIOBlockSize;
+    bool EnableRequestWeighting;
 
     bool EnablePwritev;
     bool FlushAfterWrite;
@@ -763,9 +769,8 @@ struct TThreadPoolIOEngineConfig
             .GreaterThanOrEqual(1)
             .Default(4);
 
-        registrar.Parameter("direct_io_block_size", &TThis::DirectIOBlockSize)
-            .GreaterThan(0)
-            .Default(4_KB);
+        registrar.Parameter("enable_request_weighting", &TThis::EnableRequestWeighting)
+            .Default(false);
 
         registrar.Parameter("min_request_size_to_use_huge_pages", &TThis::MinRequestSizeToUseHugePages)
             .GreaterThanOrEqual(0)
@@ -989,12 +994,11 @@ public:
                     const auto readWaitTime = timer.GetElapsedTime();
                     AddReadWaitTimeSample(readWaitTime);
 
-                    YT_LOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive,
-                        "Started reading from disk (Handle: %v, RequestSize: %v, ReadSessionId: %v, ReadWaitTime: %v)",
-                        static_cast<FHANDLE>(*request.Handle),
-                        request.Size,
-                        sessionId,
-                        readWaitTime);
+                    YT_TLOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive, "Started reading from disk")
+                        .With("Handle", static_cast<FHANDLE>(*request.Handle))
+                        .With("RequestSize", request.Size)
+                        .With("ReadSessionId", sessionId)
+                        .With("ReadWaitTime", readWaitTime);
 
                     return DoRead(
                         std::move(request),
@@ -1171,6 +1175,48 @@ DEFINE_ENUM(EFairShareIOEngineRequestType,
     (FlushFileRange)
 );
 
+std::partial_ordering CompareIOFairShareStates(
+    const std::optional<TIOFairShareState>& lhs,
+    const std::optional<TIOFairShareState>& rhs)
+{
+    if (!lhs && !rhs) {
+        return std::partial_ordering::equivalent;
+    }
+
+    // Requests without fair-share statistics retain guaranteed priority.
+    if (!lhs) {
+        return std::partial_ordering::less;
+    }
+
+    if (!rhs) {
+        return std::partial_ordering::greater;
+    }
+
+    if (lhs->IOFairShareWeight == 0.0 || rhs->IOFairShareWeight == 0.0) {
+        return rhs->IOFairShareWeight <=> lhs->IOFairShareWeight;
+    }
+
+    return lhs->IOConsumed * rhs->IOFairShareWeight <=> rhs->IOConsumed * lhs->IOFairShareWeight;
+}
+
+std::optional<TIOFairShareState> MakeIOFairShareState(
+    std::optional<i64> ioConsumed,
+    std::optional<double> ioFairShareWeight)
+{
+    if (ioConsumed && ioFairShareWeight &&
+        *ioConsumed >= 0 &&
+        std::isfinite(*ioFairShareWeight) &&
+        *ioFairShareWeight >= 0)
+    {
+        return TIOFairShareState{
+            .IOConsumed = *ioConsumed,
+            .IOFairShareWeight = *ioFairShareWeight,
+        };
+    }
+
+    return std::nullopt;
+}
+
 class TFairShareHierarchicalThreadPoolIOEngine
     : public TIOEngineBase
 {
@@ -1237,6 +1283,7 @@ public:
                     requestId,
                     EFairShareIOEngineRequestType::Read);
                 auto requestSize = slice.Request.Size;
+                auto fairShareState = slice.Request.FairShareState;
                 futures.push_back(promise.ToFuture());
 
                 auto callback = BIND([=, this, this_ = MakeStrong(this),
@@ -1249,12 +1296,11 @@ public:
                     const auto readWaitTime = timer.GetElapsedTime();
                     AddReadWaitTimeSample(readWaitTime);
 
-                    YT_LOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive,
-                        "Started reading from disk (Handle: %v, RequestSize: %v, ReadSessionId: %v, ReadWaitTime: %v)",
-                        static_cast<FHANDLE>(*request.Handle),
-                        request.Size,
-                        sessionId,
-                        readWaitTime);
+                    YT_TLOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive, "Started reading from disk")
+                        .With("Handle", static_cast<FHANDLE>(*request.Handle))
+                        .With("RequestSize", request.Size)
+                        .With("ReadSessionId", sessionId)
+                        .With("ReadWaitTime", readWaitTime);
 
                     return DoRead(
                         std::move(request),
@@ -1279,7 +1325,11 @@ public:
                         .Cost = requestSize,
                     });
                 SlotIds_.emplace(slotId);
-                SlotIdToRequestIds_[slotId].push_back({requestId, EFairShareIOEngineRequestType::Read});
+                SlotIdToRequestIds_[slotId].push_back({
+                    .RequestId = requestId,
+                    .RequestType = EFairShareIOEngineRequestType::Read,
+                    .FairShareState = fairShareState,
+                });
             }
         }
 
@@ -1320,14 +1370,15 @@ public:
 
         auto guard = Guard(Lock_);
         std::vector<TFuture<TWriteResponse>> futures;
-        auto slotId = request.FairShareSlotId;
         for (auto& slice : GetRequestSlicer().Slice(std::move(request), config->DirectIOBlockSize)) {
+            auto slotId = slice.FairShareSlotId;
             auto requestId = TGuid::Create();
             auto promise = CreateRequestPromise<TWriteResponse>(
                 slotId,
                 requestId,
                 EFairShareIOEngineRequestType::Write);
             auto toWriteRemaining = static_cast<i64>(GetByteSize(slice.Buffers));
+            auto fairShareState = slice.FairShareState;
 
             futures.push_back(promise.ToFuture());
 
@@ -1367,7 +1418,11 @@ public:
                     .Cost = toWriteRemaining,
                 });
             SlotIds_.emplace(slotId);
-            SlotIdToRequestIds_[slotId].push_back({requestId, EFairShareIOEngineRequestType::Write});
+            SlotIdToRequestIds_[slotId].push_back({
+                .RequestId = requestId,
+                .RequestType = EFairShareIOEngineRequestType::Write,
+                .FairShareState = fairShareState,
+            });
         }
 
         guard.Release();
@@ -1397,6 +1452,7 @@ public:
             slotId,
             requestId,
             EFairShareIOEngineRequestType::Flush);
+        auto fairShareState = request.FairShareState;
         auto callback = BIND(&DoFlushFile, std::move(request), StaticConfig_->EnableSync, category, Sensors_);
         auto future = promise.ToFuture();
         auto guard = Guard(Lock_);
@@ -1409,7 +1465,11 @@ public:
                 .Callback = std::move(callback),
             });
         SlotIds_.emplace(slotId);
-        SlotIdToRequestIds_[slotId].push_back({requestId, EFairShareIOEngineRequestType::Flush});
+        SlotIdToRequestIds_[slotId].push_back({
+            .RequestId = requestId,
+            .RequestType = EFairShareIOEngineRequestType::Flush,
+            .FairShareState = fairShareState,
+        });
 
         guard.Release();
         EventCount_.NotifyAll();
@@ -1423,12 +1483,12 @@ public:
         TIOSessionId /*sessionId*/) override
     {
         std::vector<TFuture<TFlushFileRangeResponse>> futures;
-        auto slotId = request.FairShareSlotId;
 
         auto config = Config_.Acquire();
         auto guard = Guard(Lock_);
 
         for (auto& slice : GetRequestSlicer().Slice(std::move(request), config->DirectIOBlockSize)) {
+            auto slotId = slice.FairShareSlotId;
             auto requestId = TGuid::Create();
             auto promise = CreateRequestPromise<TFlushFileRangeResponse>(
                 slotId,
@@ -1437,6 +1497,7 @@ public:
 
             futures.push_back(promise.ToFuture());
 
+            auto fairShareState = slice.FairShareState;
             auto callback = BIND(&DoFlushFileRange, std::move(slice), StaticConfig_->EnableSync, category, Sensors_);
 
             EmplaceOrCrash(
@@ -1447,7 +1508,11 @@ public:
                     .Callback = std::move(callback),
                 });
             SlotIds_.emplace(slotId);
-            SlotIdToRequestIds_[slotId].push_back({requestId, EFairShareIOEngineRequestType::FlushFileRange});
+            SlotIdToRequestIds_[slotId].push_back({
+                .RequestId = requestId,
+                .RequestType = EFairShareIOEngineRequestType::FlushFileRange,
+                .FairShareState = fairShareState,
+            });
         }
 
         guard.Release();
@@ -1469,8 +1534,16 @@ public:
     {
         auto finally = [this] (auto&& guard, auto&& cookie) {
             guard.Release();
+
+            if (Stopping_.load()) {
+                return;
+            }
             EventCount_.Wait(std::move(cookie), TDuration::Seconds(1));
-            YT_UNUSED_FUTURE(BIND(&TFairShareHierarchicalThreadPoolIOEngine::EngineLoop, MakeStrong(this))
+
+            if (Stopping_.load()) {
+                return;
+            }
+            YT_UNUSED_FUTURE(BIND(&TFairShareHierarchicalThreadPoolIOEngine::EngineLoop, MakeWeak(this))
                 .AsyncVia(ThreadPool_->GetInvoker())
                 .Run());
         };
@@ -1486,9 +1559,7 @@ public:
 
             // TODO(don-dron): For requests that are not explicitly marked up with slots, guaranteed priority
             // must be used. In the future, you need to exclude unmarked requests.
-            auto slot = FairShareQueue_ && !SlotIds_.contains(TFairShareSlotId{})
-                ? FairShareQueue_->PeekSlot(SlotIds_)
-                : nullptr;
+            auto slot = PeekSlot();
             auto slotId = slot ? slot->GetSlotId() : TFairShareSlotId{};
             auto requestsIt = SlotIdToRequestIds_.find(slotId);
 
@@ -1502,9 +1573,9 @@ public:
             auto& requests = requestsIt->second;
 
             YT_VERIFY(!requests.empty());
-            auto requestIdToType = requests.front();
-            auto requestId = requestIdToType.first;
-            auto requestType = requestIdToType.second;
+            auto requestDescriptor = requests.front();
+            auto requestId = requestDescriptor.RequestId;
+            auto requestType = requestDescriptor.RequestType;
 
             requests.pop_front();
 
@@ -1543,7 +1614,8 @@ public:
                         FlushFileRangeRequestStorage_);
                     break;
                 default:
-                    YT_LOG_FATAL("Unknown request type (RequestType: %v)", requestType);
+                    YT_TLOG_FATAL("Unknown request type")
+                        .With("RequestType", requestType);
             }
         }
     }
@@ -1562,6 +1634,13 @@ private:
         i64 Cost = 0;
     };
 
+    struct TRequestDescriptor
+    {
+        TGuid RequestId;
+        EFairShareIOEngineRequestType RequestType;
+        std::optional<TIOFairShareState> FairShareState;
+    };
+
     const TConfigPtr StaticConfig_;
     TAtomicIntrusivePtr<TConfig> Config_;
 
@@ -1572,7 +1651,7 @@ private:
     const TFairShareHierarchicalSlotQueuePtr<std::string> FairShareQueue_;
 
     YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, Lock_);
-    THashMap<TFairShareSlotId, std::deque<std::pair<TGuid, EFairShareIOEngineRequestType>>> SlotIdToRequestIds_;
+    THashMap<TFairShareSlotId, std::deque<TRequestDescriptor>> SlotIdToRequestIds_;
     THashSet<TFairShareSlotId> SlotIds_;
 
     THashMap<TGuid, TRequestHandler<TInternalReadResponse>> ReadRequestStorage_;
@@ -1580,7 +1659,22 @@ private:
     THashMap<TGuid, TRequestHandler<TFlushFileResponse>> FlushFileRequestStorage_;
     THashMap<TGuid, TRequestHandler<TFlushFileRangeResponse>> FlushFileRangeRequestStorage_;
 
+    std::atomic<bool> Stopping_ = false;
     NThreading::TEventCount EventCount_;
+
+    // This must run before the priority-100 ThreadPool callback. The flag
+    // prevents EngineLoop from missing the wakeup and then waiting for its
+    // one-second timeout during shutdown.
+    const TShutdownCookie ShutdownCookie_ = RegisterShutdownCallback(
+        Format("FairShareIOEngine(%v)", LocationId_),
+        BIND_NO_PROPAGATE(&TFairShareHierarchicalThreadPoolIOEngine::OnShutdown, MakeWeak(this)),
+        /*priority*/ 101);
+
+    void OnShutdown()
+    {
+        Stopping_.store(true);
+        EventCount_.NotifyAll();
+    }
 
     TIORequestSlicer GetRequestSlicer() const
     {
@@ -1605,8 +1699,8 @@ private:
                 auto& requests = SlotIdToRequestIds_[slotId];
                 std::erase_if(
                     requests,
-                    [&] (const auto& requestIdToType) {
-                        return requestIdToType.first == requestId;
+                    [&] (const TRequestDescriptor& requestDescriptor) {
+                        return requestDescriptor.RequestId == requestId;
                     });
 
                 if (requests.empty()) {
@@ -1677,6 +1771,50 @@ private:
         ThreadPool_->SetThreadCount(config->FairShareThreadCount);
         Config_.Store(config);
         RunActions();
+    }
+
+    std::partial_ordering CompareSlotsByRequests(
+        const TFairShareHierarchicalSlotQueueSlotPtr<std::string>& lhs,
+        const TFairShareHierarchicalSlotQueueSlotPtr<std::string>& rhs) const
+    {
+        YT_ASSERT_SPINLOCK_AFFINITY(Lock_);
+
+        auto requestsLhsIt = SlotIdToRequestIds_.find(lhs->GetSlotId());
+        auto requestsRhsIt = SlotIdToRequestIds_.find(rhs->GetSlotId());
+
+        if (requestsLhsIt == requestsRhsIt) {
+            return std::partial_ordering::equivalent;
+        }
+
+        if (requestsLhsIt == SlotIdToRequestIds_.end() || requestsLhsIt->second.empty()) {
+            return std::partial_ordering::greater;
+        }
+
+        if (requestsRhsIt == SlotIdToRequestIds_.end() || requestsRhsIt->second.empty()) {
+            return std::partial_ordering::less;
+        }
+
+        auto comparisonResult = CompareIOFairShareStates(
+            requestsLhsIt->second.front().FairShareState,
+            requestsRhsIt->second.front().FairShareState);
+        return std::is_eq(comparisonResult) ? CompareByEnqueueTime(lhs, rhs) : comparisonResult;
+    }
+
+    TFairShareHierarchicalSlotQueueSlotPtr<std::string> PeekSlot() const
+    {
+        YT_ASSERT_SPINLOCK_AFFINITY(Lock_);
+
+        if (!FairShareQueue_ || SlotIds_.contains(TFairShareSlotId{})) {
+            return nullptr;
+        }
+
+        if (!Config_.Acquire()->EnableRequestWeighting) {
+            return FairShareQueue_->PeekSlot(SlotIds_);
+        }
+
+        return FairShareQueue_->PeekSlot(
+            SlotIds_,
+            std::bind_front(&TFairShareHierarchicalThreadPoolIOEngine::CompareSlotsByRequests, this));
     }
 
     void RunActions()

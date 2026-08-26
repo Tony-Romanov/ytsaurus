@@ -90,7 +90,8 @@ i64 TJournalSession::GetIntermediateEmptyBlockCount() const
 
 TFuture<ISession::TFinishResult> TJournalSession::DoFinish(
     const TRefCountedChunkMetaPtr& /*chunkMeta*/,
-    std::optional<int> blockCount)
+    std::optional<int> blockCount,
+    std::optional<TIOFairShareState> /*fairShareState*/)
 {
     YT_ASSERT_INVOKER_AFFINITY(SessionInvoker_);
 
@@ -129,6 +130,7 @@ TFuture<NIO::TIOCounters> TJournalSession::DoPutBlocks(
     int startBlockIndex,
     std::vector<TBlock> blocks,
     i64 /*cumulativeBlockSize*/,
+    std::optional<TIOFairShareState> /*fairShareState*/,
     bool /*enableCaching*/)
 {
     YT_ASSERT_INVOKER_AFFINITY(SessionInvoker_);
@@ -147,9 +149,9 @@ TFuture<NIO::TIOCounters> TJournalSession::DoPutBlocks(
 
     int duplicateBlockCount = std::min<int>(recordCount - startBlockIndex, std::ssize(blocks));
     if (duplicateBlockCount > 0) {
-        YT_LOG_DEBUG("Skipped duplicate blocks (ChunkId: %v, Blocks: %v)",
-            SessionId_.ChunkId,
-            FormatBlocks(startBlockIndex, startBlockIndex + duplicateBlockCount - 1));
+        YT_TLOG_DEBUG("Skipped duplicate blocks")
+            .With("ChunkId", SessionId_.ChunkId)
+            .With("Blocks", FormatBlocks(startBlockIndex, startBlockIndex + duplicateBlockCount - 1));
     }
 
     i64 payloadSize = 0;
@@ -198,8 +200,7 @@ TFuture<TJournalSession::TSendBlocksResult> TJournalSession::DoSendBlocks(
     int /*startBlockIndex*/,
     int /*blockCount*/,
     i64 /*cumulativeBlockSize*/,
-    std::optional<i64> /*ioConsumed*/,
-    std::optional<double> /*ioFairShareWeight*/,
+    std::optional<TIOFairShareState> /*fairShareState*/,
     TDuration /*requestTimeout*/,
     bool /*instantReplyOnThrottling*/,
     const TNodeDescriptor& /*target*/)

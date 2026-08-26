@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import shlex
 import subprocess
@@ -49,6 +50,36 @@ def _load_logslice():
 
 
 logslice = _load_logslice()
+
+
+def _find_fixture_dir():
+    relative_path = "yt/yt/tools/logslice/unittests/py/fixtures/ytadmin_13061"
+    try:
+        import yatest.common
+        return yatest.common.source_path(relative_path)
+    except ImportError:
+        return os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "fixtures",
+            "ytadmin_13061")
+
+
+FIXTURE_DIR = _find_fixture_dir()
+
+
+def _find_auth_preflight_fixture():
+    relative_path = (
+        "yt/yt/tools/logslice/unittests/py/fixtures/ytadmin_58495/"
+        "authentication_unavailable.json")
+    try:
+        import yatest.common
+        return yatest.common.source_path(relative_path)
+    except ImportError:
+        return os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "fixtures",
+            "ytadmin_58495",
+            "authentication_unavailable.json")
 
 
 def _ssh_localhost_works():
@@ -311,6 +342,146 @@ class PipelineStatusTest(unittest.TestCase):
                 self.ssh.run_pipeline(["logslice", "file"], [["wc", "-x"]]),
                 1,
             )
+
+    def test_result_retains_grep_no_match_after_presentation_stage(self):
+        result = self._result(
+            0, "__LOGSLICE_PIPESTATUS__:0 1 0\n", stdout="0\n")
+        with mock.patch.object(logslice.subprocess, "run", return_value=result):
+            completed = self.ssh.run_pipeline_result(
+                ["logslice", "file"], [["grep", "x"], ["wc", "-l"]])
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.operational_returncode, 0)
+        self.assertEqual(completed.stdout, "0\n")
+
+
+class MultiTypeAndOutcomeTest(unittest.TestCase):
+    def test_parse_log_types_accepts_all_and_comma_list(self):
+        self.assertEqual(
+            logslice.parse_log_types("debug,error,info"),
+            ["debug", "error", "info"])
+        self.assertEqual(
+            logslice.parse_log_types("all"),
+            ["debug", "info", "error"])
+        with self.assertRaisesRegex(ValueError, "unknown log type"):
+            logslice.parse_log_types("debug,warning")
+
+    def test_fixture_merges_severities_by_timestamp(self):
+        outputs = []
+        for name in ("debug.log", "info.log", "error.log"):
+            with open(os.path.join(FIXTURE_DIR, name)) as stream:
+                outputs.append(stream.read())
+        merged = logslice.merge_timestamped_outputs(outputs)
+        stamps = [
+            line.split()[1].replace(",", ".")
+            for line in merged.splitlines()
+        ]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertEqual(merged.count(
+            "1a6f70ac-1cbee4dc-5d4cc759-2ee628e1"), 5)
+
+    def test_merge_keeps_multiline_record_with_its_timestamp(self):
+        merged = logslice.merge_timestamped_outputs([
+            "2026-08-11 06:16:54,000001 first\n  first continuation\n",
+            "2026-08-11 06:16:53,000001 second\n  second continuation\n",
+        ])
+        self.assertEqual(merged, (
+            "2026-08-11 06:16:53,000001 second\n"
+            "  second continuation\n"
+            "2026-08-11 06:16:54,000001 first\n"
+            "  first continuation\n"))
+
+    def test_fixture_distinguishes_match_no_match_and_failure(self):
+        with open(os.path.join(FIXTURE_DIR, "rotation_outcomes.json")) as stream:
+            fixture = json.load(stream)
+        results = []
+        for item in fixture:
+            status = logslice.classify_slice_result(
+                item["returncode"], item["stdout"], item["stderr"])
+            self.assertEqual(status, item["expected"], item["file"])
+            results.append({
+                "status": status,
+                "failure_class": logslice.slice_failure_class(
+                    item["returncode"], item["stderr"]),
+            })
+        self.assertEqual(logslice.slice_exit_code(results[:2]), 0)
+        self.assertEqual(
+            logslice.slice_exit_code([results[1]]),
+            logslice.GLOBAL_NO_MATCH_EXIT)
+        self.assertEqual(
+            logslice.slice_exit_code(results),
+            logslice.OPERATIONAL_FAILURE_EXIT)
+        self.assertEqual(results[2]["failure_class"], "decompression")
+
+    def test_grep_no_match_stays_no_match_after_wc_output(self):
+        self.assertEqual(
+            logslice.classify_slice_result(1, "0\n", ""),
+            "no_match")
+
+    def test_broad_debug_window_requires_explicit_override(self):
+        start = datetime(2026, 8, 11, 5, 0, 0)
+        end = datetime(2026, 8, 11, 6, 30, 0)
+        with self.assertRaisesRegex(ValueError, "narrow it"):
+            logslice.validate_debug_window(["debug"], start, end)
+        logslice.validate_debug_window(
+            ["debug"], start, end, allow_broad=True)
+        logslice.validate_debug_window(
+            ["error"], None, None, allow_broad=False)
+
+
+class AuthenticationPreflightTest(unittest.TestCase):
+    def setUp(self):
+        with open(_find_auth_preflight_fixture()) as stream:
+            self.fixture = json.load(stream)
+
+    def test_exact_gateway_failure_has_distinct_preflight_class(self):
+        self.assertEqual(
+            logslice.preflight_failure_class(self.fixture["error"]),
+            "authentication_unavailable")
+        self.assertIsNone(logslice.preflight_failure_class(
+            "ssh true failed: Connection timed out"))
+        self.assertIsNone(logslice.preflight_failure_class(
+            "requested component base was not found"))
+
+    def test_preflight_record_preserves_scope_and_inspects_no_rotations(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            logslice.report_authentication_preflight(
+                self.fixture["host"],
+                self.fixture["component"],
+                self.fixture["window_start"],
+                self.fixture["window_end"])
+        output = stderr.getvalue()
+        self.assertIn("status=authentication_unavailable", output)
+        self.assertIn("host=" + self.fixture["host"], output)
+        self.assertIn("component=" + self.fixture["component"], output)
+        self.assertIn("rotations_inspected=0", output)
+        self.assertIn("files=0", output)
+        self.assertIn("exit_code=2", output)
+        self.assertNotIn(self.fixture["error"], output)
+
+    def test_main_reports_authentication_before_build_or_discovery(self):
+        fixture = self.fixture
+        argv = [
+            "logslice.py", fixture["host"], "--type", "error",
+            "-t", fixture["window_start"], "-e", fixture["window_end"],
+        ]
+        stderr = io.StringIO()
+        with mock.patch.object(logslice.sys, "argv", argv), \
+                mock.patch.object(
+                    logslice.Ssh, "connect",
+                    side_effect=SystemExit(fixture["error"])), \
+                mock.patch.object(logslice, "resolve_logslice") as resolve, \
+                mock.patch.object(
+                    logslice, "discover_component_candidates") as discover, \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(
+                logslice.main(), logslice.OPERATIONAL_FAILURE_EXIT)
+        resolve.assert_not_called()
+        discover.assert_not_called()
+        output = stderr.getvalue()
+        self.assertIn("status=authentication_unavailable", output)
+        self.assertIn("component=" + fixture["component"], output)
+        self.assertIn("rotations_inspected=0", output)
 
 
 class ParseUserTimeTest(unittest.TestCase):
@@ -898,9 +1069,33 @@ class ComponentRoutingTest(unittest.TestCase):
             ("tablet-node", "node"),
         )
 
+    def test_tablet_sen_hostname_maps_to_node_base(self):
+        self.assertEqual(
+            logslice.infer_host_component(
+                "vla5-6094-bundlename-001-tab-sen-v.vla.yp-c.yandex.net"
+            ),
+            ("tablet-node", "node"),
+        )
+
+    def test_node_hostname_resolves_location_suffixed_base(self):
+        route = logslice.resolve_component_route(
+            "vla5-6094-bundlename-001-tab-sen-v.vla.yp-c.yandex.net",
+            None,
+            ["node-vla5-6094"],
+        )
+        self.assertEqual(route["role"], "tablet-node")
+        self.assertEqual(route["component"], "node")
+        self.assertEqual(route["base"], "node-vla5-6094")
+
     def test_master_hostname_maps_to_master_base(self):
         self.assertEqual(
             logslice.infer_host_component("m001-zeno.vla.yp-c.yandex.net"),
+            ("master", "master"),
+        )
+
+    def test_bare_master_hostname_maps_to_master_base(self):
+        self.assertEqual(
+            logslice.infer_host_component("mc014-seneca-vla"),
             ("master", "master"),
         )
 
