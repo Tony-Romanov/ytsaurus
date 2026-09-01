@@ -8,6 +8,7 @@
 #include <yt/yt/core/bus/unittests/lib/helpers.h>
 
 #include <yt/yt/core/concurrency/scheduler_api.h>
+#include <yt/yt/core/net/address.h>
 #include <yt/yt/core/test_framework/framework.h>
 
 #include <library/cpp/testing/common/network.h>
@@ -23,17 +24,20 @@ struct TUcxTestTransport
     IBusServerPtr Server;
     IBusClientPtr Client;
 
-    explicit TUcxTestTransport(IMessageHandlerPtr serverHandler)
+    explicit TUcxTestTransport(
+        IMessageHandlerPtr serverHandler,
+        std::string host = "127.0.0.1")
         : Port(NTesting::GetFreePort())
     {
         auto serverConfig = New<TBusServerConfig>();
+        serverConfig->Address = host;
         serverConfig->Port = Port;
         serverConfig->Transports = "tcp";
         Server = CreateBusServer(serverConfig);
         Server->Start(std::move(serverHandler));
 
         auto clientConfig = New<TBusClientConfig>();
-        clientConfig->Address = Format("127.0.0.1:%v", static_cast<int>(Port));
+        clientConfig->Address = NNet::BuildServiceAddress(host, Port);
         clientConfig->Transports = "tcp";
         Client = CreateBusClient(clientConfig);
     }
@@ -55,6 +59,18 @@ TEST(TUcxBusTest, RequestReplyPreservesMessageParts)
         {.TrackingLevel = EDeliveryTrackingLevel::Full}))
         .ThrowOnError();
     replyHandler->WaitUntilDone();
+}
+
+TEST(TUcxBusTest, Ipv6ListenerStartsAndStops)
+{
+    auto port = NTesting::GetFreePort();
+    auto serverConfig = New<TBusServerConfig>();
+    serverConfig->Address = "::1";
+    serverConfig->Port = port;
+    serverConfig->Transports = "tcp";
+    auto server = CreateBusServer(serverConfig);
+    server->Start(New<NBus::NTests::TEmptyBusHandler>());
+    WaitFor(server->Stop()).ThrowOnError();
 }
 
 TEST(TUcxBusTest, LargeMessage)

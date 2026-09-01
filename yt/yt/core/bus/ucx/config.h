@@ -41,6 +41,10 @@ DEFINE_REFCOUNTED_TYPE(TBusClientConfig)
 struct TBusServerConfig
     : public TBusConfig
 {
+    //! Optional local host or IP address to bind to. If omitted, the listener
+    //! preserves the legacy behavior and binds to the IPv4 wildcard address.
+    //! Both IPv4 and IPv6 addresses are supported.
+    std::optional<std::string> Address;
     std::optional<int> Port;
 
     REGISTER_YSON_STRUCT(TBusServerConfig);

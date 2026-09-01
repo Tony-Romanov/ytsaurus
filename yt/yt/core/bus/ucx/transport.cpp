@@ -331,18 +331,28 @@ public:
         return bus;
     }
 
-    void Listen(int port, IMessageHandlerPtr handler)
+    void Listen(const std::optional<std::string>& host, int port, IMessageHandlerPtr handler)
     {
         ServerHandler_ = std::move(handler);
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_ANY);
-        address.sin_port = htons(port);
+
+        NNet::TNetworkAddress networkAddress;
+        if (host) {
+            networkAddress = Resolve(NNet::BuildServiceAddress(*host, port));
+        } else {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_ANY);
+            address.sin_port = htons(port);
+            networkAddress = NNet::TNetworkAddress(
+                *reinterpret_cast<const sockaddr*>(&address),
+                sizeof(address));
+        }
+
         ucp_listener_params_t params{};
         params.field_mask = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
             UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
-        params.sockaddr.addr = reinterpret_cast<const sockaddr*>(&address);
-        params.sockaddr.addrlen = sizeof(address);
+        params.sockaddr.addr = networkAddress.GetSockAddr();
+        params.sockaddr.addrlen = networkAddress.GetLength();
         params.conn_handler.cb = &TEngine::OnConnectionRequest;
         params.conn_handler.arg = this;
         CheckUcx(ucp_listener_create(ListenerWorker_, &params, &Listener_), "Cannot create UCX listener");
@@ -426,10 +436,7 @@ private:
         int port;
         NNet::ParseServiceAddress(address, &host, &port);
         addrinfo hints{};
-        // The server listener is deliberately IPv4-only. Asking the resolver for
-        // the same family avoids IPv4-mapped IPv6 addresses, which UCX sockcm
-        // cannot reliably map back to the selected data device.
-        hints.ai_family = AF_INET;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         addrinfo* result = nullptr;
         auto service = ToString(port);
@@ -680,7 +687,7 @@ public:
         if (!Config_->Port) {
             THROW_ERROR_EXCEPTION("UCX server port is not configured");
         }
-        Engine_->Listen(*Config_->Port, std::move(handler));
+        Engine_->Listen(Config_->Address, *Config_->Port, std::move(handler));
     }
 
     TFuture<void> Stop() override

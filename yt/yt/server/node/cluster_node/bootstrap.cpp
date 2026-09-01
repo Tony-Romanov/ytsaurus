@@ -832,12 +832,6 @@ private:
                 NChunkClient::ConfigureUcxTransport(true, Config_->Ucx->Transports);
 
                 if (IsDataNode()) {
-                    auto busConfig = New<NYT::NBus::NUcx::TBusServerConfig>();
-                    busConfig->Port = Config_->Ucx->Port;
-                    busConfig->Transports = Config_->Ucx->Transports;
-                    UcxRpcServer_ = NRpc::NBus::CreateBusServer(NYT::NBus::NUcx::CreateBusServer(busConfig));
-                    UcxRpcServer_->Configure(Config_->RpcServer);
-
                     auto host = GetLocalHostName();
                     for (const auto& [network, address] : Config_->Addresses) {
                         if (network == Config_->Ucx->NetworkName) {
@@ -845,6 +839,14 @@ private:
                             break;
                         }
                     }
+
+                    auto busConfig = New<NYT::NBus::NUcx::TBusServerConfig>();
+                    busConfig->Address = host;
+                    busConfig->Port = Config_->Ucx->Port;
+                    busConfig->Transports = Config_->Ucx->Transports;
+                    UcxRpcServer_ = NRpc::NBus::CreateBusServer(NYT::NBus::NUcx::CreateBusServer(busConfig));
+                    UcxRpcServer_->Configure(Config_->RpcServer);
+
                     localRpcAddresses[Format("ucx/%v", Config_->Ucx->NetworkName)] =
                         NNet::BuildServiceAddress(host, Config_->Ucx->Port);
                 }

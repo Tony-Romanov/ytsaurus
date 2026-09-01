@@ -16,6 +16,8 @@ void TBusClientConfig::Register(TRegistrar registrar)
 
 void TBusServerConfig::Register(TRegistrar registrar)
 {
+    registrar.Parameter("address", &TThis::Address)
+        .Default();
     registrar.Parameter("port", &TThis::Port)
         .Default();
 }
