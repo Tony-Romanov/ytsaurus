@@ -11,9 +11,9 @@
 #include <yt/yt/ytlib/api/native/config.h>
 #include <yt/yt/ytlib/api/native/transaction.h>
 
+#include <yt/yt/ytlib/chunk_client/data_slice.h>
 #include <yt/yt/ytlib/chunk_client/input_chunk.h>
 #include <yt/yt/ytlib/chunk_client/job_spec_extensions.h>
-#include <yt/yt/ytlib/chunk_client/legacy_data_slice.h>
 
 #include <yt/yt/ytlib/cypress_client/rpc_helpers.h>
 
@@ -605,7 +605,7 @@ private:
         }
     }
 
-    void ValidateInputDataSlice(const TLegacyDataSlicePtr& dataSlice)
+    void ValidateInputDataSlice(const TDataSlicePtr& dataSlice)
     {
         auto errorCode = NChunkClient::EErrorCode::InvalidInputChunk;
         if (!dataSlice->IsTrivial()) {
@@ -689,10 +689,10 @@ private:
 
         InputSliceDataWeight_ = JobSizeConstraints_->GetInputSliceDataWeight();
 
-        YT_LOG_INFO("Calculated operation parameters (JobCount: %v, MaxDataWeightPerJob: %v, InputSliceDataWeight: %v)",
-            JobSizeConstraints_->GetJobCount(),
-            JobSizeConstraints_->GetMaxDataWeightPerJob(),
-            InputSliceDataWeight_);
+        YT_TLOG_INFO("Calculated operation parameters")
+            .With("JobCount", JobSizeConstraints_->GetJobCount())
+            .With("MaxDataWeightPerJob", JobSizeConstraints_->GetMaxDataWeightPerJob())
+            .With("InputSliceDataWeight", InputSliceDataWeight_);
     }
 
     void FetchInputTableAttributes()
@@ -847,7 +847,7 @@ private:
         return chunkPoolOptions;
     }
 
-    TChunkStripePtr CreateChunkStripe(TLegacyDataSlicePtr dataSlice)
+    TChunkStripePtr CreateChunkStripe(TDataSlicePtr dataSlice)
     {
         TChunkStripePtr chunkStripe = New<TChunkStripe>(false /*foreign*/);
         chunkStripe->DataSlices().push_back(std::move(dataSlice));
@@ -870,16 +870,14 @@ private:
     {
         auto yielder = CreatePeriodicYielder(PrepareYieldPeriod);
 
-        std::vector<TLegacyDataSlicePtr> hunkChunkSlices;
-        std::vector<TLegacyDataSlicePtr> compressionDictionarySlices;
-        std::vector<TLegacyDataSlicePtr> chunkSlices;
+        std::vector<TDataSlicePtr> hunkChunkSlices;
+        std::vector<TDataSlicePtr> compressionDictionarySlices;
+        std::vector<TDataSlicePtr> chunkSlices;
 
         for (const auto& chunk : Concatenate(InputManager_->CollectPrimaryUnversionedChunks(), InputManager_->CollectPrimaryVersionedChunks())) {
-            auto dataSlice = CreateUnversionedInputDataSlice(CreateInputChunkSlice(chunk));
+            const auto& inputTable = InputManager_->GetInputTables()[chunk->GetTableIndex()];
+            auto dataSlice = CreateUnversionedInputDataSlice(CreateInputChunkSlice(chunk, RowBuffer_, inputTable->Comparator));
             dataSlice->SetInputStreamIndex(InputStreamDirectory_.GetInputStreamIndex(chunk->GetTableIndex(), chunk->GetRangeIndex()));
-
-            const auto& inputTable = InputManager_->GetInputTables()[dataSlice->GetTableIndex()];
-            dataSlice->TransformToNew(RowBuffer_, inputTable->Comparator);
 
             ValidateInputDataSlice(dataSlice);
             if (chunk->IsHunk()) {
@@ -898,7 +896,7 @@ private:
         YT_VERIFY(std::ssize(CompressionDictionaryIds_) == std::ssize(compressionDictionarySlices));
 
         int sliceCount = 0;
-        auto addInputSlices = [&] (const TRemoteCopyTaskBasePtr& task, std::vector<TLegacyDataSlicePtr>&& slices) {
+        auto addInputSlices = [&] (const TRemoteCopyTaskBasePtr& task, std::vector<TDataSlicePtr>&& slices) {
             sliceCount += std::ssize(slices);
             for (auto& slice : slices) {
                 task->AddInput(CreateChunkStripe(std::move(slice)));
@@ -926,7 +924,7 @@ private:
     void ProcessInputs()
     {
         YT_PROFILE_TIMING("/operations/remote_copy/input_processing_time") {
-            YT_LOG_INFO("Processing inputs");
+            YT_TLOG_INFO("Processing inputs");
 
             MainTask_->SetIsInput(true);
             if (HunkTask_) {
@@ -937,7 +935,8 @@ private:
             }
 
             auto sliceCount = AddInputSlices();
-            YT_LOG_INFO("Processed inputs (Slices: %v)", sliceCount);
+            YT_TLOG_INFO("Processed inputs")
+                .With("Slices", sliceCount);
         }
     }
 
@@ -1041,12 +1040,12 @@ private:
 
         auto masterCacheAddresses = GetRemoteMasterCacheAddresses();
         if (masterCacheAddresses.empty()) {
-            YT_LOG_DEBUG("Not using remote master caches for remote copy operation");
+            YT_TLOG_DEBUG("Not using remote master caches for remote copy operation");
         } else {
             connectionConfig->Static->OverrideMasterAddresses(masterCacheAddresses);
 
-            YT_LOG_DEBUG("Using remote master caches for remote copy operation (Addresses: %v)",
-                masterCacheAddresses);
+            YT_TLOG_DEBUG("Using remote master caches for remote copy operation")
+                .With("Addresses", masterCacheAddresses);
         }
 
         auto* remoteCopyJobSpecExt = JobSpecTemplate_.MutableExtension(TRemoteCopyJobSpecExt::remote_copy_job_spec_ext);
@@ -1171,19 +1170,19 @@ private:
     {
         if (mapping.size() != chunkIds.size()) {
             for (const auto& chunkId : chunkIds) {
-                YT_LOG_FATAL_IF(
+                YT_TLOG_FATAL_IF(
                     !mapping.contains(chunkId),
-                    "Validate %v consistency failed. Chunk %v was not copied",
-                    chunkName,
-                    chunkId);
+                    "Consistency validation failed; chunk was not copied")
+                    .With("ChunkName", chunkName)
+                    .With("ChunkId", chunkId);
             }
             for (const auto& [oldId, newId] : mapping) {
-                YT_LOG_FATAL_IF(
+                YT_TLOG_FATAL_IF(
                     !chunkIds.contains(oldId),
-                    "Validate %v consistency failed. Chunk %v should not have been copied as %v",
-                    chunkName,
-                    oldId,
-                    newId);
+                    "Consistency validation failed; chunk should not have been copied")
+                    .With("ChunkName", chunkName)
+                    .With("OldChunkId", oldId)
+                    .With("NewChunkId", newId);
             }
         }
     }

@@ -73,30 +73,6 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Reports the job's recently consumed I/O over #window to the data node via the
-// io_consumed request field. No-op when no meter is attached.
-template <class TRequestPtr>
-void SetRequestIoConsumed(const TRequestPtr& req, const TClientChunkWriteOptions& options, TDuration window)
-{
-    if (const auto& jobIoMeter = options.JobIoMeter) {
-        req->set_io_consumed(jobIoMeter->GetIoConsumedInWindow(window));
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-// Reports the configured I/O fair-share weight to the data node via the
-// io_fair_share_weight request field. No-op when the weight is not set.
-template <class TRequestPtr>
-void SetRequestIoFairShareWeight(const TRequestPtr& req, std::optional<double> weight)
-{
-    if (weight) {
-        req->set_io_fair_share_weight(*weight);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
 DECLARE_REFCOUNTED_CLASS(TReplicationWriter)
 DECLARE_REFCOUNTED_CLASS(TNode)
 DECLARE_REFCOUNTED_CLASS(TGroup)
@@ -151,6 +127,11 @@ public:
         return Index_;
     }
 
+    void SetIndex(int index)
+    {
+        Index_ = index;
+    }
+
     const IChannelPtr& GetChannel() const
     {
         return Channel_;
@@ -177,7 +158,6 @@ public:
     }
 
     void InitializeSession(
-        int index,
         IChannelPtr channel,
         TChunkLocationUuid targetLocationUuid,
         TChunkLocationIndex targetLocationIndex,
@@ -186,7 +166,6 @@ public:
         YT_VERIFY(channel);
         YT_VERIFY(!Channel_);
 
-        Index_ = index;
         Channel_ = channel;
         TargetLocationUuid_ = targetLocationUuid;
         TargetLocationIndex_ = targetLocationIndex;
@@ -231,13 +210,10 @@ public:
 
     void UpdateAcquiredMemory(i64 requestedMemory, i64 approvedMemory)
     {
-        // It can happen when old ping response handled after ProbePutBlocks request.
-        if (approvedMemory < ApprovedMemory_) {
-            return;
-        }
-
-        RequestedMemory_ = requestedMemory;
-        ApprovedMemory_ = approvedMemory;
+        // An old ping response can be handled after ProbePutBlocks request.
+        // When throttling, the RPC responds with {requestedMemory, 0}.
+        RequestedMemory_ = std::max(requestedMemory, RequestedMemory_);
+        ApprovedMemory_ = std::max(approvedMemory, ApprovedMemory_);
     }
 
     i64 GetRequestedMemory() const
@@ -279,7 +255,7 @@ private:
     const TNodeDescriptor Descriptor_;
     const TChunkReplicaWithMedium ChunkReplica_;
 
-    int Index_;
+    int Index_ = -1;
     IChannelPtr Channel_;
     TChunkLocationUuid TargetLocationUuid_;
     TChunkLocationIndex TargetLocationIndex_;
@@ -342,6 +318,7 @@ private:
 
     bool Flushing_ = false;
     std::vector<bool> SentTo_;
+    TNodePtr ProbeNode_;
     std::optional<TInstant> ProbeStartTime_;
 
     std::vector<TBlock> Blocks_;
@@ -665,6 +642,19 @@ private:
 
             while (std::ssize(Nodes_) < uploadReplicationFactor) {
                 StartSessions(AllocateTargets(), !useSendBlocks);
+            }
+
+            std::sort(
+                Nodes_.begin(),
+                Nodes_.end(),
+                [] (const auto& lhs, const auto& rhs) {
+                    if (lhs->GetTargetLocationUuid() != rhs->GetTargetLocationUuid()) {
+                        return lhs->GetTargetLocationUuid() < rhs->GetTargetLocationUuid();
+                    }
+                    return lhs->GetDefaultAddress() < rhs->GetDefaultAddress();
+                });
+            for (int index = 0; index < std::ssize(Nodes_); ++index) {
+                Nodes_[index]->SetIndex(index);
             }
 
             YT_TLOG_INFO("Writer opened")
@@ -1062,7 +1052,6 @@ private:
         SetRequestWorkloadDescriptor(req, Config_->WorkloadDescriptor);
         ToProto(req->mutable_session_id(), SessionId_);
         req->set_sync_on_close(Config_->SyncOnClose);
-        req->set_enable_direct_io(Config_->EnableDirectIO);
         req->set_disable_send_blocks(disableSendBlocks);
         req->set_use_probe_put_blocks(isOffshore ? false : Config_->UseProbePutBlocks);
         req->set_preallocate_disk_space(isOffshore ? false : Config_->PreallocateDiskSpace);
@@ -1095,7 +1084,6 @@ private:
             .With("Address", address);
 
         node->InitializeSession(
-            Nodes_.size(),
             channel,
             targetLocationUuid,
             targetLocationIndex,
@@ -1184,7 +1172,7 @@ private:
         req->SetTimeout(Config_->NodeRpcTimeout);
         ToProto(req->mutable_session_id(), SessionId_);
         SetRequestIoConsumed(req, options.ClientOptions, Config_->IoConsumedReportWindow);
-        SetRequestIoFairShareWeight(req, Config_->IoFairShareWeight);
+        SetRequestIoFairShareWeight(req, options.ClientOptions, Config_->IoFairShareWeight);
 
         // NB: If we are under erasure writer, he already have called #Finalize() on chunkMeta.
         // In particular, there might be parallel part writers, so in this case we should
@@ -1410,40 +1398,44 @@ void TGroup::ProbePutBlocks(const TReplicationWriterPtr& writer, const IChunkWri
     for (auto node : writer->Nodes_) {
         // Send ProbePutBlocks requests only if they were not sent or were preempted.
         if (node->IsAlive() && node->GetRequestedMemory() < CumulativeBlockSize_) {
-            nodes.push_back(node);
+            if (!node->ShouldUseProbePutBlocks()) {
+                node->UpdateAcquiredMemory(CumulativeBlockSize_, CumulativeBlockSize_);
+            } else {
+                nodes.push_back(node);
+            }
         }
     }
 
-    std::vector<TFuture<TDataNodeServiceProxy::TRspProbePutBlocks::TResult>> requests;
-    requests.reserve(nodes.size());
-
     for (const auto& node : nodes) {
-        YT_TLOG_DEBUG("Probing blocks")
-            .With("Address", node->GetDefaultAddress())
-            .With("CumulativeBlockSize", CumulativeBlockSize_);
+        // Do not restart the timeout when resending a preempted request for the same node.
+        if (ProbeNode_ != node) {
+            ProbeNode_ = node;
+            ProbeStartTime_ = TInstant::Now();
+        }
 
-        if (node->ShouldUseProbePutBlocks()) {
-            YT_TLOG_DEBUG("Sending ProbePutBlocks")
-                .With("Node", node->GetIndex())
-                .With("RequestedCumulativeBlockSize", CumulativeBlockSize_)
-                .With("SessionId", writer->SessionId_);
+        TDataNodeServiceProxy proxy(node->GetChannel());
+        auto req = proxy.ProbePutBlocks();
+        req->set_cumulative_block_size(CumulativeBlockSize_);
+        ToProto(req->mutable_session_id(), writer->SessionId_);
+        req->SetRequestInfo(
+            "Node: %v, RequestedCumulativeBlockSize: %v, SessionId: %v",
+            node->GetIndex(),
+            CumulativeBlockSize_,
+            writer->SessionId_);
+        SetRequestIoConsumed(req, options.ClientOptions, writer->Config_->IoConsumedReportWindow);
+        SetRequestIoFairShareWeight(req, options.ClientOptions, writer->Config_->IoFairShareWeight);
+        auto rspOrError = WaitFor(req->Invoke());
 
-            TDataNodeServiceProxy proxy(node->GetChannel());
-            auto req = proxy.ProbePutBlocks();
-            req->set_cumulative_block_size(CumulativeBlockSize_);
-            ToProto(req->mutable_session_id(), writer->SessionId_);
-            SetRequestIoConsumed(req, options.ClientOptions, writer->Config_->IoConsumedReportWindow);
-            SetRequestIoFairShareWeight(req, writer->Config_->IoFairShareWeight);
-            auto rspOrError = WaitFor(req->Invoke());
-
-            if (rspOrError.IsOK()) {
-                node->UpdateAcquiredMemory(rspOrError.Value()->probe_put_blocks_state().requested_cumulative_block_size(),
+        if (rspOrError.IsOK()) {
+            node->UpdateAcquiredMemory(
+                rspOrError.Value()->probe_put_blocks_state().requested_cumulative_block_size(),
                 rspOrError.Value()->probe_put_blocks_state().approved_cumulative_block_size());
-            } else {
-                writer->OnNodeFailed(node, rspOrError);
+            if (node->GetApprovedMemory() < CumulativeBlockSize_) {
+                // Probing nodes sequentially to avoid deadlocks.
+                break;
             }
         } else {
-            node->UpdateAcquiredMemory(CumulativeBlockSize_, CumulativeBlockSize_);
+            writer->OnNodeFailed(node, rspOrError);
         }
     }
 
@@ -1499,7 +1491,7 @@ void TGroup::PutGroup(const TReplicationWriterPtr& writer, const IChunkWriter::T
         req->set_populate_cache(writer->Config_->PopulateCache);
         req->set_cumulative_block_size(CumulativeBlockSize_);
         SetRequestIoConsumed(req, options.ClientOptions, writer->Config_->IoConsumedReportWindow);
-        SetRequestIoFairShareWeight(req, writer->Config_->IoFairShareWeight);
+        SetRequestIoFairShareWeight(req, options.ClientOptions, writer->Config_->IoFairShareWeight);
 
         SetRpcAttachedBlocks(req, Blocks_);
 
@@ -1603,7 +1595,7 @@ void TGroup::SendGroup(
         req->set_block_count(Blocks_.size());
         req->set_cumulative_block_size(CumulativeBlockSize_);
         SetRequestIoConsumed(req, options.ClientOptions, writer->Config_->IoConsumedReportWindow);
-        SetRequestIoFairShareWeight(req, writer->Config_->IoFairShareWeight);
+        SetRequestIoFairShareWeight(req, options.ClientOptions, writer->Config_->IoFairShareWeight);
         ToProto(req->mutable_target_descriptor(), dstNode->GetDescriptor());
 
         sendBlocksFutures.push_back(req->Invoke());
@@ -1709,19 +1701,14 @@ void TGroup::Process(const IChunkWriter::TWriteBlocksOptions& options)
     YT_TLOG_DEBUG("Processing blocks")
         .With("Blocks", FormatBlocks(FirstBlockIndex_, GetEndBlockIndex()));
 
-    std::vector<TNodePtr> nodesWithAcquiredResources;
-    std::vector<TNodePtr> nodesWithRequestedResources;
     std::vector<TNodePtr> nodesWithPossibleToSendBlocks;
     bool emptyNodeFound = false;
+    TNodePtr firstUnapprovedNode;
     for (int nodeIndex = 0; nodeIndex < std::ssize(SentTo_); ++nodeIndex) {
         const auto& node = writer->Nodes_[nodeIndex];
         if (node->IsAlive()) {
-            if (node->GetRequestedMemory() >= CumulativeBlockSize_) {
-                nodesWithRequestedResources.push_back(node);
-            }
-
-            if (node->GetApprovedMemory() >= CumulativeBlockSize_) {
-                nodesWithAcquiredResources.push_back(node);
+            if (!firstUnapprovedNode && node->GetApprovedMemory() < CumulativeBlockSize_) {
+                firstUnapprovedNode = node;
             }
 
             if (SentTo_[nodeIndex]) {
@@ -1738,28 +1725,20 @@ void TGroup::Process(const IChunkWriter::TWriteBlocksOptions& options)
     if (!emptyNodeFound) {
         writer->ShiftWindow(options);
     } else if (nodesWithPossibleToSendBlocks.empty() &&
-        // Retry ProbePutBlocks requests only if they were preempted.
-        std::ssize(nodesWithRequestedResources) < writer->AliveNodeCount_ ||
-        // Always send ProbePutBlocks in order to get smaller memory to process that group
-        !ProbeStartTime_.has_value())
+        firstUnapprovedNode &&
+        firstUnapprovedNode->GetRequestedMemory() < CumulativeBlockSize_)
     {
         ProbePutBlocks(writer, options);
-        // ProbePutBlocks request before retries.
-        if (!ProbeStartTime_.has_value()) {
+    } else if (firstUnapprovedNode) {
+        if (ProbeNode_ != firstUnapprovedNode) {
+            ProbeNode_ = firstUnapprovedNode;
             ProbeStartTime_ = TInstant::Now();
         }
-    } else if (nodesWithPossibleToSendBlocks.empty() &&
-        std::ssize(nodesWithAcquiredResources) < writer->AliveNodeCount_)
-    {
-        YT_VERIFY(ProbeStartTime_.has_value());
-        for (const auto& node : writer->Nodes_) {
-            if (node->IsAlive() &&
-                node->GetApprovedMemory() < CumulativeBlockSize_ &&
-                TInstant::Now() - *ProbeStartTime_ > writer->Config_->ProbePutBlocksTimeout)
-            {
-                // Node failed because of timeout for acquiring resources on node for Group.
-                writer->OnNodeFailed(node, TError(EErrorCode::NodeProbeFailed, "ProbePutBlocks failed"));
-            }
+
+        YT_VERIFY(ProbeStartTime_);
+        if (TInstant::Now() - *ProbeStartTime_ > writer->Config_->ProbePutBlocksTimeout) {
+            // Node failed because of timeout for acquiring resources on node for Group.
+            writer->OnNodeFailed(ProbeNode_, TError(EErrorCode::NodeProbeFailed, "ProbePutBlocks failed"));
         }
         TDelayedExecutor::Submit(BIND(&TGroup::ScheduleProcess, MakeWeak(this), options),
             writer->Config_->NodePingPeriod);

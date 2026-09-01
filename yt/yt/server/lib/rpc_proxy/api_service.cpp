@@ -565,7 +565,7 @@ public:
         if (Client_ && Client_->GetNativeConnection()->IsTerminated()) {
             auto replyError = TError(NRpc::EErrorCode::TransportError, "Connection to cluster %v was terminated", ClientClusterName_);
             if (!error.IsOK()) {
-                replyError <<= error;
+                replyError.Add(error);
             }
             TBase::Reply(replyError);
         } else {
@@ -611,7 +611,8 @@ public:
                 DoEmitError();
             }
         } catch (const std::exception& ex) {
-            YT_LOG_ERROR(ex, "Error while logging structured event");
+            YT_TLOG_ERROR("Error while logging structured event")
+                .With(ex);
         }
     }
 
@@ -931,6 +932,8 @@ private:
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, TransferAccountResources);
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, ReadFile);
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, WriteFile);
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, PartitionFile);
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, ReadFilePartition);
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, ReadJournal);
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, WriteJournal);
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, TruncateJournal);
@@ -1289,6 +1292,10 @@ TApiService::TApiService(
     registerMethod(EMultiproxyMethodKind::Write, RPC_SERVICE_METHOD_DESC(WriteFile)
         .SetStreamingEnabled(true)
         .SetCancelable(true));
+    registerMethod(EMultiproxyMethodKind::Read, RPC_SERVICE_METHOD_DESC(PartitionFile));
+    registerMethod(EMultiproxyMethodKind::Read, RPC_SERVICE_METHOD_DESC(ReadFilePartition)
+        .SetStreamingEnabled(true)
+        .SetCancelable(true));
 
     registerMethod(EMultiproxyMethodKind::Read, RPC_SERVICE_METHOD_DESC(ReadJournal)
         .SetStreamingEnabled(true)
@@ -1372,10 +1379,9 @@ void TApiService::OnDynamicConfigChanged(const TApiServiceDynamicConfigPtr& conf
 
     auto oldConfig = Config_.Acquire();
 
-    YT_LOG_DEBUG(
-        "Updating API service config (OldConfig: %v, NewConfig: %v)",
-        ConvertToYsonString(oldConfig, EYsonFormat::Text),
-        ConvertToYsonString(config, EYsonFormat::Text));
+    YT_TLOG_DEBUG("Updating API service config")
+        .With("OldConfig", ConvertToYsonString(oldConfig, EYsonFormat::Text))
+        .With("NewConfig", ConvertToYsonString(config, EYsonFormat::Text));
 
     AuthenticatedClientCache_->Reconfigure(config->ClientCache);
 
@@ -1420,9 +1426,9 @@ void TApiService::AllocateTestData(const TTraceContextPtr& traceContext)
 
         MakeTestHeapAllocation(size, delay);
 
-        YT_LOG_DEBUG("Test heap allocation is finished (AllocationSize: %v, AllocationReleaseDelay: %v)",
-            size,
-            delay);
+        YT_TLOG_DEBUG("Test heap allocation is finished")
+            .With("AllocationSize", size)
+            .With("AllocationReleaseDelay", delay);
     }
 }
 
@@ -1562,9 +1568,9 @@ NNative::IClientPtr TApiService::GetAuthenticatedClientOrThrow(
 
     // Pretty-printing Protobuf requires a bunch of effort, so we make it conditional.
     if (config->VerboseLogging) {
-        YT_LOG_DEBUG("RequestId: %v, RequestBody: %v",
-            context->GetRequestId(),
-            request->ShortDebugString());
+        YT_TLOG_DEBUG("Request body")
+            .With("RequestId", context->GetRequestId())
+            .With("RequestBody", request->ShortDebugString());
     }
 
     NApi::NNative::IConnectionPtr connection;
@@ -1811,10 +1817,9 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, GenerateTimestamps)
                         return MakeFuture(std::move(providerResult));
                     }
 
-                    YT_LOG_WARNING(
-                        providerResult,
-                        "Wrong clock cluster tag %v, trying to generate timestamps via direct call",
-                        clockClusterTag);
+                    YT_TLOG_WARNING("Wrong clock cluster tag, trying to generate timestamps via direct call")
+                        .With("ClockClusterTag", clockClusterTag)
+                        .With(providerResult);
 
                     auto alienClient = connection->GetClockManager()->GetTimestampProviderOrThrow(clockClusterTag);
                     return alienClient->GenerateTimestamps(count);
@@ -3260,8 +3265,8 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PingChaosLease)
     auto client = GetAuthenticatedClientOrThrow(context, request);
     auto chaosLeaseId = FromProto<TChaosLeaseId>(request->chaos_lease_id());
 
-    auto options = TChaosLeaseAttachOptions{};
-    options.Ping = true;
+    TChaosLeasePingOptions options;
+    SetTimeoutOptions(&options, context.Get());
     options.PingAncestors = request->ping_ancestors();
 
     context->SetRequestInfo("ChaosLeaseId: %v",
@@ -3270,7 +3275,7 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, PingChaosLease)
     ExecuteCall(
         context,
         [=] {
-            return client->AttachChaosLease(chaosLeaseId, options).AsVoid();
+            return client->PingChaosLease(chaosLeaseId, options);
         });
 }
 
@@ -4798,17 +4803,17 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, SelectRows)
             TTruncatedStringView(query, queryTruncateLimit),
             options.Timestamp,
             options.PlaceholderValues);
-        YT_LOG_DEBUG("Untruncated select query (Query: %v, Timestamp: %v, PlaceholderValues: %v)",
-            query,
-            options.Timestamp,
-            options.PlaceholderValues);
+        YT_TLOG_DEBUG("Untruncated select query")
+            .With("Query", query)
+            .With("Timestamp", options.Timestamp)
+            .With("PlaceholderValues", options.PlaceholderValues);
     } else {
         context->SetRequestInfo("Query: %v, Timestamp: %v",
             TTruncatedStringView(query, queryTruncateLimit),
             options.Timestamp);
-        YT_LOG_DEBUG("Untruncated select query (Query: %v, Timestamp: %v)",
-            query,
-            options.Timestamp);
+        YT_TLOG_DEBUG("Untruncated select query")
+            .With("Query", query)
+            .With("Timestamp", options.Timestamp);
     }
 
     ExecuteCall(
@@ -6523,6 +6528,20 @@ DEFINE_RPC_SERVICE_METHOD(TApiService, WriteFile)
                 .ThrowOnError();
         },
         false /*feedbackEnabled*/);
+}
+
+DEFINE_RPC_SERVICE_METHOD(TApiService, PartitionFile)
+{
+    Y_UNUSED(request, response, context);
+
+    THROW_ERROR_EXCEPTION("PartitionFile is not implemented yet");
+}
+
+DEFINE_RPC_SERVICE_METHOD(TApiService, ReadFilePartition)
+{
+    Y_UNUSED(request, response, context);
+
+    THROW_ERROR_EXCEPTION("ReadFilePartition is not implemented yet");
 }
 
 ////////////////////////////////////////////////////////////////////////////////

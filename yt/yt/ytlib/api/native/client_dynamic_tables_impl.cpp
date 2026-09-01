@@ -1,6 +1,5 @@
 #include "backup_session.h"
 #include "chaos_helpers.h"
-#include "chaos_lease.h"
 #include "client_impl.h"
 #include "config.h"
 #include "connection.h"
@@ -26,9 +25,9 @@
 #include <yt/yt/ytlib/chunk_client/chunk_reader_options.h>
 #include <yt/yt/ytlib/chunk_client/chunk_reader_statistics.h>
 #include <yt/yt/ytlib/chunk_client/chunk_spec_fetcher.h>
+#include <yt/yt/ytlib/chunk_client/data_slice.h>
 #include <yt/yt/ytlib/chunk_client/helpers.h>
 #include <yt/yt/ytlib/chunk_client/input_chunk.h>
-#include <yt/yt/ytlib/chunk_client/legacy_data_slice.h>
 
 #include <yt/yt/ytlib/cypress_client/cypress_ypath_proxy.h>
 #include <yt/yt/ytlib/cypress_client/rpc_helpers.h>
@@ -70,6 +69,8 @@
 
 #include <yt/yt/ytlib/transaction_client/action.h>
 #include <yt/yt/ytlib/transaction_client/helpers.h>
+
+#include <yt/yt/client/api/chaos_lease.h>
 
 #include <yt/yt/client/chaos_client/helpers.h>
 #include <yt/yt/client/chaos_client/replication_card.h>
@@ -1255,8 +1256,8 @@ TLookupRowsResult<IRowset> TClient::DoLookupRowsOnce(
             if (resultOrError.IsOK()) {
                 return resultOrError.Value();
             } else {
-                resultOrError <<= TErrorAttribute("replica_cluster", replicaFallbackInfo.ClusterName);
-                resultOrError <<= TErrorAttribute("replica_path", replicaFallbackInfo.Path);
+                resultOrError.Add("replica_cluster", replicaFallbackInfo.ClusterName);
+                resultOrError.Add("replica_path", replicaFallbackInfo.Path);
             }
 
             YT_TLOG_DEBUG("Fallback to replica failed")
@@ -1505,25 +1506,37 @@ TLookupRowsResult<IRowset> TClient::DoLookupRowsOnce(
                 options.DetailedProfilingInfo->WastedSubrequestCount += std::ssize(results) - failedSubrequestCount;
             }
 
-            // If any subrequest failed with TabletServantIsNotActive and partial result is not
-            // requested, collect all such errors and throw them as a single combined error so
-            // that the mount cache can patch all affected tablets in one shot.
-            std::vector<TError> servantNotActiveErrors;
+            // If all failed subrequests contain redirection errors and partial result is not
+            // requested, throw them as a single combined error so that the mount cache can patch
+            // all affected tablets in one shot. Otherwise, prioritize a non-redirection error so
+            // that regular mount cache invalidation is performed.
+            std::vector<TError> redirectionErrors;
+            std::optional<TError> nonRedirectionError;
             for (const auto& result : results) {
-                if (!result.IsOK()) {
-                    if (result.FindMatching(NTabletClient::EErrorCode::TabletServantIsNotActive)) {
-                        servantNotActiveErrors.push_back(result);
-                    }
+                if (result.IsOK()) {
+                    continue;
+                }
+
+                if (result.FindMatching(NTabletClient::EErrorCode::TabletServantIsNotActive) ||
+                    result.FindMatching(NTabletClient::EErrorCode::TabletResharded))
+                {
+                    redirectionErrors.push_back(result);
+                } else if (!nonRedirectionError) {
+                    nonRedirectionError = result;
                 }
             }
 
-            if (!servantNotActiveErrors.empty()) {
-                if (servantNotActiveErrors.size() == 1) {
-                    servantNotActiveErrors[0].ThrowOnError();
+            if (!redirectionErrors.empty() && !nonRedirectionError) {
+                if (redirectionErrors.size() == 1) {
+                    redirectionErrors[0].ThrowOnError();
                 } else {
-                    THROW_ERROR_EXCEPTION("Some lookup subrequests failed because tablet servants are not active")
-                        .With(servantNotActiveErrors);
+                    THROW_ERROR_EXCEPTION("Some lookup subrequests failed because tablet metadata changed")
+                        .With(redirectionErrors);
                 }
+            }
+
+            if (nonRedirectionError) {
+                nonRedirectionError->ThrowOnError();
             }
         }
     }
@@ -1676,7 +1689,7 @@ TDuration TClient::CheckPermissionsForQuery(
         if (tableInfoOrError.IsOK()) {
             const auto& tableInfo = tableInfoOrError.Value();
             if (tableInfo->UpstreamReplicaId) {
-                error <<= TErrorAttribute("replica_path", tableInfo->PhysicalPath);
+                error.Add("replica_path", tableInfo->PhysicalPath);
             }
         }
 
@@ -3157,7 +3170,6 @@ IUnversionedRowsetPtr TClient::DoPullQueueViaTabletNodeApi(
     ValidateTabletMountedOrFrozen(tableInfo, tabletInfo);
     auto channel = GetReadCellChannelOrThrow(tabletInfo->CellId);
     TQueryServiceProxy proxy(channel);
-    proxy.SetDefaultTimeout(options.Timeout.value_or(Connection_->GetConfig()->DefaultFetchTableRowsTimeout));
 
     auto req = proxy.FetchTableRows();
     ToProto(req->mutable_tablet_id(), tabletInfo->TabletId);
@@ -3168,6 +3180,12 @@ IUnversionedRowsetPtr TClient::DoPullQueueViaTabletNodeApi(
     req->set_max_row_count(rowBatchReadOptions.MaxRowCount);
     req->set_max_data_weight(rowBatchReadOptions.MaxDataWeight);
     ToProto(req->mutable_options()->mutable_workload_descriptor(), options.WorkloadDescriptor);
+
+    const auto& connectionConfig = Connection_->GetConfig();
+    req->SetTimeout(options.Timeout.value_or(connectionConfig->DefaultFetchTableRowsTimeout));
+    if (connectionConfig->PullQueueResponseCodec.has_value()) {
+        req->SetResponseCodec(connectionConfig->PullQueueResponseCodec.value());
+    }
 
     auto rsp = WaitFor(req->Invoke())
         .ValueOrThrow();
@@ -4272,7 +4290,6 @@ IPrerequisitePtr TClient::DoAttachChaosLease(
     TChaosLeaseId chaosLeaseId,
     const TChaosLeaseAttachOptions& options)
 {
-    auto channel = GetChaosChannelByObjectIdOrThrow(chaosLeaseId);
     auto timeoutPath = Format("%v/@timeout", FromObjectId(chaosLeaseId));
     auto timeoutNode = WaitFor(GetNode(timeoutPath, {}))
         .ValueOrThrow();
@@ -4280,7 +4297,6 @@ IPrerequisitePtr TClient::DoAttachChaosLease(
 
     auto chaosLease = CreateChaosLease(
         this,
-        std::move(channel),
         chaosLeaseId,
         timeout,
         options.PingAncestors,
@@ -4298,6 +4314,22 @@ IPrerequisitePtr TClient::DoStartChaosLease(
     const TChaosLeaseStartOptions& /*options*/)
 {
     THROW_ERROR_EXCEPTION("Use CreateNode to start chaos leases");
+}
+
+void TClient::DoPingChaosLease(
+    TChaosLeaseId chaosLeaseId,
+    const TChaosLeasePingOptions& options)
+{
+    auto channel = GetChaosChannelByObjectIdOrThrow(chaosLeaseId);
+    auto proxy = TChaosNodeServiceProxy(std::move(channel));
+
+    auto req = proxy.PingChaosLease();
+    req->SetTimeout(options.Timeout.value_or(Connection_->GetConfig()->DefaultChaosNodeServiceTimeout));
+    ToProto(req->mutable_chaos_lease_id(), chaosLeaseId);
+    req->set_ping_ancestors(options.PingAncestors);
+
+    WaitFor(req->Invoke())
+        .ThrowOnError();
 }
 
 ////////////////////////////////////////////////////////////////////////////////

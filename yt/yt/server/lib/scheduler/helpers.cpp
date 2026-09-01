@@ -43,6 +43,23 @@ ui64 EntropyFromAllocationId(TAllocationId allocationId)
     return allocationId.Underlying().Parts64[1];
 }
 
+bool CheckAllocationId(TAllocationId allocationId, TNodeId nodeId)
+{
+    return TypeFromId(allocationId.Underlying()) == EObjectType::SchedulerJob &&
+        NodeIdFromAllocationId(allocationId) == nodeId;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TAllocationIdGenerator::TAllocationIdGenerator(TCellTag cellTag)
+    : CellTag_(cellTag)
+{ }
+
+TAllocationId TAllocationIdGenerator::Generate(TNodeId nodeId) const
+{
+    return GenerateAllocationId(CellTag_, nodeId);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 TSerializableAccessControlList MakeOperationArtifactAcl(const TSerializableAccessControlList& acl)
@@ -123,7 +140,9 @@ void MaybeDelay(const TDelayConfigPtr& delayConfig, const TLogger* logger)
     if (delayConfig) {
         if (logger) {
             const auto& Logger = *logger;
-            YT_LOG_DEBUG("Making test delay (Duration: %v, Type: %v)", delayConfig->Duration, delayConfig->Type);
+            YT_TLOG_DEBUG("Making test delay")
+                .With("Duration", delayConfig->Duration)
+                .With("Type", delayConfig->Type);
         }
 
         Delay(delayConfig->Duration, delayConfig->Type);

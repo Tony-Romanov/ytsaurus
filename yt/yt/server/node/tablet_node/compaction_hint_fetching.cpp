@@ -19,6 +19,24 @@ using namespace NTracing;
 
 ////////////////////////////////////////////////////////////////////////////////
 
+TCompactionHintFetchThrottlers::TCompactionHintFetchThrottlers(
+    const NLsm::TStoreCompactionHintArray<TCompactionHintFetcherConfigPtr>& configs)
+{
+    for (auto [storeKind, partitionKind] : NLsm::StoreCompactionHintKinds) {
+        RequestThrottlers_[storeKind] = CreateReconfigurableThroughputThrottler(configs[storeKind]->RequestThrottler);
+    }
+}
+
+void TCompactionHintFetchThrottlers::Reconfigure(
+    const NLsm::TStoreCompactionHintArray<TCompactionHintFetcherConfigPtr>& configs)
+{
+    for (auto [storeKind, partitionKind] : NLsm::StoreCompactionHintKinds) {
+        RequestThrottlers_[storeKind]->Reconfigure(configs[storeKind]->RequestThrottler);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 TCompactionHintFetchPipeline::TCompactionHintFetchPipeline(TSortedChunkStore* store)
     : Store_(store)
 { }
@@ -39,9 +57,9 @@ void TCompactionHintFetchPipeline::Fetch()
 
     const auto& Logger = GetFetcher()->Context().Logger;
 
-    YT_LOG_DEBUG("Requesting compaction hint for store (StoreId: %v, ChunkId: %v)",
-        Store_->GetId(),
-        Store_->GetChunkId());
+    YT_TLOG_DEBUG("Requesting compaction hint for store")
+        .With("StoreId", Store_->GetId())
+        .With("ChunkId", Store_->GetChunkId());
 
     DoFetch();
 }
@@ -62,9 +80,9 @@ void TCompactionHintFetchPipeline::OnStoreHasNoHint()
 {
     const auto& Logger = GetFetcher()->Context().Logger;
 
-    YT_LOG_DEBUG("No compaction hint for store (StoreId: %v, ChunkId: %v)",
-        Store_->GetId(),
-        Store_->GetChunkId());
+    YT_TLOG_DEBUG("No compaction hint for store")
+        .With("StoreId", Store_->GetId())
+        .With("ChunkId", Store_->GetChunkId());
 
     auto* partition = Store_->GetPartition();
 
@@ -78,9 +96,9 @@ void TCompactionHintFetchPipeline::FinishFetch(NLsm::TStoreCompactionHint::TPayl
     const auto& context = GetFetcher()->Context();
     const auto& Logger = context.Logger;
 
-    YT_LOG_DEBUG("Finished fetching compaction hint for store (StoreId: %v, ChunkId: %v)",
-        Store_->GetId(),
-        Store_->GetChunkId());
+    YT_TLOG_DEBUG("Finished fetching compaction hint for store")
+        .With("StoreId", Store_->GetId())
+        .With("ChunkId", Store_->GetChunkId());
 
     Payload_ = std::move(payload);
 
@@ -97,9 +115,10 @@ void TCompactionHintFetchPipeline::OnRequestFailed(const TError& error)
     const auto& context = GetFetcher()->Context();
     const auto& Logger = context.Logger;
 
-    YT_LOG_WARNING(error, "Failed to fetch compaction hint for store, retry (StoreId: %v, ChunkId: %v)",
-        Store_->GetId(),
-        Store_->GetChunkId());
+    YT_TLOG_WARNING("Failed to fetch compaction hint for store, retry")
+        .With("StoreId", Store_->GetId())
+        .With("ChunkId", Store_->GetChunkId())
+        .With(error);
 
     context.FailedRequestCount.Increment();
 
@@ -118,12 +137,13 @@ TCompactionHintFetcher::TCompactionHintFetcher(
     TTabletCellId cellId,
     TLogger logger,
     const TProfiler& profiler,
-    TCompactionHintFetcherConfigPtr config)
+    TCompactionHintFetcherConfigPtr config,
+    IReconfigurableThroughputThrottlerPtr requestThrottler)
     : Config_(std::move(config))
     , Profiler_(profiler.WithTag("cell_id", ToString(cellId)))
     , RequestCount_(Profiler_.Counter("/request_count"))
     , ThrottledRequestCount_(Profiler_.Counter("/throttled_request_count"))
-    , RequestThrottler_(CreateReconfigurableThroughputThrottler(Config_->RequestThrottler))
+    , RequestThrottler_(std::move(requestThrottler))
     , Context_{
         .FinishedRequestCount = Profiler_.Counter("/finished_request_count"),
         .FailedRequestCount = Profiler_.Counter("/failed_request_count"),
@@ -139,7 +159,7 @@ void TCompactionHintFetcher::Start(IInvokerPtr epochAutomatonInvoker, TCompactio
     YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
     YT_VERIFY(IsStopped());
 
-    YT_LOG_DEBUG("Starting compaction hint fetcher");
+    YT_TLOG_DEBUG("Starting compaction hint fetcher");
 
     Config_ = std::move(config);
 
@@ -148,8 +168,6 @@ void TCompactionHintFetcher::Start(IInvokerPtr epochAutomatonInvoker, TCompactio
         BIND(&TCompactionHintFetcher::ExecuteEnqueuedPipelines, MakeWeak(this)),
         Config_->PeriodicExecutor);
     FetchingExecutor_->Start();
-
-    RequestThrottler_->Reconfigure(Config_->RequestThrottler);
 }
 
 void TCompactionHintFetcher::Stop()
@@ -161,7 +179,7 @@ void TCompactionHintFetcher::Stop()
         return;
     }
 
-    YT_LOG_DEBUG("Stopping compaction hint fetcher");
+    YT_TLOG_DEBUG("Stopping compaction hint fetcher");
 
     YT_VERIFY(FetchingExecutor_->Stop().IsSet());
     FetchingExecutor_.Reset();
@@ -175,13 +193,11 @@ void TCompactionHintFetcher::Reconfigure(const TCompactionHintFetcherConfigPtr& 
         return;
     }
 
-    YT_LOG_DEBUG("Reconfigure compaction hint fetcher");
+    YT_TLOG_DEBUG("Reconfigure compaction hint fetcher");
 
     Config_ = config;
 
     FetchingExecutor_->SetOptions(Config_->PeriodicExecutor);
-
-    RequestThrottler_->Reconfigure(Config_->RequestThrottler);
 }
 
 void TCompactionHintFetcher::EnqueuePipeline(const TCompactionHintFetchPipelinePtr& pipeline)
@@ -210,26 +226,20 @@ void TCompactionHintFetcher::ExecuteEnqueuedPipelines()
         return;
     }
 
-    i64 limit = RequestThrottler_->TryAcquireAvailable(std::numeric_limits<i64>::max());
-
-    if (limit == 0) {
-        ThrottledRequestCount_.Increment();
-        return;
-    }
-
-    i64 remainingLimit = limit;
-    for (; remainingLimit > 0; --remainingLimit) {
-        // NB(dave11ar): Be careful!
-        // Fetch can cancel fetching of other pipelines and remove element from Pipelines_.
-        if (Pipelines_.Empty()) {
+    i64 requestCount = 0;
+    while (!Pipelines_.Empty()) {
+        if (RequestThrottler_->TryAcquireAvailable(1) == 0) {
+            ThrottledRequestCount_.Increment();
             break;
         }
 
+        // NB(dave11ar): Be careful!
+        // Fetch can cancel fetching of other pipelines and remove element from Pipelines_.
         Pipelines_.PopBack()->Fetch();
+        ++requestCount;
     }
 
-    RequestThrottler_->Release(remainingLimit);
-    RequestCount_.Increment(limit - remainingLimit);
+    RequestCount_.Increment(requestCount);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

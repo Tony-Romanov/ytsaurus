@@ -3566,6 +3566,20 @@ THashMap<TString, TPragmaDescr> PragmaDescrs{
         },
     }),
     TableElemExt({
+        .CanonicalName = "UdfBridge",
+        .IsYqlSelectCompatible = true,
+        .Cb = [](CB_SIG) -> TMaybe<TNodePtr> {
+            auto& ctx = query.Context();
+            if (!values.empty() || pragmaValueDefault) {
+                query.Error() << "Expected no pragma arguments";
+                return {};
+            }
+            return BuildPragma(ctx.Pos(), TString(ConfigProviderName), "flags",
+                               TVector<TDeferredAtom>{TDeferredAtom(ctx.Pos(), TString("UdfBridge"))},
+                               /*valueDefault=*/false);
+        },
+    }),
+    TableElemExt({
         .CanonicalName = "Library",
         .IsYqlSelectCompatible = true,
         .Cb = [](CB_SIG) -> TMaybe<TNodePtr> {
@@ -4962,7 +4976,7 @@ TSourcePtr TSqlQuery::Build(const TRule_multiple_column_assignment& stmt) {
     FillTargetList(*this, stmt.GetRule_set_target_list1(), targetList);
 
     const TPosition pos(Ctx_.Pos());
-    auto parenthesis = stmt.GetRule_smart_parenthesis3();
+    const auto& parenthesis = stmt.GetRule_smart_parenthesis3();
 
     TNodePtr node = TSqlExpression(*this).BuildSourceOrNode(parenthesis);
     if (TSourcePtr source = MoveOutIfSource(node)) {

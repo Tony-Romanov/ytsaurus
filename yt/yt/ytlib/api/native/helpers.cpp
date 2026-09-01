@@ -7,12 +7,17 @@
 #include <yt/yt/ytlib/auth/native_authenticator.h>
 #include <yt/yt/ytlib/auth/native_authentication_manager.h>
 
+#include <yt/yt/ytlib/chunk_client/chunk_reader_options.h>
+
 #include <yt/yt/ytlib/hive/cluster_directory.h>
+#include <yt/yt/ytlib/hive/config.h>
 
 #include <yt/yt/ytlib/scheduler/scheduler_service_proxy.h>
 
 #include <yt/yt/ytlib/security_client/permission_cache.h>
 #include <yt/yt/ytlib/security_client/user_attribute_cache.h>
+
+#include <yt/yt/client/table_client/config.h>
 
 #include <yt/yt/client/tablet_client/table_mount_cache.h>
 
@@ -29,12 +34,14 @@ const auto& Logger = NativeConnectionLogger;
 ////////////////////////////////////////////////////////////////////////////////
 
 using namespace NAuth;
+using namespace NChunkClient;
 using namespace NConcurrency;
 using namespace NLogging;
 using namespace NObjectClient;
 using namespace NRpc;
 using namespace NSecurityClient;
 using namespace NScheduler;
+using namespace NTableClient;
 using namespace NTabletClient;
 using namespace NYPath;
 using namespace NYTree;
@@ -106,15 +113,40 @@ TAllocationBriefInfo ParseGetBreifAllocationInfoResponse(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-bool IsValidSourceTvmId(const IConnectionPtr& connection, TTvmId tvmId)
+TError ValidateSourceTvmId(const IConnectionPtr& connection, TTvmId tvmId)
 {
-    return tvmId == connection->GetConfig()->TvmId || connection->GetClusterDirectory()->HasTvmId(tvmId);
+    if (tvmId == connection->GetConfig()->TvmId) {
+        return {};
+    }
+
+    const auto& clusterDirectory = connection->GetClusterDirectory();
+
+    // NB: lastUpdateTime is set after populating clusterDirectory, read it before probing tvmId.
+    auto lastUpdateTime = clusterDirectory->GetLastSuccessfulUpdateTime();
+    if (clusterDirectory->HasTvmId(tvmId)) {
+        return {};
+    }
+
+    const auto& synchronizerConfig = connection->GetConfig()->ClusterDirectorySynchronizer;
+    auto maxStaleness = synchronizerConfig->SyncPeriod * synchronizerConfig->TvmIdRejectionStalenessMultiplier;
+    if (!lastUpdateTime || TInstant::Now() - *lastUpdateTime > maxStaleness) {
+        return TError(
+            NRpc::EErrorCode::TransientFailure,
+            "Cannot validate source TVM id %v since cluster directory has not been synchronized recently",
+            tvmId)
+            .With("last_successful_update_time", lastUpdateTime);
+    }
+
+    return TError(
+        NRpc::EErrorCode::AuthenticationError,
+        "Source TVM id %v is rejected",
+        tvmId);
 }
 
 IAuthenticatorPtr CreateNativeAuthenticator(const IConnectionPtr& connection)
 {
     return NAuth::CreateNativeAuthenticator([connection] (TTvmId tvmId) {
-        return IsValidSourceTvmId(connection, tvmId);
+        return ValidateSourceTvmId(connection, tvmId);
     });
 }
 
@@ -350,6 +382,23 @@ TFuture<bool> IsUserBanned(const IConnectionPtr& connection, const std::string& 
             YT_VERIFY(attributes);
             return attributes->Banned;
         }));
+}
+
+TClientChunkReadOptions MakeChunkReadOptions(
+    TReadSessionId readSessionId,
+    IMemoryUsageTrackerPtr memoryUsageTracker,
+    const TTableReaderConfigPtr& tableReaderConfig,
+    const TYPath& yPath)
+{
+    auto chunkReadOptions = TClientChunkReadOptions{
+        .WorkloadDescriptor = tableReaderConfig->WorkloadDescriptor,
+        .ReadSessionId = readSessionId,
+        .MemoryUsageTracker = std::move(memoryUsageTracker),
+    };
+    if (!yPath.empty()) {
+        chunkReadOptions.WorkloadDescriptor.Annotations.push_back(Format("TablePath: %v", yPath));
+    }
+    return chunkReadOptions;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

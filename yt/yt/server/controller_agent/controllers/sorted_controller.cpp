@@ -14,14 +14,14 @@
 #include <yt/yt/server/controller_agent/operation.h>
 
 #include <yt/yt/server/lib/chunk_pools/chunk_pool.h>
-#include <yt/yt/server/lib/chunk_pools/new_sorted_chunk_pool.h>
+#include <yt/yt/server/lib/chunk_pools/sorted_chunk_pool.h>
 
 #include <yt/yt/ytlib/chunk_client/chunk_meta_extensions.h>
 #include <yt/yt/ytlib/chunk_client/chunk_scraper.h>
+#include <yt/yt/ytlib/chunk_client/data_slice.h>
 #include <yt/yt/ytlib/chunk_client/input_chunk.h>
 #include <yt/yt/ytlib/chunk_client/input_chunk_slice.h>
 #include <yt/yt/ytlib/chunk_client/job_spec_extensions.h>
-#include <yt/yt/ytlib/chunk_client/legacy_data_slice.h>
 
 #include <yt/yt/ytlib/controller_agent/proto/job.pb.h>
 
@@ -119,7 +119,7 @@ protected:
             , Controller_(controller)
             , Options_(controller->GetSortedChunkPoolOptions())
         {
-            ChunkPool_ = CreateNewSortedChunkPool(
+            ChunkPool_ = CreateSortedChunkPool(
                 Options_,
                 controller->CreateChunkSliceFetcherFactory(),
                 controller->GetInputStreamDirectory());
@@ -163,14 +163,12 @@ protected:
             return TotalOutputRowCount_;
         }
 
-        void AdjustDataSliceForPool(const TLegacyDataSlicePtr& dataSlice) const override
+        void AdjustDataSliceForPool(const TDataSlicePtr& dataSlice) const override
         {
             // Consider the following case as an example: we are running reduce over a sorted table
             // with two key columns [key, subkey] and a range >[5, foo]:<=[7, bar]. From the
             // pool's point of this slice covers a range >=[5]:<=[7] (note that boundaries become inclusive
             // when truncated).
-
-            YT_VERIFY(!dataSlice->IsLegacy);
 
             auto inputStreamDescriptor = Controller_->GetInputStreamDirectory().GetDescriptor(dataSlice->GetInputStreamIndex());
 
@@ -320,7 +318,7 @@ protected:
     TSortColumns ForeignSortColumns_;
 
     // TODO(max42): YT-14081.
-    // New sorted pool performs unwanted cuts even for small tests. In order to overcome that,
+    // The sorted pool may cut even small inputs. To account for that,
     // we consider total data slice weight instead of total chunk data weight.
     i64 TotalPrimaryInputDataSliceWeight_ = 0;
     i64 TotalForeignInputDataSliceWeight_ = 0;
@@ -387,11 +385,10 @@ protected:
 
         InputSliceDataWeight_ = JobSizeConstraints_->GetInputSliceDataWeight();
 
-        YT_LOG_INFO(
-            "Calculated operation parameters (JobCount: %v, MaxDataWeightPerJob: %v, InputSliceDataWeight: %v)",
-            JobSizeConstraints_->GetJobCount(),
-            JobSizeConstraints_->GetMaxDataWeightPerJob(),
-            InputSliceDataWeight_);
+        YT_TLOG_INFO("Calculated operation parameters")
+            .With("JobCount", JobSizeConstraints_->GetJobCount())
+            .With("MaxDataWeightPerJob", JobSizeConstraints_->GetMaxDataWeightPerJob())
+            .With("InputSliceDataWeight", InputSliceDataWeight_);
     }
 
     void CustomPrepare() override
@@ -451,7 +448,7 @@ protected:
         }
     }
 
-    TChunkStripePtr CreateChunkStripe(TLegacyDataSlicePtr dataSlice)
+    TChunkStripePtr CreateChunkStripe(TDataSlicePtr dataSlice)
     {
         auto chunkStripe = New<TChunkStripe>(InputManager_->GetInputTables()[dataSlice->GetTableIndex()]->IsForeign());
         chunkStripe->DataSlices().push_back(std::move(dataSlice));
@@ -461,7 +458,7 @@ protected:
     void ProcessInputs()
     {
         YT_PROFILE_TIMING("/operations/merge/input_processing_time") {
-            YT_LOG_INFO("Processing inputs");
+            YT_TLOG_INFO("Processing inputs");
 
             auto yielder = CreatePeriodicYielder(PrepareYieldPeriod);
 
@@ -475,9 +472,8 @@ protected:
                 const auto& comparator = InputManager_->GetInputTables()[chunk->GetTableIndex()]->Comparator;
                 YT_VERIFY(comparator);
 
-                const auto& dataSlice = CreateUnversionedInputDataSlice(CreateInputChunkSlice(chunk));
+                const auto& dataSlice = CreateUnversionedInputDataSlice(CreateInputChunkSlice(chunk, RowBuffer_, comparator));
                 dataSlice->SetInputStreamIndex(InputStreamDirectory_.GetInputStreamIndex(chunk->GetTableIndex(), chunk->GetRangeIndex()));
-                dataSlice->TransformToNew(RowBuffer_, comparator.GetLength());
                 InferLimitsFromBoundaryKeys(dataSlice, RowBuffer_, comparator);
 
                 TotalPrimaryInputDataSliceWeight_ += dataSlice->GetDataWeight();
@@ -488,15 +484,6 @@ protected:
                 yielder.TryYield();
             }
             for (const auto& slice : CollectPrimaryVersionedDataSlices(InputSliceDataWeight_)) {
-                // If we keep chunk slice limits at this point, they will be transformed to legacy
-                // limits back and forth in legacy sorted chunk pool. Right now it breaks them, e.g.
-                // >=[1,1] -> [1,1] -> >[1]. I am not completely sure how to fix that properly, so
-                // I am removing chunk slice limits as a workaround until YT-13880.
-                for (const auto& chunkSlice : slice->ChunkSlices) {
-                    chunkSlice->LowerLimit() = TInputSliceLimit();
-                    chunkSlice->UpperLimit() = TInputSliceLimit();
-                }
-
                 SortedTask_->AddInput(CreateChunkStripe(slice));
 
                 TotalPrimaryInputDataSliceWeight_ += slice->GetDataWeight();
@@ -517,10 +504,10 @@ protected:
                 }
             }
 
-            YT_LOG_INFO("Processed inputs (PrimaryUnversionedSlices: %v, PrimaryVersionedSlices: %v, ForeignSlices: %v)",
-                primaryUnversionedSlices,
-                primaryVersionedSlices,
-                foreignSlices);
+            YT_TLOG_INFO("Processed inputs")
+                .With("PrimaryUnversionedSlices", primaryUnversionedSlices)
+                .With("PrimaryVersionedSlices", primaryVersionedSlices)
+                .With("ForeignSlices", foreignSlices);
         }
     }
 
@@ -562,11 +549,6 @@ protected:
                 }
             }
         }
-    }
-
-    virtual bool ShouldSlicePrimaryTableByKeys() const
-    {
-        return true;
     }
 
     virtual i64 GetMinTeleportChunkSize()  = 0;
@@ -668,7 +650,6 @@ protected:
         jobOptions.ForeignComparator = GetComparator(ForeignSortColumns_);
         jobOptions.PrimaryPrefixLength = PrimarySortColumns_.size();
         jobOptions.ForeignPrefixLength = ForeignSortColumns_.size();
-        jobOptions.ShouldSlicePrimaryTableByKeys = ShouldSlicePrimaryTableByKeys();
         jobOptions.MaxTotalSliceCount = Config_->MaxTotalSliceCount;
         jobOptions.EnablePeriodicYielder = true;
 
@@ -800,11 +781,6 @@ public:
         , Spec_(spec)
     { }
 
-    bool ShouldSlicePrimaryTableByKeys() const override
-    {
-        return true;
-    }
-
     bool IsRowCountPreserved() const override
     {
         return !Spec_->Sampling->SamplingRate &&
@@ -833,12 +809,12 @@ public:
     void AdjustSortColumns() override
     {
         const auto& specSortColumns = Spec_->MergeBy;
-        YT_LOG_INFO("Spec sort columns obtained (SortColumns: %v)",
-            specSortColumns);
+        YT_TLOG_INFO("Spec sort columns obtained")
+            .With("SortColumns", specSortColumns);
 
         PrimarySortColumns_ = CheckInputTablesSorted(specSortColumns);
-        YT_LOG_INFO("Sort columns adjusted (SortColumns: %v)",
-            PrimarySortColumns_);
+        YT_TLOG_INFO("Sort columns adjusted")
+            .With("SortColumns", PrimarySortColumns_);
     }
 
     TSortedChunkPoolOptions GetSortedChunkPoolOptions() override
@@ -1003,10 +979,11 @@ protected:
         if (!interrupted) {
             auto isNontrivialInput = InputHasReadLimits() || InputHasVersionedTables();
             if (!isNontrivialInput && IsRowCountPreserved() && Spec_->ForceTransform) {
-                YT_LOG_ERROR_IF(EstimatedInputStatistics_->RowCount != SortedTask_->GetTotalOutputRowCount(),
-                    "Input/output row count mismatch in sorted merge operation (TotalEstimatedInputRowCount: %v, TotalOutputRowCount: %v)",
-                    EstimatedInputStatistics_->RowCount,
-                    SortedTask_->GetTotalOutputRowCount());
+                YT_TLOG_ERROR_IF(
+                    EstimatedInputStatistics_->RowCount != SortedTask_->GetTotalOutputRowCount(),
+                    "Input/output row count mismatch in sorted merge operation")
+                    .With("TotalEstimatedInputRowCount", EstimatedInputStatistics_->RowCount)
+                    .With("TotalOutputRowCount", SortedTask_->GetTotalOutputRowCount());
                 YT_VERIFY(EstimatedInputStatistics_->RowCount == SortedTask_->GetTotalOutputRowCount());
             }
         }
@@ -1270,11 +1247,6 @@ public:
         return TConfigurator<TReduceOperationSpec>();
     }
 
-    bool ShouldSlicePrimaryTableByKeys() const override
-    {
-        return *Spec_->EnableKeyGuarantee;
-    }
-
     EJobType GetJobType() const override
     {
         return *Spec_->EnableKeyGuarantee ? EJobType::SortedReduce : EJobType::JoinReduce;
@@ -1287,11 +1259,11 @@ public:
 
     void AdjustSortColumns() override
     {
-        YT_LOG_INFO("Adjusting sort columns (EnableKeyGuarantee: %v, ReduceBy: %v, SortBy: %v, JoinBy: %v)",
-            *Spec_->EnableKeyGuarantee,
-            Spec_->ReduceBy,
-            Spec_->SortBy,
-            Spec_->JoinBy);
+        YT_TLOG_INFO("Adjusting sort columns")
+            .With("EnableKeyGuarantee", *Spec_->EnableKeyGuarantee)
+            .With("ReduceBy", Spec_->ReduceBy)
+            .With("SortBy", Spec_->SortBy)
+            .With("JoinBy", Spec_->JoinBy);
 
         if (*Spec_->EnableKeyGuarantee) {
             auto specKeyColumns = Spec_->SortBy.empty() ? Spec_->ReduceBy : Spec_->SortBy;
@@ -1347,10 +1319,10 @@ public:
                 return table->IsPrimary();
             });
         }
-        YT_LOG_INFO("Sort columns adjusted (PrimarySortColumns: %v, ForeignSortColumns: %v, SortColumns: %v)",
-            PrimarySortColumns_,
-            ForeignSortColumns_,
-            SortColumns_);
+        YT_TLOG_INFO("Sort columns adjusted")
+            .With("PrimarySortColumns", PrimarySortColumns_)
+            .With("ForeignSortColumns", ForeignSortColumns_)
+            .With("SortColumns", SortColumns_);
 
         if (!Spec_->PivotKeys.empty()) {
             if (!*Spec_->EnableKeyGuarantee) {
@@ -1426,7 +1398,7 @@ private:
         options.SliceForeignChunks = Spec_->SliceForeignChunks;
         options.SortedJobOptions.ConsiderOnlyPrimarySize = Spec_->ConsiderOnlyPrimarySize;
         if (Spec_->MinManiacDataWeight && IsKeyGuaranteeEnabled()) {
-            YT_LOG_INFO("Ignoring min_maniac_data_weight since key guarantee is enabled");
+            YT_TLOG_INFO("Ignoring min_maniac_data_weight since key guarantee is enabled");
         } else {
             options.MinManiacDataWeight = Spec_->MinManiacDataWeight;
         }

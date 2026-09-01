@@ -22,6 +22,7 @@
 
 #include <yt/yt/client/api/client.h>
 #include <yt/yt/client/api/transaction.h>
+#include <yt/yt/client/tablet_client/public.h>
 
 #include <yt/yt/client/transaction_client/helpers.h>
 #include <yt/yt/client/transaction_client/timestamp_provider.h>
@@ -58,6 +59,14 @@ using NTransactionClient::ETransactionType;
 ////////////////////////////////////////////////////////////////////////////////
 
 constinit const auto Logger = ControllerLogger;
+
+////////////////////////////////////////////////////////////////////////////////
+
+//! Shape of the derived leadership warm-up, see #GetLeadershipWarmupTimeout. The factor leaves room
+//! for a discovery tick missed just before the address was published (the executor is jittered), the
+//! extra time covers the RPC latency and the registration stampede of a large fleet.
+static constexpr int LeadershipWarmupPeriodFactor = 2;
+static constexpr auto LeadershipWarmupExtraTime = TDuration::Seconds(5);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -121,6 +130,15 @@ TFlowEphemeralStatePtr ComputeInitialEphemeralState(
     }
     ephemeralState->PipelinePath = pipelinePath;
     return ephemeralState;
+}
+
+//! Revokes every partition's dynamic partition spec, so no job starts until a traverse
+//! reissues it — the same gate a fresh #ComputeInitialEphemeralState arms after a restart.
+void ResetDynamicPartitionSpecs(const TFlowEphemeralStatePtr& ephemeralState)
+{
+    for (const auto& [partitionId, partitionState] : ephemeralState->Partitions) {
+        partitionState->DynamicPartitionSpec = New<TDynamicPartitionSpec>();
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -329,6 +347,8 @@ public:
             TProfiler Profiler;
 
             TGauge Unknown = Profiler.Gauge("/unknown");
+            TGauge Failed = Profiler.Gauge("/failed");
+            TGauge GracefullyMoving = Profiler.Gauge("/gracefully_moving");
             TGauge Preparing = Profiler.Gauge("/preparing");
             TGauge WorkingYoung = Profiler.Gauge("/working_young");
             TGauge WorkingOld = Profiler.Gauge("/working_old");
@@ -419,7 +439,11 @@ public:
         , Invoker_(invoker)
         , MainCycleInvoker_(mainCycleInvoker)
         , ThrottlerHost_(std::move(throttlerHost))
-        , LeaseManager_(CreateLeaseManager(Connector_, Config_->LeaseManager))
+        , LeaseManager_(CreateLeaseManager(
+            Connector_,
+            Config_->LeaseManager,
+            Config_->ElectionManager.GetType() == EElectionBackend::Dyntable,
+            Config_->PersistedStateManager->MaxWritesPerTransaction))
         , MutationMetrics_(Profiler_)
         , CurrentEpochGauge_(Profiler_.Gauge("/current_epoch"))
         , ComputationCountGauge_(Profiler_.Gauge("/computation_count"))
@@ -508,7 +532,7 @@ public:
         flowState->CurrentTimestamp = WaitFor(TimeProvider_->GetTimestamp(/*barrier*/ true))
             .ValueOrThrow();
 
-        if (!UpdateSpecs(flowState, spec, dynamicSpec)) {
+        if (!UpdateSpecs(flowView, spec, dynamicSpec)) {
             YT_TLOG_WARNING("No job manager, fast stop");
             auto context = New<TJobManagerContext>();
             context->ClientsCache = Connector_->GetClientsCache();
@@ -738,10 +762,14 @@ private:
 
     bool FlowCoreTargetMatched_ = true;
 
-    bool UpdateSpecs(const TFlowStatePtr& flowState, const TVersionedPipelineSpecPtr& spec, const TVersionedDynamicPipelineSpecPtr& dynamicSpec)
+    bool UpdateSpecs(const TFlowViewPtr& flowView, const TVersionedPipelineSpecPtr& spec, const TVersionedDynamicPipelineSpecPtr& dynamicSpec)
     {
-        const auto& executionSpec = flowState->ExecutionSpec;
-        if (executionSpec->PipelineSpec->GetVersion() != spec->GetVersion() || !JobManager_) {
+        const auto& executionSpec = flowView->State->ExecutionSpec;
+        const bool specVersionChanged = executionSpec->PipelineSpec->GetVersion() != spec->GetVersion();
+        if (specVersionChanged) {
+            ResetDynamicPartitionSpecs(flowView->EphemeralState);
+        }
+        if (specVersionChanged || !JobManager_) {
             executionSpec->PipelineSpec = spec;
             executionSpec->ExtendedPipelineSpec->TrySetValue(BuildExtendedPipelineSpec(executionSpec->PipelineSpec->GetValue()), VersionProvider_);
             UpdateStreamSpecStorageState(executionSpec->StreamSpecStorageState, *spec->GetValue(), TimeProvider_, VersionProvider_);
@@ -754,7 +782,7 @@ private:
                 context->TimeProvider = TimeProvider_;
                 context->VersionProvider = VersionProvider_;
                 context->StatusProfiler = StatusProfiler_->WithPrefix("/job_manager");
-                JobManager_ = CreateJobManager(std::move(context), executionSpec->PipelineSpec->GetValue(), executionSpec->DynamicPipelineSpec->GetValue(), flowState->JobManagerState, PipelineAuthenticator_);
+                JobManager_ = CreateJobManager(std::move(context), executionSpec->PipelineSpec->GetValue(), executionSpec->DynamicPipelineSpec->GetValue(), flowView->State->JobManagerState, PipelineAuthenticator_);
             } catch (const std::exception& ex) {
                 YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Error, "Failed to create job manager")
                     .With(ex);
@@ -909,11 +937,12 @@ private:
         auto checkLeases = [&] {
             LeaseManager_->CheckLeases(flowView);
         };
-        auto terminateAndPrepareLeases = [&] {
-            LeaseManager_->TerminateStrayLeases(flowView);
-            LeaseManager_->PrepareLeases(flowView);
-        };
         auto stopJobsAndResetState = [&] (EPipelineState newState) {
+            // StopAllJobs empties the layout, which makes every lease stray, so the same call
+            // that revokes them everywhere else revokes them here. It has to happen before the
+            // new state becomes observable: a delayed worker that still holds a valid lease
+            // would commit state and output into a pipeline already seen as paused, stopped or
+            // completed.
             JobManager_->StopAllJobs(flowView);
             LeaseManager_->TerminateStrayLeases(flowView);
             flowView->State->ExecutionSpec->PipelineState->TrySetValue(newState, VersionProvider_);
@@ -929,9 +958,33 @@ private:
         auto state = flowView->State->ExecutionSpec->PipelineState->GetValue();
         checkLeases();
         if (state == EPipelineState::Working || state == EPipelineState::Draining) {
-            manageJobs();
-            terminateAndPrepareLeases();
+            // Job management is held off as a whole, which keeps RemoveLostJobs and DistributeJobs
+            // consistent: a job left pointing at a not-yet-registered worker is exactly what the
+            // latter refuses to distribute.
+            auto warmupLeft = GetLeadershipWarmupLeft(flowView, Connector_->GetLeadershipPublishTime(), TInstant::Now());
+            if (warmupLeft > TDuration::Zero()) {
+                YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Skipping job management during leadership warm-up")
+                    .With("WarmupLeft", warmupLeft)
+                    .With("Jobs", flowView->State->ExecutionSpec->Layout->Jobs.size());
+            } else {
+                manageJobs();
+            }
         }
+        if (state == EPipelineState::Working || state == EPipelineState::Draining) {
+            LeaseManager_->PrepareLeases(flowView);
+        }
+        // After the grants and as late as the lease writes go: manageJobs() has just taken jobs
+        // away from some partitions, and their leases must be gone before this layout is
+        // persisted, or a partition the layout no longer knows about keeps a worker running on it
+        // while its next job starts alongside. Runs in every state — jobs are dropped in all of
+        // them.
+        //
+        // The order only shrinks the window, it does not close it: a revocation is the one lease
+        // write that hurts when the iteration is discarded afterwards, and PersistFlowState can
+        // still lose a row-lock race to a spec update below. The jobs whose leases were revoked
+        // then die on their next commit and are recreated a job-failure cycle later; the fence is
+        // never weakened, only liveness is.
+        LeaseManager_->TerminateStrayLeases(flowView);
         if (state == EPipelineState::Working && JobManager_->CheckPipelineCompleted(flowView)) {
             stopJobsAndResetState(EPipelineState::Completed);
         } else if (state == EPipelineState::Draining && JobManager_->CheckPipelineStopped(flowView)) {
@@ -946,6 +999,8 @@ private:
         struct TCounters
         {
             ui64 Unknown = 0;
+            ui64 Failed = 0;
+            ui64 GracefullyMoving = 0;
             ui64 Preparing = 0;
             ui64 WorkingYoung = 0;
             ui64 WorkingOld = 0;
@@ -995,8 +1050,15 @@ private:
             const auto& status = statusIt->second;
             if (!status->CurrentJobStatus) {
                 handlePartitionWithoutJobStatus();
-            } else if (!status->CurrentJobStatus->Error.IsOK()) {
-                reasonCounters.Unknown += 1;
+            } else if (const auto& error = status->CurrentJobStatus->Error; !error.IsOK()) {
+                // The job is done but still assigned: it is waiting for the controller to drop it
+                // (and, for a graceful move, to recreate it on the target worker). Both are regular
+                // lifecycle states, so keep them apart from a partition with no job at all.
+                if (error.FindMatching(NFlow::EErrorCode::GracefulShutdown)) {
+                    reasonCounters.GracefullyMoving += 1;
+                } else {
+                    reasonCounters.Failed += 1;
+                }
             } else if (!status->CurrentJobStatus->RetryableErrors.empty()) {
                 reasonCounters.WorkingWithRetryableError += 1;
             } else if (!status->CurrentJobStatus->InitedTime.has_value()) {
@@ -1019,6 +1081,8 @@ private:
 
                 auto& reasonMetrics = computationMetrics.ReasonMetrics[reason];
                 reasonMetrics.Unknown.Update(reasonCounters.Unknown);
+                reasonMetrics.Failed.Update(reasonCounters.Failed);
+                reasonMetrics.GracefullyMoving.Update(reasonCounters.GracefullyMoving);
                 reasonMetrics.Preparing.Update(reasonCounters.Preparing);
                 reasonMetrics.WorkingYoung.Update(reasonCounters.WorkingYoung);
                 reasonMetrics.WorkingOld.Update(reasonCounters.WorkingOld);
@@ -1026,6 +1090,8 @@ private:
                 reasonMetrics.Stopped.Update(reasonCounters.Stopped);
 
                 totalCounters.Unknown += reasonCounters.Unknown;
+                totalCounters.Failed += reasonCounters.Failed;
+                totalCounters.GracefullyMoving += reasonCounters.GracefullyMoving;
                 totalCounters.Preparing += reasonCounters.Preparing;
                 totalCounters.WorkingYoung += reasonCounters.WorkingYoung;
                 totalCounters.WorkingOld += reasonCounters.WorkingOld;
@@ -1044,6 +1110,8 @@ private:
             .With("WorkingYoung", totalCounters.WorkingYoung)
             .With("WorkingWithRetryableError", totalCounters.WorkingWithRetryableError)
             .With("Preparing", totalCounters.Preparing)
+            .With("GracefullyMoving", totalCounters.GracefullyMoving)
+            .With("Failed", totalCounters.Failed)
             .With("Unknown", totalCounters.Unknown)
             .With("Stopped", totalCounters.Stopped)
             .With("FlowViewAge", TInstant::Now() - TInstant::Seconds(flowView->State->CurrentTimestamp.Underlying()));
@@ -1401,8 +1469,12 @@ private:
             RootStatusProfiler_);
         WeakLeader_ = leader;
 
+        // The epoch belongs to the leadership this scheduler loop serves: reporting the end of
+        // recovery with it keeps a delayed callback from touching a later leadership.
+        auto leadershipEpoch = Connector_->GetLeadershipEpoch();
+
         auto schedulerActivityContext = TRegularActivityContext{.LeaderProfiler = leaderProfiler, .RootStatusProfiler = RootStatusProfiler_, .ActivityName = "schedule"};
-        YT_UNUSED_FUTURE(BIND([this, this_ = MakeStrong(this), leader, schedulerActivityContext] {
+        YT_UNUSED_FUTURE(BIND([this, this_ = MakeStrong(this), leader, schedulerActivityContext, leadershipEpoch] {
             auto dynamicSpecVersion = TVersion(-1);
             while (true) {
                 try {
@@ -1435,6 +1507,7 @@ private:
                     TDelayedExecutor::WaitForDuration(Config_->WarmUpTime);
 
                     while (true) {
+                        auto pipelineState = EPipelineState::Unknown;
                         try {
                             auto guard = TEventTimerGuard(schedulerActivityContext.IterationTime);
                             {
@@ -1491,10 +1564,35 @@ private:
                                     .With("Version", newFlowView->State->ExecutionSpec->PipelineState->GetVersion())
                                     .With("TargetState", newFlowView->CurrentDynamicSpec->GetValue()->TargetState);
                                 schedulerActivityContext.ErrorState->ClearError();
+                                pipelineState = newFlowView->State->ExecutionSpec->PipelineState->GetValue();
+                                // The iteration committed, so the fenced transactions feed the
+                                // leader lease from here on and the recovery-time renewal must
+                                // stop — but only once the pipeline has a spec. Until then the
+                                // iterations are no-ops throttled by NoSpecIterationBackoff, and
+                                // between two of them nothing else would touch the leader row.
+                                if (pipelineState != EPipelineState::Unknown) {
+                                    Connector_->OnLeaderRecoveryFinished(leadershipEpoch);
+                                }
                             }
                         } catch (const std::exception& ex) {
                             auto error = TError(ex);
-                            if (!error.FindMatching(NFlow::EErrorCode::SpecVersionMismatch) && !error.FindMatching(NFlow::EErrorCode::FlowCoreTargetVersionMismatch)) {
+                            // A row lock conflict is an expected outcome of an iteration, not a
+                            // reason to tear the leader down: with the dyntable backend every
+                            // fenced transaction writes the leader lease row, so an iteration
+                            // racing a client-driven spec update loses it about as often as it
+                            // wins. Restarting the executor thread would rebuild the leader and
+                            // leave its flow view keeper uninitialized for everybody else; the
+                            // next iteration simply redoes the work.
+                            // A tablet in the middle of a smooth movement is the same kind of
+                            // outcome: it rejects the commit, moves, and is back within seconds.
+                            // Restarting the executor over it costs a full flow view rebuild, and
+                            // on a pipeline whose iteration runs for minutes that turns a routine
+                            // tablet move into a controller that never finishes an iteration.
+                            if (!error.FindMatching(NFlow::EErrorCode::SpecVersionMismatch) &&
+                                !error.FindMatching(NFlow::EErrorCode::FlowCoreTargetVersionMismatch) &&
+                                !error.FindMatching(NTabletClient::EErrorCode::TransactionLockConflict) &&
+                                !IsTransientTabletError(error))
+                            {
                                 THROW_ERROR_EXCEPTION("Schedule iteration failed")
                                     .With(error);
                             }
@@ -1503,7 +1601,9 @@ private:
                             YT_TLOG_EVENT(PublicControllerLogger, NLogging::ELogLevel::Warning, "Schedule iteration failed")
                                 .With(error);
                         }
-                        TDelayedExecutor::WaitForDuration(Config_->SchedulerPeriod);
+                        TDelayedExecutor::WaitForDuration(pipelineState == EPipelineState::Unknown
+                                ? std::max(Config_->SchedulerPeriod, NoSpecIterationBackoff)
+                                : Config_->SchedulerPeriod);
                         schedulerActivityContext.TotalIterations.Increment();
                     }
                 } catch (const std::exception& ex) {
@@ -1763,6 +1863,41 @@ IControllerPtr CreateController(
         ignoreSingletonsDynamicConfig,
         clockClusterTag,
         std::move(rootStatusProfiler));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TDuration GetLeadershipWarmupTimeout(const TDynamicPipelineSpecPtr& dynamicSpec)
+{
+    const auto& connector = dynamicSpec->ControllerConnector;
+
+    auto timeout =
+        (connector->ControllerDiscoverPeriod + connector->ControllerHeartbeatPeriod) * LeadershipWarmupPeriodFactor +
+        LeadershipWarmupExtraTime;
+
+    return std::min(timeout, connector->ControllerWaitTimeout);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TDuration GetLeadershipWarmupLeft(const TFlowViewPtr& flowView, TInstant publishTime, TInstant now)
+{
+    // A layout with no jobs has nothing to protect, so a starting pipeline is never delayed.
+    if (flowView->State->ExecutionSpec->Layout->Jobs.size() == 0) {
+        return TDuration::Zero();
+    }
+
+    auto warmupTimeout = GetLeadershipWarmupTimeout(flowView->CurrentDynamicSpec->GetValue());
+    if (warmupTimeout == TDuration::Zero()) {
+        return TDuration::Zero();
+    }
+
+    if (publishTime == TInstant::Zero()) {
+        return warmupTimeout;
+    }
+
+    auto deadline = publishTime + warmupTimeout;
+    return now < deadline ? deadline - now : TDuration::Zero();
 }
 
 ////////////////////////////////////////////////////////////////////////////////

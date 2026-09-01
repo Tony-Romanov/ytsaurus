@@ -22,6 +22,7 @@ from yt_dashboards.data_nodes import build_data_nodes_common
 from yt_dashboards.data_node_local import build_data_node_local
 from yt_dashboards.user_load import build_user_load
 from yt_dashboards.http_proxies import build_http_proxies
+from yt_dashboards.table_replication import build_dynamic_table_replication
 import yt_dashboards.table_dispersion as table_dispersion
 
 from yt_dashboards.bundle_ui import (
@@ -130,6 +131,10 @@ dashboards = {
     },
     "per-table-compaction": {
         "func": compaction.build_per_table_compaction,
+        "monitoring": {},
+    },
+    "compaction-digest": {
+        "func": compaction.build_compaction_digest,
         "monitoring": {},
     },
     "bundle-ui-user-load": {
@@ -460,6 +465,10 @@ dashboards = {
         "func": table_dispersion.build,
         "monitoring": {},
     },
+    "dynamic-table-replication": {
+        "func": build_dynamic_table_replication,
+        "monitoring": {},
+    }
 }
 
 

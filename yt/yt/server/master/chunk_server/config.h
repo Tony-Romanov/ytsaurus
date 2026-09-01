@@ -610,6 +610,14 @@ struct TDynamicSequoiaChunkReplicasConfig
     bool GhostValidationHeartbeats;
     bool GhostEmptyValidationHeartbeats;
 
+    bool ThrottleSequoiaReplicaModifications;
+    bool EnablePerReplicaSequoiaModificationsThrottling;
+    bool ThrottleIncrementalHeartbeatSequoiaReplicaModifications;
+    int MaxConcurrentSequoiaReplicaModifications;
+    int MaxConcurrentReplicasInSequoiaReplicaModifications;
+
+    std::optional<TDuration> SleepDurationBeforeSequoiaReplicaModifications;
+
     REGISTER_YSON_STRUCT(TDynamicSequoiaChunkReplicasConfig);
 
     static void Register(TRegistrar registrar);
@@ -864,6 +872,13 @@ struct TDynamicChunkManagerConfig
     //! Set of storage data centers on which replica placement is forbidden.
     THashSet<std::string> BannedStorageDataCenters;
 
+    //! Set of storage data centers that are temporarily unavailable due to planned maintenance.
+    //! Must be disjoint from |BannedStorageDataCenters|.
+    THashSet<std::string> TemporarilyUnavailableStorageDataCenters;
+
+    //! Number of additional rack failures a chunk must tolerate while some replicas are temporarily unavailable.
+    int TemporarilyUnavailableExtraFailureDomainTolerance;
+
     TDynamicDataCenterFailureDetectorConfigPtr DataCenterFailureDetector;
 
     TDuration ProfilingPeriod;
@@ -916,6 +931,10 @@ struct TDynamicChunkManagerConfig
 
     int MaxVerboselyLoggedChunks;
     TDuration MaxVerboseLoggingEnabledDuration;
+
+    // COMPAT(theevilbird): Get rid of it. Remove requisitions for chunk_wise_accounting_migration
+    // account and set |AggregatedRequisitionIndex_| to |EmptyChunkRequisitionIndex| in TChunk constructor.
+    bool SetEmptyRequisitionIndexOnImport;
 
     REGISTER_YSON_STRUCT(TDynamicChunkManagerConfig);
 

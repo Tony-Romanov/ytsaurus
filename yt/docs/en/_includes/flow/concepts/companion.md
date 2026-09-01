@@ -9,6 +9,7 @@ In Flow, you can run user code in a separate process. This process is called a c
 
 ### Planned
 
+- Isolating user C++ code from the Flow core to improve error handling, enable compilation with different flags (for example, for CUDA), and so on.
 - Hot updating user code without stopping the [pipeline](../../../flow/concepts/glossary.md#pipeline).
 
 ## Workflow {#schema}
@@ -22,6 +23,10 @@ You develop all business logic in the chosen programming language on the compani
 {% endnote %}
 
 The Computation on the Worker side collects a batch of messages, enriches it with all the information needed for processing (states, parameters, watermark values, and so on), and sends it to the companion via gRPC locally, within a single host.
+
+The batch is formed without regard to [keys](../../../flow/concepts/glossary.md#key) — one request may contain messages with different keys; this is how the worker collects batches for all computations. There is no per-key grouping in the companion protocol: if the business logic needs per-key processing, it is done in the companion code — see the [Python](../../../flow/python/computation.md#batch-function) example.
+
+The companion returns its output in groups; each group carries [lineage](../../../flow/concepts/lineage.md) — the list of ids of the input messages of the batch its output was derived from (lineage is unrelated to keys). For when lineage must be set explicitly and what exactly to pass, see [When to set lineage explicitly](../../../flow/concepts/lineage.md#explicit-lineage).
 
 In the future, you’ll also be able to use Unix sockets.
 

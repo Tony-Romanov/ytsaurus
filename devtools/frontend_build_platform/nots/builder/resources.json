@@ -1,24 +1,24 @@
 {
   "info": {
-    "created": "2026-08-14T12:16:45.081Z",
+    "created": "2026-08-28T00:37:48Z",
     "pr": {
-      "id": 15030112,
-      "author": "zaverden",
-      "summary": "DEVTOOLSSUPPORT-93215: clean modeules.yaml as text"
+      "id": 15302532,
+      "author": "baymer",
+      "summary": "DEVTOOLSSUPPORT-94180: убрать pnpm install из TS_PACKAGE"
     }
   },
   "by_platform": {
     "darwin": {
-      "uri": "sbr:13189018786"
+      "uri": "sbr:13389096329"
     },
     "darwin-arm64": {
-      "uri": "sbr:13189014083"
+      "uri": "sbr:13389095338"
     },
     "linux": {
-      "uri": "sbr:13189027468"
+      "uri": "sbr:13389098318"
     },
     "linux-aarch64": {
-      "uri": "sbr:13189022374"
+      "uri": "sbr:13389097465"
     }
   }
 }

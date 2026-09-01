@@ -75,7 +75,7 @@ from gevent._compat import PathLike
 from gevent._util import _NONE
 from gevent._util import copy_globals
 
-from gevent.greenlet import Greenlet, joinall
+from gevent.greenlet import Greenlet, joinall, killall
 spawn = Greenlet.spawn
 import subprocess as __subprocess__
 # We need our sockets (at least those involved in launching children)
@@ -302,7 +302,9 @@ else:
     fork = monkey.get_original('os', 'fork')
     from gevent.os import fork_and_watch
 
-STDOUT = __subprocess__.STDOUT # static analysis
+# Some explicit imports for static analysis
+STDOUT = __subprocess__.STDOUT
+TimeoutExpired = __subprocess__.TimeoutExpired
 
 
 def call(*popenargs, **kwargs):
@@ -431,45 +433,6 @@ def check_output(*popenargs, **kwargs):
     return output
 
 _PLATFORM_DEFAULT_CLOSE_FDS = object()
-
-if 'TimeoutExpired' not in globals():
-    # Python 2
-
-    # Make TimeoutExpired inherit from _Timeout so it can be caught
-    # the way we used to throw things (except Timeout), but make sure it doesn't
-    # init a timer. Note that we can't have a fake 'SubprocessError' that inherits
-    # from exception, because we need TimeoutExpired to just be a BaseException for
-    # bwc.
-    from gevent.timeout import Timeout as _Timeout
-
-    class TimeoutExpired(_Timeout):
-        """
-        This exception is raised when the timeout expires while waiting for
-        a child process in `communicate`.
-
-        Under Python 2, this is a gevent extension with the same name as the
-        Python 3 class for source-code forward compatibility. However, it extends
-        :class:`gevent.timeout.Timeout` for backwards compatibility (because
-        we used to just raise a plain ``Timeout``); note that ``Timeout`` is a
-        ``BaseException``, *not* an ``Exception``.
-
-        .. versionadded:: 1.2a1
-        """
-
-        def __init__(self, cmd, timeout, output=None):
-            _Timeout.__init__(self, None)
-            self.cmd = cmd
-            self.seconds = timeout
-            self.output = output
-
-        @property
-        def timeout(self):
-            return self.seconds
-
-        def __str__(self):
-            return ("Command '%s' timed out after %s seconds" %
-                    (self.cmd, self.timeout))
-
 
 if hasattr(os, 'set_inheritable'):
     _set_inheritable = os.set_inheritable
@@ -1038,10 +1001,35 @@ class Popen(object):
         return self
 
     def __exit__(self, t, v, tb):
-        if self.stdout:
-            self.stdout.close()
-        if self.stderr:
-            self.stderr.close()
+        # gevent: If we're leaving the block early, because an exception is
+        # propagating or because the greenlet running it was killed, the
+        # greenlets ``communicate`` spawned can still be parked in the pipes.
+        # Closing one out from under a parked greenlet raises ``RuntimeError:
+        # reentrant call``: it shares our thread, so the buffered object's
+        # lock is held by the thread doing the close. Stop them first, and
+        # each one closes its own pipe as it unwinds. ``communicate`` avoids
+        # the same hazard by waiting for them to finish.
+        if self._communicating_greenlets is not None:
+            still_running = [
+                glet for glet in self._communicating_greenlets
+                if not glet.dead
+            ]
+            if still_running:
+                killall(still_running)
+
+        # Some other greenlet, reading ``popen.stdout`` directly, can be
+        # parked in there too, and we have no handle on that one. Its
+        # ``RuntimeError`` must not replace the exception already unwinding
+        # this block, nor skip the ``self.wait()`` below that reaps the child.
+        # The pipe closes once that reader finishes and drops its last
+        # reference to it.
+        for pipe in (self.stdout, self.stderr):
+            if pipe:
+                try:
+                    pipe.close()
+                except RuntimeError:
+                    pass
+
         try:  # Flushing a BufferedWriter may raise an error
             if self.stdin:
                 self.stdin.close()

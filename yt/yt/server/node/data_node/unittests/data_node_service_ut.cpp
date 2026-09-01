@@ -74,6 +74,32 @@ constexpr auto TestSsdMediumName = "ssd_blobs";
 
 ////////////////////////////////////////////////////////////////////////////////
 
+TEST(TNetworkStatisticsTest, ReconfigureUpdatesThrottlingWindow)
+{
+    auto config = New<TDataNodeConfig>();
+    config->NetOutThrottlingDuration = TDuration::Hours(1);
+    TNetworkStatistics networkStatistics(config);
+
+    networkStatistics.IncrementReadThrottlingCounter("default");
+    // Trigger promotion of the newly inserted TSyncMap entry into the read-only snapshot.
+    networkStatistics.IncrementReadThrottlingCounter("default");
+
+    NNodeTrackerClient::NProto::TClusterNodeStatistics statistics;
+    networkStatistics.UpdateStatistics(&statistics);
+    ASSERT_EQ(statistics.network_size(), 1);
+    EXPECT_TRUE(statistics.network(0).throttling_reads());
+
+    auto dynamicConfig = New<TDataNodeDynamicConfig>();
+    dynamicConfig->NetOutThrottlingDuration = TDuration::Zero();
+    networkStatistics.Reconfigure(dynamicConfig);
+    statistics.clear_network();
+    networkStatistics.UpdateStatistics(&statistics);
+    ASSERT_EQ(statistics.network_size(), 1);
+    EXPECT_FALSE(statistics.network(0).throttling_reads());
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 std::vector<int> GenerateRandomBlockIdsWithOrder(int min, int max, int count, TRandomGenerator& generator)
 {
     std::vector<int> blockIds;
@@ -1567,9 +1593,8 @@ TEST_P(TFairShareHierarchicalTest, DISABLED_StressTest)
     GetFairShareHierarchicalScheduler()->BuildOrchid(&writer);
     writer.Flush();
     NLogging::TLogger Logger("TFairShareHierarchicalTest");
-    YT_LOG_DEBUG(
-        "Orchid: %v",
-        NYson::TYsonString(output.Str(), NYson::EYsonType::MapFragment));
+    YT_TLOG_DEBUG("Orchid built")
+        .With("Orchid", NYson::TYsonString(output.Str(), NYson::EYsonType::MapFragment));
 
     for (const auto& workloadCategory : workloadCategories) {
         TWorkloadDescriptor workload(workloadCategory);
@@ -2354,7 +2379,7 @@ TEST_F(TDataNodeTest, StartChunkReflectsNetInThrottlerQueueSize)
     Y_UNUSED(throttleFuture);
 }
 
-TEST_F(TDataNodeTest, DISABLED_NetInThrottlingIsReportedAsWriteThrottling)
+TEST_F(TDataNodeTest, NetInThrottlingIsReportedAsWriteThrottling)
 {
     auto bootstrap = GetDataNodeBootstrap();
     bootstrap->GetDynamicConfigManager()->GetConfig()->DataNode->NetInThrottlingLimit = 0;
@@ -2708,7 +2733,7 @@ TEST_F(TGetBlockSetBatchTest, HandlesConcurrentCompletions)
     }
 }
 
-TEST_P(TGetBlockSetTest, DISABLED_GetBlockSetTest)
+TEST_P(TGetBlockSetTest, GetBlockSetTest)
 {
     auto testCase = GetParam();
 

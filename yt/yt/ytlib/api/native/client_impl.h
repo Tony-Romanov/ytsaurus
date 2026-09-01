@@ -471,6 +471,14 @@ public: \
         const NYPath::TRichYPath& path,
         const TFileWriterOptions& options) override;
 
+    TFuture<TFilePartitions> PartitionFile(
+        const NYPath::TYPath& path,
+        const std::vector<TFileReadRange>& ranges,
+        const TPartitionFileOptions& options) override;
+    TFuture<IFileReaderPtr> CreateFilePartitionReader(
+        const TFilePartitionCookiePtr& cookie,
+        const TReadFilePartitionOptions& options) override;
+
     IJournalReaderPtr CreateJournalReader(
         const NYPath::TYPath& path,
         const TJournalReaderOptions& options) override;
@@ -818,6 +826,10 @@ public: \
     IMPLEMENT_METHOD(IPrerequisitePtr, AttachChaosLease, (
         NChaosClient::TChaosLeaseId chaosLeaseId,
         const TChaosLeaseAttachOptions& options = {}),
+        (chaosLeaseId, options))
+    IMPLEMENT_METHOD(void, PingChaosLease, (
+        NChaosClient::TChaosLeaseId chaosLeaseId,
+        const TChaosLeasePingOptions& options = {}),
         (chaosLeaseId, options))
 
     IMPLEMENT_METHOD(void, SetUserBanned, (

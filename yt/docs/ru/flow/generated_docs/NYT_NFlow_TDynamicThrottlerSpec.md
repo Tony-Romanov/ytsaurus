@@ -16,10 +16,26 @@
 **Значение по умолчанию**: `5s`
 Целевой интервал между походами клиента на контроллер (размер prefetch подстраивается под него). ||
 || `retrying_channel` | **Тип**: `NYT::TIntrusivePtr<`[NYT::NRpc::TRetryingChannelConfig](./all_yson_structs#NYT_NRpc_TRetryingChannelConfig)`>`
-**Значение по умолчанию**: `{'enable_exponential_retry_backoffs': true, 'retry_attempts': 100, 'retry_timeout': 600000}`
+**Значение по умолчанию**:
+
+```yson
+{
+    "enable_exponential_retry_backoffs" = %true;
+    "retry_attempts" = 100;
+    "retry_timeout" = 600000;
+}
+```
 Параметры ретраев запросов к сервису троттлера. Дефолт рассчитан на то, чтобы пережить смену контроллера-лидера даже если она затянется. ||
 || `rpc_timeout` | **Тип**: [TDuration](./all_yson_structs#TDuration)
 **Значение по умолчанию**: `30s`
 Таймаут одного запроса `RequestQuota`. ||
+|| `classes` | **Тип**: `THashMap<NYT::NFlow::TStrongIdentifierTypedef<NYT::NFlow::TQuotaClassIdTag>, NYT::TIntrusivePtr<`[NYT::NFlow::TDynamicThrottlerClassSpec](./all_yson_structs#NYT_NFlow_TDynamicThrottlerClassSpec)`>>`
+**Значение по умолчанию**: `{}`
+Именованные взвешенные классы квоты. Активные классы делят полосу пропорционально весам, а свободная доля перераспределяется. ||
+|| `max_grant_amount` | **Тип**: `std::optional<long>`
+Максимальный размер одного серверного чанка в абсолютных единицах квоты. Ограничивает задержку пересмотра активных классов. Если не задан, запрос выдаётся целиком и удерживает token bucket всё своё prefetch-окно, задерживая остальные классы ровно на это время. ||
+|| `use_class_weights_as_limit` | **Тип**: `bool`
+**Значение по умолчанию**: `false`
+Трактует веса классов как абсолютные скорости: скорость выдачи становится суммой объявленных весов, поэтому забэкложенный класс обслуживается со скоростью своего веса в единицах в секунду. Требует хотя бы одного класса и несовместим с `limit`. Зарезервированный класс `default` в сумму не входит. ||
 |#
 

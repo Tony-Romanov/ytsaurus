@@ -2,15 +2,15 @@
 
 #include "helpers.h"
 #include "job_size_adjuster.h"
-#include "new_job_manager.h"
+#include "job_manager.h"
 
 #include <yt/yt/server/lib/chunk_pools/config.h>
 
 #include <yt/yt/server/lib/controller_agent/job_size_constraints.h>
 
+#include <yt/yt/ytlib/chunk_client/data_slice.h>
 #include <yt/yt/ytlib/chunk_client/helpers.h>
 #include <yt/yt/ytlib/chunk_client/input_chunk.h>
-#include <yt/yt/ytlib/chunk_client/legacy_data_slice.h>
 
 #include <yt/yt/library/random/bernoulli_sampler.h>
 
@@ -74,7 +74,7 @@ public:
         , SliceErasureChunksByParts_(options.SliceErasureChunksByParts)
         , RowBuffer_(options.RowBuffer)
         , InputStreamDirectory_(std::move(directory))
-        , JobManager_(New<TNewJobManager>(options.Logger))
+        , JobManager_(New<TJobManager>(options.Logger))
         , FreeJobCounter_(New<TProgressCounter>())
         , FreeDataWeightCounter_(New<TProgressCounter>())
         , FreeCompressedDataSizeCounter_(New<TProgressCounter>())
@@ -102,28 +102,23 @@ public:
             JobSizeAdjuster_ = CreateJobSizeAdjuster(
                 JobSizeConstraints_->GetDataWeightPerJob(),
                 options.JobSizeAdjusterConfig);
-            YT_LOG_DEBUG("Job size adjuster created (Options: %v)",
-                ConvertToYsonString(options.JobSizeAdjusterConfig, EYsonFormat::Text));
+            YT_TLOG_DEBUG("Job size adjuster created")
+                .With("Options", ConvertToYsonString(options.JobSizeAdjusterConfig, EYsonFormat::Text));
         }
 
-        YT_LOG_INFO(
-            "Unordered chunk pool created (DataWeightPerJob: %v, MaxDataWeightPerJob: %v, "
-            "CompressedDataSizePerJob: %v, MaxCompressedDataSizePerJob: %v, "
-            "MaxDataSlicesPerJob: %v, InputSliceDataWeight: %v, InputSliceRowCount: %v, "
-            "SamplingRate: %v, JobCount: %v, IsExplicitJobCount: %v, HasJobSizeAdjuster: %v, "
-            "BuildFirstJobOnFinishedInput: %v)",
-            JobSizeConstraints_->GetDataWeightPerJob(),
-            JobSizeConstraints_->GetMaxDataWeightPerJob(),
-            JobSizeConstraints_->GetCompressedDataSizePerJob(),
-            JobSizeConstraints_->GetMaxCompressedDataSizePerJob(),
-            JobSizeConstraints_->GetMaxDataSlicesPerJob(),
-            JobSizeConstraints_->GetInputSliceDataWeight(),
-            JobSizeConstraints_->GetInputSliceRowCount(),
-            JobSizeConstraints_->GetSamplingRate(),
-            JobSizeConstraints_->GetJobCount(),
-            JobSizeConstraints_->IsExplicitJobCount(),
-            static_cast<bool>(JobSizeAdjuster_),
-            BuildFirstJobOnFinishedInput_);
+        YT_TLOG_INFO("Unordered chunk pool created")
+            .With("DataWeightPerJob", JobSizeConstraints_->GetDataWeightPerJob())
+            .With("MaxDataWeightPerJob", JobSizeConstraints_->GetMaxDataWeightPerJob())
+            .With("CompressedDataSizePerJob", JobSizeConstraints_->GetCompressedDataSizePerJob())
+            .With("MaxCompressedDataSizePerJob", JobSizeConstraints_->GetMaxCompressedDataSizePerJob())
+            .With("MaxDataSlicesPerJob", JobSizeConstraints_->GetMaxDataSlicesPerJob())
+            .With("InputSliceDataWeight", JobSizeConstraints_->GetInputSliceDataWeight())
+            .With("InputSliceRowCount", JobSizeConstraints_->GetInputSliceRowCount())
+            .With("SamplingRate", JobSizeConstraints_->GetSamplingRate())
+            .With("JobCount", JobSizeConstraints_->GetJobCount())
+            .With("IsExplicitJobCount", JobSizeConstraints_->IsExplicitJobCount())
+            .With("HasJobSizeAdjuster", static_cast<bool>(JobSizeAdjuster_))
+            .With("BuildFirstJobOnFinishedInput", BuildFirstJobOnFinishedInput_);
 
         UpdateFreeJobCounter();
     }
@@ -139,7 +134,6 @@ public:
         InputCookieIsSuspended_.emplace_back(false);
 
         for (const auto& dataSlice : stripe->DataSlices()) {
-            YT_VERIFY(!dataSlice->IsLegacy);
             // XXX
             dataSlice->GetInputStreamIndex();
             AddDataSlice(dataSlice, cookie);
@@ -163,7 +157,8 @@ public:
 
         // Option allows building only single job to allow job size adjuster adjust the size of future jobs.
         if (BuildFirstJobOnFinishedInput_ && AddJobToJobManager()) {
-            YT_LOG_DEBUG("Job was build after input finish (JobCounter: %v)", JobCounter_);
+            YT_TLOG_DEBUG("Job was build after input finish")
+                .With("JobCounter", JobCounter_);
         }
 
         CheckCompleted();
@@ -310,12 +305,11 @@ public:
         TJobSplittingBase::Completed(cookie, jobSummary);
 
         if (jobSummary.InterruptionReason != EInterruptionReason::None) {
-            YT_LOG_DEBUG(
-                "Splitting job (JobId: %v, OutputCookie: %v, InterruptionReason: %v, SplitJobCount: %v)",
-                jobSummary.Id,
-                cookie,
-                jobSummary.InterruptionReason,
-                jobSummary.SplitJobCount);
+            YT_TLOG_DEBUG("Splitting job")
+                .With("JobId", jobSummary.Id)
+                .With("OutputCookie", cookie)
+                .With("InterruptionReason", jobSummary.InterruptionReason)
+                .With("SplitJobCount", jobSummary.SplitJobCount);
             YT_VERIFY(jobSummary.UnreadInputDataSlices.size() > 0);
             auto childCookies = SplitJob(jobSummary.UnreadInputDataSlices, jobSummary.SplitJobCount);
             ValidateChildJobSizes(cookie, childCookies, [this] (TOutputCookie cookie) {
@@ -335,7 +329,7 @@ public:
     }
 
     std::vector<TOutputCookie> SplitJob(
-        const std::vector<TLegacyDataSlicePtr>& dataSlices,
+        const std::vector<TDataSlicePtr>& dataSlices,
         int jobCount)
     {
         i64 unreadRowCount = GetCumulativeRowCount(dataSlices);
@@ -440,7 +434,7 @@ private:
 
     TInputStreamDirectory InputStreamDirectory_;
 
-    TNewJobManagerPtr JobManager_;
+    TJobManagerPtr JobManager_;
 
     TProgressCounterPtr FreeJobCounter_;
     TProgressCounterPtr FreeDataWeightCounter_;
@@ -454,7 +448,7 @@ private:
     bool BuildFirstJobOnFinishedInput_ = false;
 
     //! Teleport (move to destination pool) trivial (complete), unversioned, teleportable chunk.
-    bool TryTeleportChunk(const TLegacyDataSlicePtr& dataSlice)
+    bool TryTeleportChunk(const TDataSlicePtr& dataSlice)
     {
         if (!dataSlice->IsTrivial() ||
             dataSlice->HasLimits() ||
@@ -478,29 +472,22 @@ private:
 
         const auto& jobCounter = GetJobCounter();
 
-        YT_LOG_DEBUG(
-            "Teleported single chunk (ChunkId: %v, TableIndex: %v, ChunkCount: %v, DataWeight: %v, "
-            "RowCount: %v, ValueCount: %v, MaxBlockSize: %v, RangeIndex: %v, IsTrivial: %v, "
-            "IsTeleportable: %v, IsLegacy: %v, HasLimits: %v, LegacyLowerLimit: %v, LegacyUpperLimit: %v, "
-            "LowerLimit: %v, UpperLimit: %v, Pending: %v, Blocked: %v)",
-            dataSlice->GetSingleUnversionedChunk()->GetChunkId(),
-            dataSlice->GetTableIndex(),
-            dataSlice->GetChunkCount(),
-            dataSlice->GetDataWeight(),
-            dataSlice->GetRowCount(),
-            dataSlice->GetValueCount(),
-            dataSlice->GetMaxBlockSize(),
-            dataSlice->GetRangeIndex(),
-            dataSlice->IsTrivial(),
-            dataSlice->IsTeleportable,
-            dataSlice->IsLegacy,
-            dataSlice->HasLimits(),
-            dataSlice->LegacyLowerLimit(),
-            dataSlice->LegacyUpperLimit(),
-            dataSlice->LowerLimit(),
-            dataSlice->UpperLimit(),
-            jobCounter->GetPending(),
-            jobCounter->GetBlocked());
+        YT_TLOG_DEBUG("Teleported single chunk")
+            .With("ChunkId", dataSlice->GetSingleUnversionedChunk()->GetChunkId())
+            .With("TableIndex", dataSlice->GetTableIndex())
+            .With("ChunkCount", dataSlice->GetChunkCount())
+            .With("DataWeight", dataSlice->GetDataWeight())
+            .With("RowCount", dataSlice->GetRowCount())
+            .With("ValueCount", dataSlice->GetValueCount())
+            .With("MaxBlockSize", dataSlice->GetMaxBlockSize())
+            .With("RangeIndex", dataSlice->GetRangeIndex())
+            .With("IsTrivial", dataSlice->IsTrivial())
+            .With("IsTeleportable", dataSlice->IsTeleportable)
+            .With("HasLimits", dataSlice->HasLimits())
+            .With("LowerLimit", dataSlice->LowerLimit())
+            .With("UpperLimit", dataSlice->UpperLimit())
+            .With("Pending", jobCounter->GetPending())
+            .With("Blocked", jobCounter->GetBlocked());
 
         return true;
     }
@@ -511,7 +498,7 @@ private:
             i64 idealDataWeightPerJob = GetAdjustedDataWeightPerJob();
             i64 idealCompressedDataSizePerJob = GetAdjustedCompressedDataSizePerJob();
 
-            auto jobStub = std::make_unique<TNewJobStub>();
+            auto jobStub = std::make_unique<TJobStub>();
 
             // Take local chunks first.
             if (nodeId != InvalidNodeId) {
@@ -570,7 +557,7 @@ private:
         return limit.RowIndex.value_or(defaultRowIndex) == defaultRowIndex && (!limit.KeyBound || limit.KeyBound.IsUniversal());
     };
 
-    void AddDataSlice(const TLegacyDataSlicePtr dataSlice, IChunkPoolInput::TCookie inputCookie)
+    void AddDataSlice(const TDataSlicePtr dataSlice, IChunkPoolInput::TCookie inputCookie)
     {
         dataSlice->Tag = inputCookie;
 
@@ -611,9 +598,9 @@ private:
                     upperLimit = slice->UpperLimit();
                 }
 
-                auto newDataSlice = New<TLegacyDataSlice>(
+                auto newDataSlice = New<TDataSlice>(
                     EDataSourceType::UnversionedTable,
-                    TLegacyDataSlice::TChunkSliceList{std::move(slice)},
+                    TDataSlice::TChunkSliceList{std::move(slice)},
                     lowerLimit,
                     upperLimit);
                 newDataSlice->CopyPayloadFrom(*dataSlice);
@@ -622,17 +609,13 @@ private:
                 AddStripe(New<TChunkStripe>(std::move(newDataSlice)), /*solid*/ false);
             }
         } else {
-            for (const auto& slice : CreateErasureInputChunkSlices(chunk, codecId)) {
-                slice->TransformToNewKeyless();
-
+            for (const auto& slice : CreateInputChunkSlicesFromCompleteErasureChunk(chunk, codecId)) {
                 auto smallerSlices = slice->SliceEvenly(
                     JobSizeConstraints_->GetInputSliceDataWeight(),
                     JobSizeConstraints_->GetInputSliceRowCount(),
                     RowBuffer_);
 
                 for (auto& smallerSlice : smallerSlices) {
-                    YT_VERIFY(!smallerSlice->IsLegacy);
-
                     TInputSliceLimit lowerLimit;
                     if (!IsTrivialLimit(smallerSlice->LowerLimit(), 0)) {
                         lowerLimit = smallerSlice->LowerLimit();
@@ -642,9 +625,9 @@ private:
                         upperLimit = smallerSlice->UpperLimit();
                     }
 
-                    auto newDataSlice = New<TLegacyDataSlice>(
+                    auto newDataSlice = New<TDataSlice>(
                         EDataSourceType::UnversionedTable,
-                        TLegacyDataSlice::TChunkSliceList{std::move(smallerSlice)},
+                        TDataSlice::TChunkSliceList{std::move(smallerSlice)},
                         lowerLimit,
                         upperLimit);
 
@@ -656,13 +639,12 @@ private:
             }
         }
 
-        YT_LOG_TRACE("Slicing unversioned chunk (ChunkId: %v, DataWeight: %v, SliceDataWeight: %v, SliceRowCount: %v, "
-            "SliceCount: %v)",
-            chunk->GetChunkId(),
-            chunk->GetDataWeight(),
-            JobSizeConstraints_->GetInputSliceDataWeight(),
-            JobSizeConstraints_->GetInputSliceRowCount(),
-            Stripes_.size() - oldSize);
+        YT_TLOG_TRACE("Slicing unversioned chunk")
+            .With("ChunkId", chunk->GetChunkId())
+            .With("DataWeight", chunk->GetDataWeight())
+            .With("SliceDataWeight", JobSizeConstraints_->GetInputSliceDataWeight())
+            .With("SliceRowCount", JobSizeConstraints_->GetInputSliceRowCount())
+            .With("SliceCount", Stripes_.size() - oldSize);
     }
 
     std::optional<TOutputCookie> AddStripe(TChunkStripePtr stripe, bool solid)
@@ -763,7 +745,7 @@ private:
                 //
                 // 2. Sliced jobs cannot be fewer than the explicit job count. The algorithm prioritizes this by finalizing
                 //    a stripe early if remaining chunks are insufficient to produce the required number of jobs.
-                YT_LOG_ALERT("Explicit job count guarantee cannot be satisfied; scheduling an extra job");
+                YT_TLOG_ALERT("Explicit job count guarantee cannot be satisfied; scheduling an extra job");
                 ++pendingJobCount;
             }
 
@@ -852,7 +834,7 @@ private:
         YT_VERIFY(!FreeStripes_.contains(stripeIndex));
         YT_VERIFY(ExtractedStripes_.insert(stripeIndex).second);
 
-        auto jobStub = std::make_unique<TNewJobStub>();
+        auto jobStub = std::make_unique<TJobStub>();
         for (const auto& dataSlice : suspendableStripe.GetStripe()->DataSlices()) {
             jobStub->AddDataSlice(dataSlice, stripeIndex, /*primary*/ true);
         }
@@ -897,7 +879,7 @@ private:
     }
 
     void AddStripesToJob(
-        TNewJobStub* jobStub,
+        TJobStub* jobStub,
         const THashSet<int>::const_iterator& begin,
         const THashSet<int>::const_iterator& end,
         i64 idealDataWeightPerJob,
@@ -965,29 +947,23 @@ private:
             YT_VERIFY(ExtractedStripes_.insert(stripeIndex).second);
         }
 
-        YT_LOG_DEBUG(
-            "Stripes added to job stub (AddedStripesCount: %v, FinishAddingStripesReason: %v, "
-            "UnextractedStripesCount: %v, JobDataWeight: %v, JobCompressedDataSize: %v, "
-            "IdealDataWeightPerJob: %v, IdealCompressedDataSizePerJob: %v)",
-            std::ssize(addedStripeIndexes),
-            finishReason,
-            std::ssize(Stripes_) - std::ssize(ExtractedStripes_),
-            jobStub->GetDataWeight(),
-            jobStub->GetCompressedDataSize(),
-            idealDataWeightPerJob,
-            idealCompressedDataSizePerJob);
+        YT_TLOG_DEBUG("Stripes added to job stub")
+            .With("AddedStripesCount", std::ssize(addedStripeIndexes))
+            .With("FinishAddingStripesReason", finishReason)
+            .With("UnextractedStripesCount", std::ssize(Stripes_) - std::ssize(ExtractedStripes_))
+            .With("JobDataWeight", jobStub->GetDataWeight())
+            .With("JobCompressedDataSize", jobStub->GetCompressedDataSize())
+            .With("IdealDataWeightPerJob", idealDataWeightPerJob)
+            .With("IdealCompressedDataSizePerJob", idealCompressedDataSizePerJob);
 
         if (JobSizeConstraints_->IsExplicitJobCount() && FreeJobCounter_->GetTotal() == 1 && jobStub->GetDataWeight() > idealDataWeightPerJob) {
             // NB(apollo1321): Compressed data size per job is *not* used when explicit job count is set.
-            YT_LOG_WARNING(
-                "Last job is bigger than expected (AddedStripesCount: %v, "
-                "JobDataWeight: %v, JobCompressedDataSize: %v, "
-                "IdealDataWeightPerJob: %v, IdealCompressedDataSizePerJob: %v)",
-                std::ssize(addedStripeIndexes),
-                jobStub->GetDataWeight(),
-                jobStub->GetCompressedDataSize(),
-                idealDataWeightPerJob,
-                idealCompressedDataSizePerJob);
+            YT_TLOG_WARNING("Last job is bigger than expected")
+                .With("AddedStripesCount", std::ssize(addedStripeIndexes))
+                .With("JobDataWeight", jobStub->GetDataWeight())
+                .With("JobCompressedDataSize", jobStub->GetCompressedDataSize())
+                .With("IdealDataWeightPerJob", idealDataWeightPerJob)
+                .With("IdealCompressedDataSizePerJob", idealCompressedDataSizePerJob);
         }
     }
 

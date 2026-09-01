@@ -24,6 +24,8 @@ Lineage используется фреймворком в двух целях:
 
 По умолчанию родителем выходного сообщения считается весь текущий батч. Явный lineage позволяет сузить это множество до конкретного подмножества входных объектов, что делает вычисление `EventTimestamp` и `AlignmentTimestamp` более точным.
 
+В Swift-компьютейшене сужение обязательно: у каждого выходного сообщения должен быть ровно один родитель (несколько — только при [`allow_batching_with_relaxed_guarantees`](../../../flow/concepts/guarantees.md#swift-allow-batching-with-relaxed-guarantees)). При обработке по одному сообщению фреймворк назначает родителя автоматически; в batch-обработке его задаёт пользовательский код. В Transform-компьютейшене явный lineage необязателен.
+
 ## API {#api}
 
 Lineage устанавливается через метод `SetParents` / `set_parent_ids` / `setParentIds` / `WithParentIDs` на объекте `OutputCollector`. Метод возвращает **новый** коллектор с привязанным контекстом lineage — все вызовы `AddMessage` / `add_message` / `addMessage` на нём будут нести этот lineage.

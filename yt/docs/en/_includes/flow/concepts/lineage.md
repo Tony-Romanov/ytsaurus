@@ -23,17 +23,21 @@ In most cases, you don’t need to manage lineage explicitly—the framework aut
 
 By default, the entire current batch is considered the parent of the output message. Setting lineage explicitly lets you narrow this set to a specific subset of input objects. This makes the computation of `EventTimestamp` and `AlignmentTimestamp` more precise.
 
+In a Swift computation the narrowing is mandatory: every output message must have exactly one parent (multiple only with [`allow_batching_with_relaxed_guarantees`](../../../flow/concepts/guarantees.md#swift-allow-batching-with-relaxed-guarantees)). With per-message processing the framework assigns the parent automatically; in batch processing user code sets it. In a Transform computation explicit lineage is optional.
+
 ## API {#api}
 
-You set lineage using the `SetParents` / `set_parent_ids` / `setParentIds` method on the `OutputCollector` object. The method returns a **new** collector with the lineage context attached. All calls to `AddMessage` / `add_message` / `addMessage` on this collector will carry that lineage.
+You set lineage using the `SetParents` / `set_parent_ids` / `setParentIds` / `WithParentIDs` method on the `OutputCollector` object. The method returns a **new** collector with the lineage context attached. All calls to `AddMessage` / `add_message` / `addMessage` on this collector will carry that lineage.
 
 For more details on how to use this in each language:
 - [C++](../../../flow/cpp/computation.md#output-collector)
 - [Java](../../../flow/java/computation.md#output-collector)
 - [Python](../../../flow/python/computation.md#output-collector)
+- [Go](../../../flow/go/computation.md#output-collector)
 
 ## See also
 
 - [Message Processing Order](../../../flow/concepts/ordering.md)
 - [Computation](../../../flow/concepts/computation.md)
 - [Core Concepts (Glossary)](../../../flow/concepts/glossary.md)
+- [Computation (Go)](../../../flow/go/computation.md)
