@@ -1,5 +1,6 @@
 #pragma once
 
+#include "file_source.h"
 #include "public.h"
 #include "yt_path_option.h"
 
@@ -67,6 +68,7 @@ struct TResourceSpec
 {
     std::string ResourceClassName;
     NYTree::IMapNodePtr Parameters;
+    THashMap<TFileSourceId, TFileSourceSpecPtr> FileSources;
     THashMap<TResourceId, TResourceDescriptionPtr> Dependencies;
     THashMap<std::string, ssize_t> RequiredCapabilities;
     bool PreloadRequired{};
@@ -904,6 +906,15 @@ struct TDynamicComputationSpec
     std::optional<TThrottlerId> InputRowsThrottlerId;
     std::optional<TThrottlerId> InputBytesThrottlerId;
 
+    //! Quota classes attached to the requests each automatic input throttler
+    //! makes; each is validated against the classes its own throttler declares.
+    //! The class covers every request the computation sends to that throttler,
+    //! including ones made through a manually obtained handle for the same id.
+    //! A throttler with no class configured is served from the reserved
+    //! "default" class.
+    std::optional<TQuotaClassId> InputRowsThrottlerClassId;
+    std::optional<TQuotaClassId> InputBytesThrottlerClassId;
+
     //! YTQL predicate over message meta and payload; a message is skipped when it holds.
     std::optional<std::string> SkipIfExpression;
 
@@ -938,6 +949,17 @@ struct TDynamicResourceSpec
     : public NYTree::TYsonStruct
 {
     NYTree::IMapNodePtr Parameters;
+    THashMap<TFileSourceId, TDynamicFileSourceSpecPtr> FileSources;
+    //! Controller-side discovery period for every named file source.
+    TDuration FileSourceDiscoverPeriod;
+    //! Worker-side retry period for preparing a delivered file-source target.
+    TDuration FileSourceUpdateRetryPeriod;
+    //! Minimum interval between selecting new file snapshots for this resource.
+    TDuration FileSnapshotMinCreationPeriod;
+    //! Maximum number of file snapshots retained in controller state.
+    i64 FileSnapshotCatalogMaxEntries{};
+    //! Time after which an incomplete file snapshot rollout is reported.
+    TDuration FileSnapshotRolloutWarningPeriod;
 
     REGISTER_YSON_STRUCT(TDynamicResourceSpec);
 
@@ -948,11 +970,31 @@ DEFINE_REFCOUNTED_TYPE(TDynamicResourceSpec);
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct TDynamicThrottlerClassSpec
+    : public NYTree::TYsonStruct
+{
+    double Weight = 1.0;
+
+    REGISTER_YSON_STRUCT(TDynamicThrottlerClassSpec);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TDynamicThrottlerClassSpec);
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct TDynamicThrottlerSpec
     : public NYTree::TYsonStruct
 {
-    //! Quota emitted globally per `Period`. Null means unlimited.
+    //! Quota emitted globally per second. Null means unlimited, unless
+    //! |UseClassWeightsAsLimit| derives the rate from the class weights.
     std::optional<double> Limit;
+
+    //! Reads the class weights as absolute rates: the global limit becomes the
+    //! sum of the declared class weights, so a backlogged class is served at
+    //! its weight in quota units per second. Mutually exclusive with |Limit|.
+    bool UseClassWeightsAsLimit{};
 
     //! Quota bucket refill window on the server.
     TDuration Period;
@@ -966,11 +1008,23 @@ struct TDynamicThrottlerSpec
     //! Per-RPC timeout for RequestQuota calls.
     TDuration RpcTimeout;
 
+    THashMap<TQuotaClassId, TDynamicThrottlerClassSpecPtr> Classes;
+
+    std::optional<i64> MaxGrantAmount;
+
+    //! Quota emitted globally per second once |UseClassWeightsAsLimit| is
+    //! applied. Null means unlimited.
+    std::optional<double> GetEffectiveLimit() const;
+
     //! Server-side token bucket config.
     NConcurrency::TThroughputThrottlerConfigPtr BuildThroughputConfig() const;
 
     //! Client-side prefetching config.
     NConcurrency::TPrefetchingThrottlerConfigPtr BuildPrefetchingConfig() const;
+
+    THashMap<std::string, double> BuildClassWeights() const;
+
+    bool ClientConfigEquals(const TDynamicThrottlerSpec& other) const;
 
     REGISTER_YSON_STRUCT(TDynamicThrottlerSpec);
 
@@ -1253,6 +1307,11 @@ THashMap<TStreamId, std::vector<TStreamId>> BuildStreamGraph(const TPipelineSpec
 void ValidateIsDirectedAcyclicGraph(const THashMap<TStreamId, std::vector<TStreamId>>& streamGraph);
 void ValidatePipelineSpec(const TPipelineSpecPtr& spec);
 void ValidateDynamicPipelineSpec(const TDynamicPipelineSpecPtr& spec);
+
+//! Shared quota-class invariants, used by both the pipeline spec and the
+//! distributed-throttler bucket config so the two cannot drift.
+void ValidateQuotaClassName(TStringBuf className);
+void ValidateQuotaClassWeight(double weight);
 
 //! Returns the deduplicated, stably sorted list of YT-path ownership claims declared by every
 //! entity in the pipeline. Same collection that ValidatePipelineSpec uses for conflict detection.

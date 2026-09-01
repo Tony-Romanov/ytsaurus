@@ -608,6 +608,23 @@ void TDynamicSequoiaChunkReplicasConfig::Register(TRegistrar registrar)
     registrar.Parameter("ghost_empty_validation_heartbeats", &TThis::GhostEmptyValidationHeartbeats)
         .Default(false);
 
+    registrar.Parameter("throttle_sequoia_replica_modifications", &TThis::ThrottleSequoiaReplicaModifications)
+        .Default(false);
+    registrar.Parameter("enable_per_replica_sequoia_modifications_throttling", &TThis::EnablePerReplicaSequoiaModificationsThrottling)
+        .Default(false);
+    registrar.Parameter("throttle_incremental_heartbeat_sequoia_replica_modifications", &TThis::ThrottleIncrementalHeartbeatSequoiaReplicaModifications)
+        .Default(true);
+    registrar.Parameter("max_concurrent_sequoia_replica_modifications", &TThis::MaxConcurrentSequoiaReplicaModifications)
+        .Default(100)
+        .GreaterThanOrEqual(0);
+    registrar.Parameter("max_concurrent_replicas_in_sequoia_replica_modifications", &TThis::MaxConcurrentReplicasInSequoiaReplicaModifications)
+        .Default(5'000'000)
+        .GreaterThanOrEqual(0);
+
+    registrar.Parameter("sleep_duration_before_sequoia_replica_modifications", &TThis::SleepDurationBeforeSequoiaReplicaModifications)
+        .Default(std::nullopt)
+        .DontSerializeDefault();
+
     registrar.Postprocessor([] (TThis* config) {
         // COMPAT(grphil).
         if (!config->BlobReplicasStoreConfig) {
@@ -980,6 +997,13 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
     registrar.Parameter("banned_storage_data_centers", &TThis::BannedStorageDataCenters)
         .Default();
 
+    registrar.Parameter("temporarily_unavailable_storage_data_centers", &TThis::TemporarilyUnavailableStorageDataCenters)
+        .Default();
+
+    registrar.Parameter("temporarily_unavailable_extra_failure_domain_tolerance", &TThis::TemporarilyUnavailableExtraFailureDomainTolerance)
+        .GreaterThanOrEqual(0)
+        .Default(1);
+
     registrar.Parameter("profiling_period", &TThis::ProfilingPeriod)
         .Default(DefaultProfilingPeriod);
 
@@ -1056,7 +1080,19 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
     registrar.Parameter("max_verbose_logging_enabled_duration", &TThis::MaxVerboseLoggingEnabledDuration)
         .Default(TDuration::Days(1));
 
+    registrar.Parameter("set_empty_requisition_index_on_import", &TThis::SetEmptyRequisitionIndexOnImport)
+        .Default(false)
+        .DontSerializeDefault();
+
     registrar.Postprocessor([] (TThis* config) {
+        for (const auto& dataCenter : config->BannedStorageDataCenters) {
+            if (config->TemporarilyUnavailableStorageDataCenters.contains(dataCenter)) {
+                THROW_ERROR_EXCEPTION(
+                    "Storage data center %Qv cannot be both banned and temporarily unavailable",
+                    dataCenter);
+            }
+        }
+
         auto& jobTypeToThrottler = config->JobTypeToThrottler;
         for (auto jobType : TEnumTraits<EJobType>::GetDomainValues()) {
             if (IsMasterJobType(jobType) && !jobTypeToThrottler.contains(jobType)) {

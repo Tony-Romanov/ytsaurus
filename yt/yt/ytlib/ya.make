@@ -13,7 +13,6 @@ SRCS(
     api/native/bundle_controller_client_impl.cpp
     api/native/cell_commit_session.cpp
     api/native/chaos_helpers.cpp
-    api/native/chaos_lease.cpp
     api/native/chaos_lease_type_handler.cpp
     api/native/chaos_replicated_table_type_handler.cpp
     api/native/chaos_table_replica_type_handler.cpp
@@ -163,6 +162,7 @@ SRCS(
     GLOBAL chunk_client/configure_dispatcher.cpp
     chunk_client/confirming_writer.cpp
     chunk_client/data_sink.cpp
+    chunk_client/data_slice.cpp
     chunk_client/data_slice_descriptor.cpp
     chunk_client/data_source.cpp
     chunk_client/deferred_chunk_meta.cpp
@@ -183,7 +183,6 @@ SRCS(
     chunk_client/input_chunk.cpp
     chunk_client/job_io_meter.cpp
     GLOBAL chunk_client/job_spec_extensions.cpp
-    chunk_client/legacy_data_slice.cpp
     chunk_client/medium_directory_synchronizer.cpp
     chunk_client/medium_directory.cpp
     chunk_client/medium_descriptor.cpp
@@ -260,14 +259,15 @@ SRCS(
 
     distributed_chunk_session_client/config.cpp
     distributed_chunk_session_client/helpers.cpp
-    distributed_chunk_session_client/distributed_chunk_session_seal_summary_fetcher.cpp
-    distributed_chunk_session_client/distributed_chunk_session_seal_monitor.cpp
-    distributed_chunk_session_client/distributed_chunk_session_pool.cpp
-    distributed_chunk_session_client/distributed_chunk_writer.cpp
-    distributed_chunk_session_client/distributed_chunk_session_controller.cpp
-    distributed_chunk_session_client/distributed_chunk_session_reader.cpp
+    distributed_chunk_session_client/seal_summary_fetcher.cpp
+    distributed_chunk_session_client/seal_monitor.cpp
+    distributed_chunk_session_client/statistics.cpp
+    distributed_chunk_session_client/session_pool.cpp
+    distributed_chunk_session_client/session_writer.cpp
+    distributed_chunk_session_client/session_controller.cpp
+    distributed_chunk_session_client/session_reader.cpp
 
-    distributed_chunk_session_client/proto/distributed_chunk_session_service.proto
+    distributed_chunk_session_client/proto/session_service.proto
 
     driver/config.cpp
 

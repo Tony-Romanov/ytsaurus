@@ -43,7 +43,9 @@ type ResourcesConfig struct {
 type Config struct {
 	// LocalBinariesDir is set if we want to execute local binaries on the clique.
 	// This directory should contain trampoline and chyt binaries.
-	LocalBinariesDir           *string                 `yson:"local_binaries_dir"`
+	LocalBinariesDir *string `yson:"local_binaries_dir"`
+	// LocalLogsDir persists local clique logs outside job sandboxes.
+	LocalLogsDir               *string                 `yson:"local_logs_dir"`
 	LogRotationMode            *LogRotationModeType    `yson:"log_rotation_mode"`
 	AddressResolver            map[string]any          `yson:"address_resolver"`
 	BusServer                  map[string]any          `yson:"bus_server"`
@@ -291,7 +293,34 @@ func (c *Controller) buildCommand(speclet *Speclet) string {
 	if speclet.ODBCConfig.EnableOrDefault() {
 		args = append(args, "--prepare-odbc")
 	}
+
+	if speclet.logsDir != nil {
+		args = append(
+			args,
+			"--log-file", filepath.Join(*speclet.logsDir, "trampoline-$YT_JOB_INDEX.debug.log"),
+			"--stderr-file", filepath.Join(*speclet.logsDir, "stderr.clickhouse-$YT_JOB_INDEX"),
+		)
+	}
 	return strings.Join(args, " ")
+}
+
+func (c *Controller) prepareLocalLogs(oplet *strawberry.Oplet) (*string, error) {
+	if c.config.LocalLogsDir == nil {
+		return nil, nil
+	}
+
+	dir := filepath.Join(
+		*c.config.LocalLogsDir,
+		oplet.Alias(),
+		fmt.Sprint(oplet.NextIncarnationIndex()),
+	)
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		return nil, err
+	}
+	return &dir, nil
 }
 
 func (c *Controller) Root() ypath.Path {
@@ -349,6 +378,11 @@ func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
 		opletInfo.CHYTRunningVersionPath = filepath.Join(*c.config.LocalBinariesDir, "ytserver-clickhouse")
 	}
 	oplet.SetOpletInfo(opletInfo)
+
+	speclet.logsDir, err = c.prepareLocalLogs(oplet)
+	if err != nil {
+		return nil, nil, nil, false, fmt.Errorf("failed to prepare local logs directory: %w", err)
+	}
 
 	// Build configs.
 	err = c.appendConfigs(ctx, oplet, &speclet, &filePaths)
@@ -687,6 +721,33 @@ func (c *Controller) GetOpBriefAttributes(parsedSpeclet any, opletInfo yson.RawV
 
 func (c *Controller) GetScalerTarget(ctx context.Context, opletInfo strawberry.OpletInfoForScaler) (*strawberry.ScalerTarget, error) {
 	return nil, nil
+}
+
+func (c *Controller) GetMetrics(oplet *strawberry.Oplet) []strawberry.Metric {
+	if !oplet.HasYTOperation() {
+		return nil
+	}
+
+	metric, ok := getVersionMetric(oplet.GetBriefInfo().OpletInfo)
+	if !ok {
+		return nil
+	}
+	return []strawberry.Metric{metric}
+}
+
+func getVersionMetric(opletInfo yson.RawValue) (strawberry.Metric, bool) {
+	var info chytOpletInfo
+	if err := yson.Unmarshal(opletInfo, &info); err != nil || info.CHYTRunningVersion == "" {
+		return strawberry.Metric{}, false
+	}
+
+	return strawberry.Metric{
+		Name: "chyt_server_version",
+		Tags: map[string]string{
+			"version": info.CHYTRunningVersion,
+		},
+		Value: 1,
+	}, true
 }
 
 func (c *Controller) GetOpletInfo(ctx context.Context, oplet *strawberry.Oplet) (any, error) {

@@ -58,7 +58,7 @@ private:
 
     void DoRun()
     {
-        YT_LOG_INFO("Running changelog discovery");
+        YT_TLOG_INFO("Running changelog discovery");
 
         std::vector<TFuture<void>> asyncResults;
         for (auto peerId = 0; peerId < CellManager_->GetTotalPeerCount(); ++peerId) {
@@ -66,9 +66,9 @@ private:
             if (!channel)
                 continue;
 
-            YT_LOG_DEBUG("Requesting changelog info (PeerId: %v, ChangelogId: %v)",
-                peerId,
-                ChangelogId_);
+            YT_TLOG_DEBUG("Requesting changelog info")
+                .With("PeerId", peerId)
+                .With("ChangelogId", ChangelogId_);
 
             TInternalHydraServiceProxy proxy(channel);
             proxy.SetDefaultTimeout(Config_->ControlRpcTimeout);
@@ -90,16 +90,17 @@ private:
         const TInternalHydraServiceProxy::TErrorOrRspLookupChangelogPtr& rspOrError)
     {
         if (!rspOrError.IsOK()) {
-            YT_LOG_WARNING(rspOrError, "Error requesting changelog info (PeerId: %v)",
-                peerId);
+            YT_TLOG_WARNING("Error requesting changelog info")
+                .With("PeerId", peerId)
+                .With(rspOrError);
             return;
         }
 
         const auto& rsp = rspOrError.Value();
         int recordCount = rsp->record_count();
-        YT_LOG_INFO("Changelog info received (PeerId: %v, RecordCount: %v)",
-            peerId,
-            recordCount);
+        YT_TLOG_INFO("Changelog info received")
+            .With("PeerId", peerId)
+            .With("RecordCount", recordCount);
 
         if (recordCount < MinRecordCount_) {
             return;
@@ -111,9 +112,9 @@ private:
         result.RecordCount = recordCount;
 
         if (Promise_.TrySet(result)) {
-            YT_LOG_INFO("Changelog discovery succeeded (PeerId: %v, RecordCount: %v)",
-                peerId,
-                recordCount);
+            YT_TLOG_INFO("Changelog discovery succeeded")
+                .With("PeerId", peerId)
+                .With("RecordCount", recordCount);
         }
     }
 
@@ -157,7 +158,7 @@ public:
         YT_VERIFY(CellManager_);
 
         YT_VERIFY(CellManager_->GetSelfConfig()->Voting);
-        RegisterSuccess(localChangelogId, localTerm);
+        RegisterSuccess(CellManager_->GetSelfPeerId(), localChangelogId, localTerm);
     }
 
     TFuture<std::pair<int, int>> Run()
@@ -177,14 +178,14 @@ private:
 
     int ChangelogId_ = 0;
     int Term_ = 0;
-    int SuccessCount_ = 0;
+    int SuccessWeight_ = 0;
 
     std::vector<TError> InnerErrors_;
 
 
-    void RegisterSuccess(int changelogId, int term)
+    void RegisterSuccess(int peerId, int changelogId, int term)
     {
-        ++SuccessCount_;
+        SuccessWeight_ += CellManager_->GetPeerWeight(peerId);
         ChangelogId_ = std::max(ChangelogId_, changelogId);
         Term_ = std::max(Term_, term);
     }
@@ -196,7 +197,7 @@ private:
 
     void DoRun()
     {
-        YT_LOG_INFO("Computing latest quorum changelog id");
+        YT_TLOG_INFO("Computing latest quorum changelog id");
 
         std::vector<TFuture<void>> asyncResults;
         asyncResults.reserve(CellManager_->GetTotalPeerCount());
@@ -215,8 +216,8 @@ private:
                 continue;
             }
 
-            YT_LOG_DEBUG("Requesting changelog info (PeerId: %v)",
-                peerId);
+            YT_TLOG_DEBUG("Requesting changelog info")
+                .With("PeerId", peerId);
 
             TInternalHydraServiceProxy proxy(channel);
             proxy.SetDefaultTimeout(Config_->ControlRpcTimeout);
@@ -238,33 +239,34 @@ private:
             const auto& rsp = rspOrError.Value();
             int changelogId = rsp->changelog_id();
             int term = rsp->term();
-            RegisterSuccess(changelogId, term);
+            RegisterSuccess(peerId, changelogId, term);
 
-            YT_LOG_DEBUG("Changelog id received (PeerId: %v, ChangelogId: %v, Term: %v)",
-                peerId,
-                changelogId,
-                term);
+            YT_TLOG_DEBUG("Changelog id received")
+                .With("PeerId", peerId)
+                .With("ChangelogId", changelogId)
+                .With("Term", term);
         } else {
             RegisterFailure(rspOrError);
 
-            YT_LOG_WARNING(rspOrError, "Error requesting changelog id (PeerId: %v)",
-                peerId);
+            YT_TLOG_WARNING("Error requesting changelog id")
+                .With("PeerId", peerId)
+                .With(rspOrError);
         }
     }
 
     void OnComplete(const TError&)
     {
-        int quorum = CellManager_->GetQuorumPeerCount();
-        if (SuccessCount_ < quorum) {
-            Promise_.TrySet(TError("Not enough answers to compute quorum changelog id: %v out of %v",
-                SuccessCount_,
-                quorum));
+        auto quorumWeight = CellManager_->GetQuorumWeight();
+        if (SuccessWeight_ < quorumWeight) {
+            Promise_.TrySet(TError("Not enough answers to compute quorum changelog id: weight %v out of %v",
+                SuccessWeight_,
+                quorumWeight));
             return;
         }
 
-        YT_LOG_INFO("Computed quorum latest changelog id (ChangelogId: %v, Term: %v)",
-            ChangelogId_,
-            Term_);
+        YT_TLOG_INFO("Computed quorum latest changelog id")
+            .With("ChangelogId", ChangelogId_)
+            .With("Term", Term_);
 
         Promise_.Set({ChangelogId_, Term_});
     }

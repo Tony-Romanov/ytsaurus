@@ -130,6 +130,9 @@ void TTabletManagerDynamicConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("yield_before_building_lsm_actions", &TThis::YieldBeforeBuildingLsmActions)
         .Default(false);
+
+    registrar.Parameter("account_active_store_lookup_hash_table_to_tablet_static", &TThis::AccountActiveStoreLookupHashTableToTabletStatic)
+        .Default(true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -175,7 +178,7 @@ void TStoreBackgroundActivityOrchidConfig::Register(TRegistrar registrar)
 void TCompactionHintFetcherConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("periodic_executor", &TThis::PeriodicExecutor)
-        .Default({.Period = TDuration::Seconds(5)});
+        .Default({.Period = TDuration::Seconds(1)});
     registrar.Parameter("request_throttler", &TThis::RequestThrottler)
         .DefaultCtor([] { return TThroughputThrottlerConfig::Create(/*limit*/ 300); });
 }

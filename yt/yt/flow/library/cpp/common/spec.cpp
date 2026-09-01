@@ -547,6 +547,8 @@ void TResourceSpec::Register(TRegistrar registrar)
             return GetEphemeralNodeFactory()->CreateMap();
         })
         .ResetOnLoad();
+    registrar.Parameter("file_sources", &TThis::FileSources)
+        .Default();
     registrar.Parameter("dependencies", &TThis::Dependencies)
         .Default();
     registrar.Parameter("required_capabilities", &TThis::RequiredCapabilities)
@@ -834,6 +836,10 @@ void TDynamicComputationSpec::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("input_bytes_throttler_id", &TThis::InputBytesThrottlerId)
         .Default();
+    registrar.Parameter("input_rows_throttler_class_id", &TThis::InputRowsThrottlerClassId)
+        .Default();
+    registrar.Parameter("input_bytes_throttler_class_id", &TThis::InputBytesThrottlerClassId)
+        .Default();
 
     registrar.Parameter("skip_if_expression", &TThis::SkipIfExpression)
         .Default();
@@ -870,6 +876,32 @@ void TDynamicResourceSpec::Register(TRegistrar registrar)
             return GetEphemeralNodeFactory()->CreateMap();
         })
         .ResetOnLoad();
+    registrar.Parameter("file_sources", &TThis::FileSources)
+        .Default();
+    registrar.Parameter("file_source_discover_period", &TThis::FileSourceDiscoverPeriod)
+        .GreaterThan(TDuration::Zero())
+        .Default(TDuration::Seconds(30));
+    registrar.Parameter("file_source_update_retry_period", &TThis::FileSourceUpdateRetryPeriod)
+        .GreaterThan(TDuration::Zero())
+        .Default(TDuration::Minutes(1));
+    registrar.Parameter("file_snapshot_min_creation_period", &TThis::FileSnapshotMinCreationPeriod)
+        .GreaterThan(TDuration::Zero())
+        .Default(TDuration::Minutes(5));
+    registrar.Parameter("file_snapshot_catalog_max_entries", &TThis::FileSnapshotCatalogMaxEntries)
+        .GreaterThanOrEqual(2)
+        .Default(1024);
+    registrar.Parameter("file_snapshot_rollout_warning_period", &TThis::FileSnapshotRolloutWarningPeriod)
+        .GreaterThan(TDuration::Zero())
+        .Default(TDuration::Minutes(15));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TDynamicThrottlerClassSpec::Register(TRegistrar registrar)
+{
+    registrar.Parameter("weight", &TThis::Weight)
+        .Default(1.0)
+        .CheckThat(&ValidateQuotaClassWeight);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -895,12 +927,53 @@ void TDynamicThrottlerSpec::Register(TRegistrar registrar)
         });
     registrar.Parameter("rpc_timeout", &TThis::RpcTimeout)
         .Default(TDuration::Seconds(30));
+    registrar.Parameter("classes", &TThis::Classes)
+        .Default();
+    registrar.Parameter("max_grant_amount", &TThis::MaxGrantAmount)
+        .Default()
+        .GreaterThan(0);
+    registrar.Parameter("use_class_weights_as_limit", &TThis::UseClassWeightsAsLimit)
+        .Default(false);
+
+    registrar.Postprocessor([] (TThis* spec) {
+        for (const auto& [classId, _] : spec->Classes) {
+            ValidateQuotaClassName(classId.Underlying());
+        }
+
+        if (spec->UseClassWeightsAsLimit) {
+            THROW_ERROR_EXCEPTION_IF(
+                spec->Limit.has_value(),
+                "%Qv and %Qv are mutually exclusive",
+                "limit",
+                "use_class_weights_as_limit");
+            // The sum would be zero, and the throttler would grant nothing at
+            // all with no hint as to why.
+            THROW_ERROR_EXCEPTION_IF(
+                spec->Classes.empty(),
+                "%Qv requires at least one class in %Qv",
+                "use_class_weights_as_limit",
+                "classes");
+        }
+    });
+}
+
+std::optional<double> TDynamicThrottlerSpec::GetEffectiveLimit() const
+{
+    if (Limit || !UseClassWeightsAsLimit) {
+        return Limit;
+    }
+
+    double limit = 0;
+    for (const auto& [_, classSpec] : Classes) {
+        limit += classSpec->Weight;
+    }
+    return limit;
 }
 
 NConcurrency::TThroughputThrottlerConfigPtr TDynamicThrottlerSpec::BuildThroughputConfig() const
 {
     auto config = New<NConcurrency::TThroughputThrottlerConfig>();
-    config->Limit = Limit;
+    config->Limit = GetEffectiveLimit();
     config->Period = Period;
     return config;
 }
@@ -910,9 +983,10 @@ NConcurrency::TPrefetchingThrottlerConfigPtr TDynamicThrottlerSpec::BuildPrefetc
     auto config = New<NConcurrency::TPrefetchingThrottlerConfig>();
     config->TargetRps = 1.0 / RequestPeriod.SecondsFloat();
     config->MinPrefetchAmount = 1;
-    if (Limit) {
-        double tokensPerSecond = *Limit / Period.SecondsFloat();
-        auto maxPrefetch = static_cast<i64>(std::ceil(tokensPerSecond * RequestPeriod.SecondsFloat()));
+    if (auto limit = GetEffectiveLimit()) {
+        // The limit is already a per-second rate, and |Period| is only the leaky
+        // bucket's refill granularity, so it must not divide the rate here.
+        auto maxPrefetch = static_cast<i64>(std::ceil(*limit * RequestPeriod.SecondsFloat()));
         config->MaxPrefetchAmount = std::max<i64>(maxPrefetch, 1);
     } else {
         // Unlimited: no meaningful upper bound; pick a large batch so the
@@ -921,6 +995,23 @@ NConcurrency::TPrefetchingThrottlerConfigPtr TDynamicThrottlerSpec::BuildPrefetc
     }
     config->Window = std::max(RequestPeriod * 10, TDuration::Seconds(1));
     return config;
+}
+
+THashMap<std::string, double> TDynamicThrottlerSpec::BuildClassWeights() const
+{
+    THashMap<std::string, double> result;
+    result.reserve(Classes.size());
+    for (const auto& [classId, classSpec] : Classes) {
+        result.emplace(classId.Underlying(), classSpec->Weight);
+    }
+    return result;
+}
+
+bool TDynamicThrottlerSpec::ClientConfigEquals(const TDynamicThrottlerSpec& other) const
+{
+    return *BuildPrefetchingConfig() == *other.BuildPrefetchingConfig() &&
+        *RetryingChannel == *other.RetryingChannel &&
+        RpcTimeout == other.RpcTimeout;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1375,6 +1466,41 @@ void CollectAndValidateYTPaths(const TPipelineSpecPtr& spec)
     }
 }
 
+void ValidateControllerResourceFileSources(const TPipelineSpecPtr& spec)
+{
+    THashSet<TResourceId> visited;
+    std::vector<TResourceId> pending;
+    for (const auto& [_, computationSpec] : spec->Computations) {
+        for (const auto& [resourceId, description] : computationSpec->RequiredResourceIds) {
+            if (description->Controller) {
+                pending.push_back(resourceId);
+            }
+        }
+    }
+
+    while (!pending.empty()) {
+        auto resourceId = pending.back();
+        pending.pop_back();
+        if (!visited.insert(resourceId).second) {
+            continue;
+        }
+
+        auto resourceIt = spec->Resources.find(resourceId);
+        if (resourceIt == spec->Resources.end()) {
+            continue;
+        }
+        const auto& resourceSpec = resourceIt->second;
+        THROW_ERROR_EXCEPTION_IF(
+            !resourceSpec->FileSources.empty(),
+            "File-source-backed resource %Qv cannot be loaded on the controller; "
+            "named file sources are worker-only",
+            resourceId);
+        for (const auto& [dependencyId, _] : resourceSpec->Dependencies) {
+            pending.push_back(dependencyId);
+        }
+    }
+}
+
 } // namespace
 
 std::vector<TYTPathClaim> CollectPipelineYTPaths(const TPipelineSpecPtr& spec)
@@ -1398,6 +1524,8 @@ std::vector<TYTPathClaim> CollectPipelineYTPaths(const TPipelineSpecPtr& spec)
 
 void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
 {
+    ValidateControllerResourceFileSources(spec);
+
     for (const auto& [streamId, streamSpec] : spec->Streams) {
         try {
             ValidateStreamSchema(*streamSpec->Schema);
@@ -1810,6 +1938,9 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
 
     for (const auto& [resourceId, resourceSpec] : spec->Resources) {
         try {
+            for (const auto& [fileSourceId, _] : resourceSpec->FileSources) {
+                ValidateFileSourceName(fileSourceId.Underlying());
+            }
             TRegistry::Get()->ValidateResourceSpec(resourceSpec);
         } catch (const std::exception& ex) {
             THROW_ERROR_EXCEPTION(ex)
@@ -1822,19 +1953,108 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec)
     ValidateIsDirectedAcyclicGraph(BuildStreamGraph(spec, /*addReadDelayEdges*/ true));
 }
 
+void ValidateQuotaClassName(TStringBuf className)
+{
+    THROW_ERROR_EXCEPTION_IF(
+        className.empty(),
+        "Throttler class id must not be empty");
+    THROW_ERROR_EXCEPTION_IF(
+        className == DefaultQuotaClassName,
+        "Throttler class id %Qv is reserved",
+        DefaultQuotaClassName);
+}
+
+void ValidateQuotaClassWeight(double weight)
+{
+    THROW_ERROR_EXCEPTION_IF(
+        !std::isfinite(weight) || weight <= 0,
+        "Throttler class weight must be finite and positive, got %v",
+        weight);
+    // The scheduler advances virtual time by amount/weight, so a denormal
+    // weight overflows it to infinity and the subsequent renormalization
+    // turns every class's virtual time into NaN, silently disabling weighted
+    // scheduling for the rest of the process's life.
+    THROW_ERROR_EXCEPTION_IF(
+        weight < MinQuotaClassWeight || weight > MaxQuotaClassWeight,
+        "Throttler class weight must be within [%v, %v], got %v",
+        MinQuotaClassWeight,
+        MaxQuotaClassWeight,
+        weight);
+}
+
 void ValidateDynamicPipelineSpec(const TDynamicPipelineSpecPtr& dynamicSpec)
 {
+    for (const auto& [resourceId, resourceSpec] : dynamicSpec->Resources) {
+        try {
+            for (const auto& [fileSourceId, _] : resourceSpec->FileSources) {
+                ValidateFileSourceName(fileSourceId.Underlying());
+            }
+        } catch (const std::exception& ex) {
+            THROW_ERROR_EXCEPTION(ex)
+                .With("resource_id", resourceId);
+        }
+    }
+
     for (const auto& [computationId, computationSpec] : dynamicSpec->Computations) {
-        auto checkThrottlerId = [&] (const std::optional<TThrottlerId>& throttlerId, TStringBuf field) {
-            if (throttlerId && !dynamicSpec->Throttlers.contains(*throttlerId)) {
+        auto checkThrottlerId = [&] (
+            const std::optional<TThrottlerId>& throttlerId,
+            const std::optional<TQuotaClassId>& classId,
+            TStringBuf field,
+            TStringBuf classField) {
+            if (!throttlerId) {
+                THROW_ERROR_EXCEPTION_IF(
+                    classId.has_value(),
+                    "%v is set but %v is not",
+                    classField,
+                    field);
+                return;
+            }
+            if (!dynamicSpec->Throttlers.contains(*throttlerId)) {
                 THROW_ERROR_EXCEPTION("Throttler %Qv referenced in %v is not declared in dynamic_spec/throttlers",
                     *throttlerId,
                     field)
                     .With("computation_id", computationId);
             }
+            if (!classId || classId->Underlying() == DefaultQuotaClassName) {
+                return;
+            }
+            const auto& throttlerSpec = GetOrCrash(dynamicSpec->Throttlers, *throttlerId);
+            if (!throttlerSpec->Classes.contains(*classId)) {
+                THROW_ERROR_EXCEPTION(
+                    "Throttler class %Qv referenced in %v is not declared for throttler %Qv",
+                    *classId,
+                    classField,
+                    *throttlerId)
+                    .With("computation_id", computationId)
+                    .With("throttler_field", field);
+            }
         };
-        checkThrottlerId(computationSpec->InputRowsThrottlerId, "input_rows_throttler_id");
-        checkThrottlerId(computationSpec->InputBytesThrottlerId, "input_bytes_throttler_id");
+        checkThrottlerId(
+            computationSpec->InputRowsThrottlerId,
+            computationSpec->InputRowsThrottlerClassId,
+            "input_rows_throttler_id",
+            "input_rows_throttler_class_id");
+        checkThrottlerId(
+            computationSpec->InputBytesThrottlerId,
+            computationSpec->InputBytesThrottlerClassId,
+            "input_bytes_throttler_id",
+            "input_bytes_throttler_class_id");
+
+        // The two fields meter different things: one charges a message count,
+        // the other a byte size. Pointing them at one throttler sums counts and
+        // bytes in a single token bucket, so its limit stops meaning anything —
+        // and since byte sizes dwarf counts, the row limit silently stops
+        // applying. Always a configuration error.
+        if (computationSpec->InputRowsThrottlerId &&
+            computationSpec->InputRowsThrottlerId == computationSpec->InputBytesThrottlerId)
+        {
+            THROW_ERROR_EXCEPTION(
+                "Throttler %Qv is referenced by both input_rows_throttler_id and "
+                "input_bytes_throttler_id; a throttler meters either message count "
+                "or byte size, not both",
+                *computationSpec->InputRowsThrottlerId)
+                .With("computation_id", computationId);
+        }
 
         auto validateStateKey = [&] (TStringBuf field, const std::string& name) {
             try {

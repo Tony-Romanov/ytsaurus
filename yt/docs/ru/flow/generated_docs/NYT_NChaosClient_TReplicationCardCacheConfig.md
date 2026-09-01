@@ -36,7 +36,17 @@
 **Значение по умолчанию**: `false`
  ||
 || `retry_backoff` | **Тип**: `NYT::TExponentialBackoffOptions`
-**Значение по умолчанию**: `{'backoff_jitter': 0.1, 'backoff_multiplier': 1.5, 'invocation_count': 10, 'max_backoff': 5000, 'min_backoff': 1000}`
+**Значение по умолчанию**:
+
+```yson
+{
+    "backoff_jitter" = 0.1;
+    "backoff_multiplier" = 1.5;
+    "invocation_count" = 10;
+    "max_backoff" = 5000;
+    "min_backoff" = 1000;
+}
+```
  ||
 || `retry_timeout` | **Тип**: `std::optional<`[TDuration](./all_yson_structs#TDuration)`>`
  ||
@@ -106,6 +116,9 @@
 || `endpoints` | **Тип**: `NYT::TIntrusivePtr<`[NYT::NRpc::TServiceDiscoveryEndpointsConfig](./all_yson_structs#NYT_NRpc_TServiceDiscoveryEndpointsConfig)`>`
  ||
 || `enable_watching` | **Тип**: `bool`
+ ||
+|| `watched_cache` | **Тип**: `NYT::TIntrusivePtr<`[NYT::NChaosClient::TWatchedReplicationCardCacheConfig](./all_yson_structs#NYT_NChaosClient_TWatchedReplicationCardCacheConfig)`>`
+**Значение по умолчанию**: `{}`
  ||
 |#
 

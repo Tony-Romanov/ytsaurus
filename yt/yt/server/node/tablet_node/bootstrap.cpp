@@ -3,6 +3,7 @@
 #include "alien_cluster_client_cache.h"
 #include "backing_store_cleaner.h"
 #include "chunk_replica_cache_pinger.h"
+#include "compaction_hint_fetching.h"
 #include "compression_dictionary_builder.h"
 #include "compression_dictionary_manager.h"
 #include "distributed_throttler_manager.h"
@@ -134,7 +135,7 @@ public:
 
     void Initialize() override
     {
-        YT_LOG_INFO("Initializing tablet node");
+        YT_TLOG_INFO("Initializing tablet node");
 
         // Cycles are fine for bootstrap.
         GetDynamicConfigManager()
@@ -257,6 +258,9 @@ public:
             }
         }
 
+        CompactionHintFetchThrottlers_ = New<TCompactionHintFetchThrottlers>(
+            GetTabletNodeDynamicConfig()->StoreCompactor->CompactionHintFetchers);
+
         auto selfAddress = NNet::BuildServiceAddress(GetLocalHostName(), GetConfig()->RpcPort);
         DistributedThrottlerManager_ = CreateDistributedThrottlerManager(
             this,
@@ -317,7 +321,7 @@ public:
         }
 
         if (!GetConfig()->TabletNode->AllowReignChange) {
-            YT_LOG_DEBUG("Tablet cell reign change is forbidden by config");
+            YT_TLOG_DEBUG("Tablet cell reign change is forbidden by config");
             SetReignChangeAllowed(false);
         }
     }
@@ -553,6 +557,11 @@ public:
             : Throttlers_[it->second];
     }
 
+    const TCompactionHintFetchThrottlersPtr& GetCompactionHintFetchThrottlers() const override
+    {
+        return CompactionHintFetchThrottlers_;
+    }
+
     const IDistributedThrottlerManagerPtr& GetDistributedThrottlerManager() const override
     {
         return DistributedThrottlerManager_;
@@ -655,6 +664,7 @@ private:
 
     TEnumIndexedArray<ETabletNodeThrottlerKind, IReconfigurableThroughputThrottlerPtr> LegacyRawThrottlers_;
     TEnumIndexedArray<ETabletNodeThrottlerKind, IThroughputThrottlerPtr> Throttlers_;
+    TCompactionHintFetchThrottlersPtr CompactionHintFetchThrottlers_;
     IDistributedThrottlerManagerPtr DistributedThrottlerManager_;
     IMediumThrottlerManagerFactoryPtr MediumThrottlerManagerFactory_;
 
@@ -700,6 +710,9 @@ private:
                 LegacyRawThrottlers_[kind]->Reconfigure(std::move(throttlerConfig));
             }
         }
+
+        CompactionHintFetchThrottlers_->Reconfigure(
+            tabletNodeConfig->StoreCompactor->CompactionHintFetchers);
 
         TableReplicatorThreadPool_->SetThreadCount(
             tabletNodeConfig->TabletManager->ReplicatorThreadPoolSize.value_or(

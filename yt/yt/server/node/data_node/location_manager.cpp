@@ -74,9 +74,9 @@ TFuture<void> TLocationManager::FailDiskByName(
                         error.GetMessage())
                         .Apply(BIND([=] (const TError& result) {
                             if (!result.IsOK()) {
-                                YT_LOG_INFO(result,
-                                    "Error marking the disk as failed (DiskName: %v)",
-                                    diskInfo.DeviceName);
+                                YT_TLOG_INFO("Error marking the disk as failed")
+                                    .With("DiskName", diskInfo.DeviceName)
+                                    .With(result);
                             }
                         }));
                 }
@@ -138,8 +138,8 @@ std::vector<TLocationLivenessInfo> TLocationManager::MapLocationToLivenessInfo(
     for (const auto& location : locations) {
         auto it = diskNameToDisk.find(location->GetStaticConfig()->DeviceName);
         if (it == diskNameToDisk.end()) {
-            YT_LOG_WARNING("Unknown location disk (DeviceName: %v)",
-                location->GetStaticConfig()->DeviceName);
+            YT_TLOG_WARNING("Unknown location disk")
+                .With("DeviceName", location->GetStaticConfig()->DeviceName);
             continue;
         }
 
@@ -226,7 +226,8 @@ std::vector<TGuid> TLocationManager::DoDestroyLocations(bool recoverUnlinkedDisk
         for (const auto& diskId : unlinkedDiskIds) {
             YT_UNUSED_FUTURE(RecoverDisk(diskId)
                 .Apply(BIND([] (const TError& result) {
-                    YT_LOG_INFO_IF(!result.IsOK(), result);
+                    YT_TLOG_INFO_IF(!result.IsOK(), "Failed to recover unlinked disk")
+                        .With(result);
                 })));
         }
     }
@@ -387,30 +388,33 @@ void TLocationHealthChecker::OnLocationsHealthCheck()
 
     // Fast path.
     if (!hotSwapEnabled.IsOK()) {
-        YT_LOG_DEBUG(hotSwapEnabled);
+        YT_TLOG_DEBUG("Failed to get hot swap state")
+            .With(hotSwapEnabled);
         return;
     }
 
     if (!hotSwapEnabled.Value()) {
-        YT_LOG_DEBUG(hotSwapEnabled, "Hot swap disabled");
+        YT_TLOG_DEBUG("Hot swap disabled")
+            .With(hotSwapEnabled);
         return;
     }
 
     auto result = WaitFor(LocationManager_->UpdateDiskCache());
 
     if (!result.IsOK()) {
-        YT_LOG_WARNING(result, "Failed to update disk cache");
+        YT_TLOG_WARNING("Failed to update disk cache")
+            .With(result);
     }
 
     auto diskInfosOrError = WaitFor(LocationManager_->GetDiskInfos());
 
     // Fast path.
     if (!diskInfosOrError.IsOK()) {
-        YT_LOG_EVENT(
+        YT_TLOG_EVENT(
             Logger,
             diskInfosOrError.FindMatching(NRpc::EErrorCode::NoSuchService) ? NLogging::ELogLevel::Trace : NLogging::ELogLevel::Info,
-            diskInfosOrError,
-            "Failed to list disk infos");
+            "Failed to list disk infos")
+            .With(diskInfosOrError);
         return;
     }
 

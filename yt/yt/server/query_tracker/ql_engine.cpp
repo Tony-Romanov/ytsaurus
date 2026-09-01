@@ -47,7 +47,7 @@ public:
 
     void Start() override
     {
-        YT_LOG_DEBUG("Starting QL query");
+        YT_TLOG_DEBUG("Starting QL query");
         OnQueryStarted();
         AsyncQueryResult_ = QueryClient_->SelectRows(Query_, Options_);
         AsyncQueryResult_.Subscribe(BIND(&TQLQueryHandler::OnQueryFinish, MakeWeak(this)).Via(GetCurrentInvoker()));
@@ -95,6 +95,11 @@ public:
         , ControlQueue_(New<TActionQueue>("QLEngineControl"))
         , ClusterDirectory_(DynamicPointerCast<NNative::IConnection>(StateClient_->GetConnection())->GetClusterDirectory())
     { }
+
+    bool IsSafeToRestartQuery() const override
+    {
+        return true;
+    }
 
     IQueryHandlerPtr StartOrAttachQuery(NRecords::TActiveQuery activeQuery) override
     {

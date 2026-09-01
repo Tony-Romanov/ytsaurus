@@ -179,6 +179,8 @@ void TConnectionStaticConfig::Register(TRegistrar registrar)
         .Default("default");
     registrar.Parameter("region", &TThis::Region)
         .Default();
+    registrar.Parameter("datacenter", &TThis::Datacenter)
+        .Default();
     registrar.Parameter("banned_replica_tracker_cache", &TThis::BannedReplicaTrackerCache)
         .DefaultNew();
 }
@@ -328,6 +330,9 @@ void TConnectionDynamicConfig::Register(TRegistrar registrar)
     registrar.Parameter("lookup_rows_in_memory_logging_suppression_timeout", &TThis::LookupRowsInMemoryLoggingSuppressionTimeout)
         .Optional();
     registrar.Parameter("lookup_rows_ext_memory_logging_suppression_timeout", &TThis::LookupRowsExtMemoryLoggingSuppressionTimeout)
+        .Optional();
+
+    registrar.Parameter("pull_queue_response_codec", &TThis::PullQueueResponseCodec)
         .Optional();
 
     registrar.Parameter("default_get_tablet_errors_limit", &TThis::DefaultGetTabletErrorsLimit)

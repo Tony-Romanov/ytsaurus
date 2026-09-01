@@ -94,7 +94,7 @@ public:
 
     void Start() override
     {
-        YT_LOG_INFO("Starting mock query");
+        YT_TLOG_INFO("Starting mock query");
         OnQueryStarted();
         if (Query_ == "fail") {
             OnQueryFailed(TError("Mock query failed"));
@@ -140,13 +140,13 @@ public:
 
     void Abort() override
     {
-        YT_LOG_INFO("Aborting mock query");
+        YT_TLOG_INFO("Aborting mock query");
         TDelayedExecutor::Cancel(DelayedCookie_);
     }
 
     void Detach() override
     {
-        YT_LOG_INFO("Detaching mock query");
+        YT_TLOG_INFO("Detaching mock query");
         TDelayedExecutor::Cancel(DelayedCookie_);
     }
 
@@ -163,6 +163,11 @@ public:
         : StateClient_(std::move(stateClient))
         , StateRoot_(std::move(stateRoot))
     { }
+
+    bool IsSafeToRestartQuery() const override
+    {
+        return false;
+    }
 
     IQueryHandlerPtr StartOrAttachQuery(NQueryTrackerClient::NRecords::TActiveQuery activeQuery) override
     {

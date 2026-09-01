@@ -28,6 +28,8 @@
 
 {% include [_](./NYT_NChaosClient_TReplicationCardCacheConfig.md) %}
 
+{% include [_](./NYT_NChaosClient_TWatchedReplicationCardCacheConfig.md) %}
+
 {% include [_](./NYT_NClient_NCache_TClientsCacheConfig.md) %}
 
 {% include [_](./NYT_NCodegen_EOptimizationLevel.md) %}
@@ -74,8 +76,6 @@
 
 {% include [_](./NYT_NFlow_NController_TControllerServiceConfig.md) %}
 
-{% include [_](./NYT_NFlow_NController_TElectionManagerConfig.md) %}
-
 {% include [_](./NYT_NFlow_NController_TLeaseManagerConfig.md) %}
 
 {% include [_](./NYT_NFlow_NController_TPersistedStateManagerConfig.md) %}
@@ -84,7 +84,7 @@
 
 {% include [_](./NYT_NFlow_NFileStorage_TFileStorageConfig.md) %}
 
-{% include [_](./NYT_NFlow_NStaticTableConnector_TTableTimestampLocatorSpec.md) %}
+{% include [_](./NYT_NFlow_NStaticTableConnectorV2_TTableTimestampLocatorSpec.md) %}
 
 {% include [_](./NYT_NFlow_NWorker_TWorkerConfig.md) %}
 
@@ -117,6 +117,8 @@
 {% include [_](./NYT_NFlow_TDynamicExternalStateJoinerSpec.md) %}
 
 {% include [_](./NYT_NFlow_TDynamicExternalStateManagerSpec.md) %}
+
+{% include [_](./NYT_NFlow_TDynamicFileSourceSpec.md) %}
 
 {% include [_](./NYT_NFlow_TDynamicInputStoreSpec.md) %}
 
@@ -160,6 +162,8 @@
 
 {% include [_](./NYT_NFlow_TDynamicTableRequestSpec.md) %}
 
+{% include [_](./NYT_NFlow_TDynamicThrottlerClassSpec.md) %}
+
 {% include [_](./NYT_NFlow_TDynamicThrottlerSpec.md) %}
 
 {% include [_](./NYT_NFlow_TDynamicTimerStoreSpec.md) %}
@@ -177,6 +181,8 @@
 {% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink.md) %}
 
 {% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnector_TSource.md) %}
+
+{% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_NStaticTableConnectorV2_TSource.md) %}
 
 {% include [_](./NYT_NFlow_TDynamicUnitedParameters_NYT_NFlow_TAsyncMultiClusterQueueSink.md) %}
 
@@ -203,10 +209,6 @@
 {% include [_](./NYT_NFlow_TExternalStateManagerSpec.md) %}
 
 {% include [_](./NYT_NFlow_TFetcherInJoinerSpec.md) %}
-
-{% include [_](./NYT_NFlow_TFileResourceDynamicParameters.md) %}
-
-{% include [_](./NYT_NFlow_TFileResourceParameters.md) %}
 
 {% include [_](./NYT_NFlow_TFileSourceSpec.md) %}
 
@@ -287,6 +289,8 @@
 {% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnector_TArrivalOrderTableSink.md) %}
 
 {% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnector_TSource.md) %}
+
+{% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_NStaticTableConnectorV2_TSource.md) %}
 
 {% include [_](./NYT_NFlow_TUnitedParameters_NYT_NFlow_TAsyncMultiClusterQueueSink.md) %}
 

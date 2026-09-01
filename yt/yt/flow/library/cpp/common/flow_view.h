@@ -9,6 +9,7 @@
 #include "timestamp_statistics.h"
 #include "traverse.h"
 
+#include <yt/yt/flow/library/cpp/file_storage/public.h>
 #include <yt/yt/flow/library/cpp/misc/indexed_yson_string.h>
 
 #include <yt/yt/client/ypath/rich.h>
@@ -118,6 +119,14 @@ struct TJob
     TIncarnationId WorkerIncarnationId;
     TPartitionId PartitionId;
     TLeaseId LeaseId;
+    //! When set, the job is fenced by rows of the pipeline's leases dynamic table instead of a
+    //! lease transaction prerequisite (LeaseId stays null).
+    //!
+    //! The counterpart of #LeaseId for the dyntable backend: both are filled once the fence of
+    //! this job exists — the rows are committed by their own transaction before the layout that
+    //! carries this flag — and the controller tells jobs that still need a fence from those that
+    //! already have one by exactly these two fields.
+    bool DyntableLease = false;
 
     REGISTER_YSON_STRUCT(TJob);
 
@@ -322,6 +331,24 @@ DEFINE_REFCOUNTED_TYPE(TMessageDistributorStatus);
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct TFileSnapshotStatus
+    : public NYTree::TYsonStruct
+{
+    TFileSnapshotId SnapshotId;
+    EFileSnapshotState State = EFileSnapshotState::Preparing;
+    std::optional<EFileSnapshotPreparationStage> PreparationStage;
+    TError Error;
+    std::optional<TInstant> NextRetryAt;
+
+    REGISTER_YSON_STRUCT(TFileSnapshotStatus);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TFileSnapshotStatus);
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct TWorkerResourceStatus
     : public NYTree::TYsonStruct
 {
@@ -339,7 +366,15 @@ struct TWorkerResourceStatus
     std::optional<i64> AppliedRevisionId;
     //! Id of the delivered target revision the resource is switching to.
     std::optional<i64> TargetRevisionId;
-    std::optional<EFileResourceUpdateState> UpdateState;
+
+    std::optional<TResourceInstanceId> ResourceInstanceId;
+    std::optional<ui64> ResourceIncarnationGeneration;
+    //! Last fully active file snapshot on this instance.
+    std::optional<TFileSnapshotId> ActiveFileSnapshotId;
+    //! File snapshot currently being prepared or activated.
+    TFileSnapshotStatusPtr PreparingFileSnapshot;
+    //! Number of live accessor leases by file snapshot.
+    THashMap<TFileSnapshotId, i64> LiveAccessorCounts;
 
     REGISTER_YSON_STRUCT(TWorkerResourceStatus);
 
@@ -353,6 +388,7 @@ DEFINE_REFCOUNTED_TYPE(TWorkerResourceStatus);
 struct TWorkerStatus
     : public NYTree::TYsonStruct
 {
+    std::optional<TIncarnationId> WorkerIncarnationId;
     TError PreviousCrashError;
     THashMap<std::string, TError> Errors;
     TMessageDistributorStatusPtr MessageDistributorStatus;

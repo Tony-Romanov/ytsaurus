@@ -137,18 +137,18 @@ void MakeWritable(const TFsPath& path)
     }
     if (!stat.IsDir()) {
         THROW_ERROR_EXCEPTION_UNLESS(
-                Chmod(path.GetPath().c_str(), stat.Mode | S_IWUSR) == 0,
-                "Failed to make file storage entry writable: %Qv",
-                path.GetPath())
-            << TError::FromSystem();
+            Chmod(path.GetPath().c_str(), stat.Mode | S_IWUSR) == 0,
+            "Failed to make file storage entry writable: %Qv",
+            path.GetPath())
+            .With(TError::FromSystem());
         return;
     }
 
     THROW_ERROR_EXCEPTION_UNLESS(
-            Chmod(path.GetPath().c_str(), stat.Mode | S_IRUSR | S_IWUSR | S_IXUSR) == 0,
-            "Failed to make file storage directory writable: %Qv",
-            path.GetPath())
-        << TError::FromSystem();
+        Chmod(path.GetPath().c_str(), stat.Mode | S_IRUSR | S_IWUSR | S_IXUSR) == 0,
+        "Failed to make file storage directory writable: %Qv",
+        path.GetPath())
+        .With(TError::FromSystem());
     TVector<TFsPath> children;
     path.List(children);
     for (const auto& child : children) {
@@ -786,13 +786,13 @@ private:
 
         TError quarantineError;
         if (indexedId) {
-            auto result = Evict(*indexedId, &quarantineError);
-            THROW_ERROR_EXCEPTION_UNLESS(
-                result == EEvictionResult::Evicted,
-                "Invalid indexed file storage object is pinned or changed during quarantine")
-                .With("object_id", *indexedId)
-                .With("path", finalDirectory.GetPath())
-                .With(quarantineError);
+            // Eviction is skipped without an error of its own when the object is merely pinned.
+            if (Evict(*indexedId, &quarantineError) != EEvictionResult::Evicted) {
+                THROW_ERROR_EXCEPTION("Invalid indexed file storage object is pinned or changed during quarantine")
+                    .With("object_id", *indexedId)
+                    .With("path", finalDirectory.GetPath())
+                    .WithIf(!quarantineError.IsOK(), std::move(quarantineError));
+            }
         } else {
             THROW_ERROR_EXCEPTION_UNLESS(
                 QuarantineUnknownPath(finalDirectory, &quarantineError),

@@ -44,7 +44,7 @@ void TTableSourceParameters::Register(TRegistrar registrar)
     registrar.Parameter("skip_non_table_nodes", &TThis::SkipNonTableNodes)
         .Default(false);
 
-    registrar.Parameter("watermark_delay", &TThis::WatermarkDelay)
+    registrar.Parameter("idle_watermark_delay", &TThis::IdleWatermarkDelay)
         .Default(TDuration::Hours(1));
 
     registrar.Parameter("failover_delay", &TThis::FailoverDelay)
@@ -111,6 +111,9 @@ void TDynamicTableSourceParameters::Register(TRegistrar registrar)
 
     registrar.Parameter("restart_instant", &TThis::RestartInstant)
         .Default(TInstant::Zero());
+
+    registrar.Parameter("allow_v1_migration", &TThis::AllowV1Migration)
+        .Default(false);
 
     registrar.Parameter("max_partition_count", &TThis::MaxPartitionCount)
         .Default(TSize::FromString("10K"));

@@ -80,6 +80,11 @@ public:
         return 0;
     }
 
+    NObjectClient::TCellTag GetPrimaryMasterCellTag() const override
+    {
+        return NObjectClient::TCellTag(0);
+    }
+
     const std::vector<IInvokerPtr>& GetNodeShardInvokers() const override
     {
         return NodeShardInvokers_;
@@ -255,7 +260,7 @@ class TPoolTreeElementHostMock
 {
 public:
     explicit TPoolTreeElementHostMock(const TStrategyTreeConfigPtr& treeConfig)
-        : ResourceTree_(New<TResourceTree>(treeConfig, std::vector<IInvokerPtr>({GetCurrentInvoker()})))
+        : ResourceTree_(New<TResourceTree>(StrategyLogger(), treeConfig, std::vector<IInvokerPtr>({GetCurrentInvoker()})))
     { }
 
     TResourceTree* GetResourceTree() override
@@ -263,10 +268,9 @@ public:
         return ResourceTree_.Get();
     }
 
-    void BuildElementLoggingStringAttributes(
+    NLogging::TLoggingTagList BuildElementLoggingTags(
         const TPoolTreeSnapshotPtr& /*treeSnapshot*/,
-        const TPoolTreeElement* /*element*/,
-        TDelimitedStringBuilderWrapper& /*delimitedBuilder*/) const override
+        const TPoolTreeElement* /*element*/) const override
     {
         YT_UNIMPLEMENTED();
     }
