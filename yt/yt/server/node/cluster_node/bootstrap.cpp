@@ -173,6 +173,7 @@
 #include <yt/yt/core/concurrency/fair_throttler.h>
 
 #include <yt/yt/core/net/address.h>
+#include <yt/yt/core/net/local_address.h>
 
 #include <yt/yt/core/misc/collection_helpers.h>
 #include <yt/yt/core/misc/proc.h>
@@ -832,7 +833,7 @@ private:
                 NChunkClient::ConfigureUcxTransport(true, Config_->Ucx->Transports);
 
                 if (IsDataNode()) {
-                    auto host = GetLocalHostName();
+                    auto host = NNet::GetLocalHostName();
                     for (const auto& [network, address] : Config_->Addresses) {
                         if (network == Config_->Ucx->NetworkName) {
                             host = address;

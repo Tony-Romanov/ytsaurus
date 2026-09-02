@@ -35,7 +35,7 @@ void TUcxConfig::Register(TRegistrar registrar)
     registrar.Parameter("enabled", &TThis::Enabled)
         .Default(false);
     registrar.Parameter("port", &TThis::Port)
-        .Default(9020)
+        .Default(9027)
         .InRange(1, 65535);
     registrar.Parameter("network_name", &TThis::NetworkName)
         .Default("default")
