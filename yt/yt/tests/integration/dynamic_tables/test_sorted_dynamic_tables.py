@@ -1,4 +1,4 @@
-from yt_dynamic_tables_base import DynamicTablesBase, SmoothMovementHelper
+from yt_dynamic_tables_base import DynamicTablesBase, SmoothMovementHelper, map_in_parallel
 
 from yt_env_setup import parametrize_external, with_portals_dir
 
@@ -957,6 +957,7 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
 
     @authors("savrus")
     @pytest.mark.parametrize("optimize_for", ["scan", "lookup"])
+    @pytest.mark.timeout(120)
     def test_stress_tablet_readers(self, optimize_for):
         sync_create_cells(1)
         self._create_simple_table(
@@ -969,29 +970,41 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
         items = 100
 
         def verify():
-            expected = [{"key": key, "value": values[key]} for key in list(values.keys())]
-            actual = select_rows("* from [//tmp/t]")
-            assert_items_equal(actual, expected)
-
+            expected_rows = [{"key": key, "value": value} for key, value in values.items()]
             keys = list(values.keys())[::2]
             for i in range(len(keys)):
                 if i % 3 == 0:
                     j = (i * 34567) % len(keys)
                     keys[i], keys[j] = keys[j], keys[i]
 
-            expected = [{"key": key, "value": values[key]} for key in keys]
+            expected_key_rows = [{"key": key, "value": values[key]} for key in keys]
+            sampled_keys = sample(range(1, items), 30)
+            expected_sampled_rows = [{"key": key, "value": values[key]} if key in values else None for key in sampled_keys]
 
-            if len(keys) > 0:
-                actual = select_rows("* from [//tmp/t] where key in (%s)" % ",".join([str(key) for key in keys]))
-                assert_items_equal(actual, expected)
+            def verify_scan():
+                actual = select_rows("* from [//tmp/t]")
+                assert_items_equal(actual, expected_rows)
 
-            actual = lookup_rows("//tmp/t", [{"key": key} for key in keys])
-            assert actual == expected
+            def verify_key_filter():
+                if len(keys) > 0:
+                    actual = select_rows("* from [//tmp/t] where key in (%s)" % ",".join([str(key) for key in keys]))
+                    assert_items_equal(actual, expected_key_rows)
 
-            keys = sample(range(1, items), 30)
-            expected = [{"key": key, "value": values[key]} if key in values else None for key in keys]
-            actual = lookup_rows("//tmp/t", [{"key": key} for key in keys], keep_missing_rows=True)
-            assert actual == expected
+            def verify_lookup():
+                actual = lookup_rows("//tmp/t", [{"key": key} for key in keys])
+                assert actual == expected_key_rows
+
+            def verify_keep_missing_rows():
+                actual = lookup_rows("//tmp/t", [{"key": key} for key in sampled_keys], keep_missing_rows=True)
+                assert actual == expected_sampled_rows
+
+            # Concurrent checks share pending metadata requests.
+            map_in_parallel(lambda check: check(), [
+                verify_scan,
+                verify_key_filter,
+                verify_lookup,
+                verify_keep_missing_rows,
+            ])
 
         verify()
 
@@ -1789,8 +1802,9 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
         with pytest.raises(YtError, match="Cell {} has no assigned peers".format(cell_id)):
             lookup_rows("//tmp/t", [{"key": 1}])
 
-    @authors("gryzlov-ad")
-    def test_watermark_basic(self):
+    @authors("gryzlov-ad", "sabdenovch")
+    @pytest.mark.parametrize("merger", ["watermark", "new"])
+    def test_watermark_basic(self, merger):
         sync_create_cells(1)
         schema = [
             {"name": "key", "type": "int64", "sort_order": "ascending"},
@@ -1804,7 +1818,7 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
                 "max_data_ttl": 0,
                 "min_data_versions": 0,
                 "max_data_versions": 0,
-                "row_merger_type": "watermark",
+                "row_merger_type": merger,
                 "auto_compaction_period": 1,
             },
         )
@@ -1839,8 +1853,9 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
 
         wait(lambda: select_rows(query) == [empty_watermark_row])
 
-    @authors("gryzlov-ad")
-    def test_watermark_wrong_schema(self):
+    @authors("gryzlov-ad", "sabdenovch")
+    @pytest.mark.parametrize("merger", ["watermark", "new"])
+    def test_watermark_wrong_schema(self, merger):
         sync_create_cells(1)
         schema = [
             {"name": "key", "type": "int64", "sort_order": "ascending"},
@@ -1855,7 +1870,7 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
                 "max_data_ttl": 5000,
                 "min_data_versions": 0,
                 "max_data_versions": 1,
-                "row_merger_type": "watermark",
+                "row_merger_type": merger,
                 "auto_compaction_period": 1,
                 "merge_rows_on_flush": True,
             },

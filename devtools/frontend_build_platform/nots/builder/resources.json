@@ -1,24 +1,22 @@
 {
   "info": {
-    "created": "2026-11-08T19:38:24.138Z",
-    "pr": {
-      "id": 16941841,
-      "author": "zaverden",
-      "summary": "FBP-3684: nots/builder: работа с архивами через бинарь nots-tar"
-    }
+    "created": "2026-11-14T15:52:34Z",
+    "commit": "ba124fad36a5d24e8f89f58afe3709244022a9f5",
+    "branch": "FBP-3712-auto-proto-only",
+    "dirty": false
   },
   "by_platform": {
     "darwin": {
-      "uri": "sbr:14219896499"
+      "uri": "sbr:14269537712"
     },
     "darwin-arm64": {
-      "uri": "sbr:14219895977"
+      "uri": "sbr:14269537923"
     },
     "linux": {
-      "uri": "sbr:14219897799"
+      "uri": "sbr:14269537077"
     },
     "linux-aarch64": {
-      "uri": "sbr:14219897066"
+      "uri": "sbr:14269537553"
     }
   }
 }

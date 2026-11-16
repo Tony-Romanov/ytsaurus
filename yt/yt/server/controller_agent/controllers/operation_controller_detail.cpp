@@ -427,7 +427,9 @@ void TOperationControllerBase::BuildTestingState(TFluentAny fluent) const
 {
     fluent
         .BeginMap()
-            .Item("commit_sleep_started").Value(CommitSleepStarted_)
+            .DoIf(Config_->TestingOptions->EnableCypressSleepState, [&] (TFluentMap fluent) {
+                fluent.Item("commit_sleep_started").Value(CommitSleepStarted_);
+            })
             .Item("dynamic_spec").Value(SpecManager_->GetSpec())
         .EndMap();
 }
@@ -1682,7 +1684,7 @@ TOperationControllerReviveResult TOperationControllerBase::Revive(bool suspended
             .StartTime = joblet->StartTime,
             .PreemptibleProgressStartTime = joblet->PreemptibleProgressStartTime,
             .ResourceLimits = joblet->ResourceLimits,
-            .DiskQuota = joblet->DiskQuota,
+            .DiskQuota = allocation.Resources.DiskQuota(),
             .TreeId = joblet->TreeId,
             .NodeId = joblet->NodeDescriptor.Id,
             .NodeAddress = NNodeTrackerClient::GetDefaultAddress(joblet->NodeDescriptor.Addresses),
@@ -2536,7 +2538,10 @@ void TOperationControllerBase::ManuallyMergeBranchedCypressNode(
         auto coordinatorCellId = Client_->GetNativeConnection()->GetMasterCellId(coordinatorCellTag);
         auto targetCellId = Client_->GetNativeConnection()->GetMasterCellId(targetCellTag);
 
-        TStrongOrderingTagsMap strongOrderingTags{{coordinatorCellId, {NNative::SequoiaCypressOrderingTag}}};
+        // TODO(h0pless): remove SequoiaCypressOrderingTag when fine-grained locks will be the default.
+        TCellIdToStrongOrderingTagSet strongOrderingTags{{coordinatorCellId, {NNative::SequoiaCypressOrderingTag, ToString(transactionId)}}};
+        // NB: targetCellId may be the same as coordinatorCellId.
+        strongOrderingTags[targetCellId].insert({NNative::SequoiaCypressOrderingTag, ToString(nodeId), ToString(transactionId)});
         if (coordinatorCellTag != targetCellTag) {
             // Output completion transaction should become committed on node's
             // native cell.
@@ -2550,8 +2555,6 @@ void TOperationControllerBase::ManuallyMergeBranchedCypressNode(
                 coordinatorCellId);
             WaitFor(request->Invoke())
                 .ThrowOnError();
-
-            strongOrderingTags[targetCellId] = {NNative::SequoiaCypressOrderingTag};
         }
 
         // It is just a way to run custom logic at master.
@@ -2641,7 +2644,7 @@ void TOperationControllerBase::SleepInCommitStage(EDelayInsideOperationCommitSta
     auto stage = Spec_->TestingOperationOptions->DelayInsideOperationCommitStage;
     auto skipOnSecondEntrance = Spec_->TestingOperationOptions->NoDelayOnSecondEntranceToCommit;
 
-    {
+    if (Config_->TestingOptions->EnableCypressSleepState) {
         auto proxy = CreateObjectServiceWriteProxy(Host_->GetClient());
 
         auto path = GetOperationPath(OperationId_) + "/@testing";

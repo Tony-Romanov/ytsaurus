@@ -140,6 +140,8 @@ public:
         TCompositeAutomatonPart::RegisterMethod(
             BIND_NO_PROPAGATE(&TTransactionSupervisor::HydraCoordinatorFinishDistributedTransaction, Unretained(this)));
         TCompositeAutomatonPart::RegisterMethod(
+            BIND_NO_PROPAGATE(&TTransactionSupervisor::HydraCoordinatorClearTransactions, Unretained(this)));
+        TCompositeAutomatonPart::RegisterMethod(
             BIND_NO_PROPAGATE(&TTransactionSupervisor::HydraParticipantPrepareTransaction, Unretained(this)));
         TCompositeAutomatonPart::RegisterMethod(
             BIND_NO_PROPAGATE(&TTransactionSupervisor::HydraParticipantRecordCommitTimestamp, Unretained(this)),
@@ -820,6 +822,8 @@ private:
                 .SetInvoker(GetSyncInvoker()));
             TServiceBase::RegisterMethod(RPC_SERVICE_METHOD_DESC(GetDownedParticipants)
                 .SetHeavy(true));
+            TServiceBase::RegisterMethod(RPC_SERVICE_METHOD_DESC(ClearTransactions)
+                .SetHeavy(true));
         }
 
     private:
@@ -844,7 +848,7 @@ private:
             // COMPAT(h0pless): Remove this flag after 26.1.
             auto stronglyOrdered = request->strongly_ordered();
 
-            TStrongOrderingTagsMap strongOrderingTags;
+            TCellIdToStrongOrderingTagList strongOrderingTags;
             for (const auto& entry : request->strong_ordering_tags_map()) {
                 auto cellId = FromProto<TCellId>(entry.cell_id());
                 if (!strongOrderingTags.emplace(cellId, FromProto<std::vector<std::string>>(entry.strong_ordering_tags())).second) {
@@ -1080,6 +1084,31 @@ private:
 
             context->Reply();
         }
+
+        //! Dangerous mutation. Do not use unless you 100% know what you are doing.
+        //! This method is created to clear stuck transactions, that are never ever going to finish.
+        //! Prerequisite to using this method is finding such stuck transactions.
+        DECLARE_RPC_SERVICE_METHOD(NProto::NTransactionSupervisor, ClearTransactions)
+        {
+            ValidatePeer(EPeerKind::Leader);
+
+            auto transactionIds = FromProto<std::vector<TTransactionId>>(request->transaction_ids());
+
+            context->AnnotateRequest()
+                .With("TransactionCount", transactionIds.size())
+                .With("DiscardLazyTransactions", request->discard_lazy_transactions());
+
+            auto owner = GetOwnerOrThrow();
+
+            NTransactionSupervisor::NProto::TReqCoordinatorClearTransactions hydraRequest;
+            ToProto(hydraRequest.mutable_transaction_ids(), transactionIds);
+            hydraRequest.set_discard_lazy_transactions(request->discard_lazy_transactions());
+
+            auto mutation = CreateMutation(owner->HydraManager_, hydraRequest);
+            mutation->SetMutationId(context->GetMutationId(), context->IsRetry());
+            mutation->SetCurrentTraceContext();
+            YT_UNUSED_FUTURE(mutation->CommitAndReply(context));
+        }
     };
 
     const TIntrusivePtr<TTransactionSupervisorService> TransactionSupervisorService_;
@@ -1214,6 +1243,8 @@ private:
             auto transactionId = FromProto<TTransactionId>(request->transaction_id());
             auto commitTimestamp = FromProto<NTransactionClient::TTimestamp>(request->commit_timestamp());
             auto commitTimestampClusterTag = request->commit_timestamp_cluster_tag();
+
+            // Safe to remove after 26.3.
             auto stronglyOrdered = request->strongly_ordered();
 
             context->AnnotateRequest()
@@ -1248,6 +1279,8 @@ private:
             ValidatePeer(EPeerKind::Leader);
 
             auto transactionId = FromProto<TTransactionId>(request->transaction_id());
+
+            // Safe to remove after 26.3.
             auto stronglyOrdered = request->strongly_ordered();
 
             context->AnnotateRequest()
@@ -1434,7 +1467,7 @@ private:
         bool inheritCommitTimestamp,
         ETransactionCoordinatorPrepareMode coordinatorPrepareMode,
         ETransactionCoordinatorCommitMode coordinatorCommitMode,
-        TStrongOrderingTagsMap strongOrderingTags,
+        TCellIdToStrongOrderingTagList strongOrderingTags,
         TTimestamp maxAllowedCommitTimestamp,
         TMutationId mutationId,
         const TAuthenticationIdentity& identity)
@@ -1800,7 +1833,7 @@ private:
         auto prepareTimestampClusterTag = FromProto<TClusterTag>(request->prepare_timestamp_cluster_tag());
         auto maxAllowedCommitTimestamp = FromProto<NTransactionClient::TTimestamp>(request->max_allowed_commit_timestamp());
 
-        TStrongOrderingTagsMap strongOrderingTags;
+        TCellIdToStrongOrderingTagList strongOrderingTags;
         for (const auto& entry : request->strong_ordering_tags_map()) {
             auto cellId = FromProto<TCellId>(entry.cell_id());
             EmplaceOrCrash(strongOrderingTags, cellId, FromProto<std::vector<std::string>>(entry.strong_ordering_tags()));
@@ -1835,7 +1868,7 @@ private:
 
             YT_TLOG_ALERT_AND_THROW_UNLESS(
                 StrongOrderingManager_.IsUniqueClockSource(prepareTimestampClusterTag),
-                "Clocks for strong ordered transactions are not unique")
+                "Clocks for strongly ordered transactions are not unique")
                 .With("TransactionId", transactionId)
                 .With("PrepareTimestampClusterTag", prepareTimestampClusterTag)
                 .With("ExpectedClusterTag", StrongOrderingManager_.GetClockSourceClusterTag());
@@ -1895,6 +1928,9 @@ private:
             return;
         }
 
+        commit->AddStrongOrderingTagsForCell(
+            TransactionManager_->GenerateStrongOrderingTags(transactionId),
+            SelfCellId_);
         if (commit->IsStronglyOrderedForCell(SelfCellId_)) {
             // Technically, transaction should be registered before attempting to run prepare,
             // and unregistered iff prepare fails. But since it all hapens in one mutation
@@ -1903,7 +1939,7 @@ private:
                 transactionId,
                 prepareTimestamp,
                 /*isCoordinator*/ true,
-                strongOrderingTags[SelfCellId_]);
+                commit->GetStrongOrderingTagsForCell(SelfCellId_));
         }
 
         ChangeCommitPersistentState(commit, ECommitState::Prepare);
@@ -2146,6 +2182,62 @@ private:
             .With("TransactionId", transactionId);
     }
 
+    void HydraCoordinatorClearTransactions(NTransactionSupervisor::NProto::TReqCoordinatorClearTransactions* request)
+    {
+        YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
+
+        auto transactionIds = FromProto<std::vector<TTransactionId>>(request->transaction_ids());
+
+        for (const auto& transactionId : transactionIds) {
+            auto* commit = FindPersistentCommit(transactionId);
+            if (!commit) {
+                YT_TLOG_DEBUG("Requested to clear a non-existing transaction commit; ignored")
+                    .With("TransactionId", transactionId);
+                continue;
+            }
+
+            if (commit->GetCoordinatorCommitMode() == ETransactionCoordinatorCommitMode::Lazy) {
+                if (!request->discard_lazy_transactions()) {
+                    YT_TLOG_WARNING("Lazy transaction clear skipped; explicit opt-in required")
+                        .With("TransactionId", transactionId);
+                    continue;
+                }
+
+                auto state = commit->GetPersistentState();
+                if (state != ECommitState::Commit && state != ECommitState::Abort) {
+                    YT_TLOG_WARNING("Lazy transaction clear skipped; transaction is not finished")
+                        .With("TransactionId", transactionId)
+                        .With("State", state);
+                    continue;
+                }
+
+                if (state == ECommitState::Commit) {
+                    auto identity = commit->AuthenticationIdentity();
+                    NRpc::TCurrentAuthenticationIdentityGuard identityGuard(&identity);
+
+                    try {
+                        TTransactionAbortOptions options{
+                            .Force = true,
+                        };
+                        TransactionManager_->AbortTransaction(transactionId, options);
+                    } catch (const std::exception& ex) {
+                        if (!TError(ex).FindMatching(NTransactionClient::EErrorCode::NoSuchTransaction)) {
+                            YT_TLOG_WARNING("Lazy coordinator transaction could not be discarded")
+                                .With("TransactionId", transactionId)
+                                .With(ex);
+                            continue;
+                        }
+                    }
+
+                    SetCommitFailed(commit, TError(
+                        "Lazy transaction %v was discarded by an administrator",
+                        transactionId));
+                }
+            }
+
+            RemovePersistentCommit(commit);
+        }
+    }
 
     // Possible persistent transaction states:
     // Active -- ok
@@ -2175,7 +2267,7 @@ private:
         if (!strongOrderingTags.empty()) {
             YT_TLOG_ALERT_AND_THROW_UNLESS(
                 StrongOrderingManager_.IsUniqueClockSource(prepareTimestampClusterTag),
-                "Clocks for strong ordered transactions are not unique")
+                "Clocks for strongly ordered transactions are not unique")
                 .With("TransactionId", transactionId)
                 .With("PrepareTimestampClusterTag", prepareTimestampClusterTag)
                 .With("ExpectedClusterTag", StrongOrderingManager_.GetClockSourceClusterTag());
@@ -2204,7 +2296,13 @@ private:
             THROW_ERROR WrapHydraError(ex);
         }
 
+        std::ranges::move(
+            TransactionManager_->GenerateStrongOrderingTags(transactionId),
+            std::back_inserter(strongOrderingTags));
+
         if (!strongOrderingTags.empty()) {
+            SortUnique(strongOrderingTags);
+
             StrongOrderingManager_.OnCommitPrepare(
                 transactionId,
                 prepareTimestamp,
@@ -2251,7 +2349,7 @@ private:
 
         YT_TLOG_ALERT_AND_THROW_UNLESS(
             StrongOrderingManager_.IsUniqueClockSource(commitTimestampClusterTag),
-            "Clocks for strong ordered transactions are not unique")
+            "Clocks for strongly ordered transactions are not unique")
             .With("TransactionId", transactionId)
             .With("CommitTimestampClusterTag", commitTimestampClusterTag)
             .With("ExpectedClusterTag", StrongOrderingManager_.GetClockSourceClusterTag());
@@ -2282,12 +2380,11 @@ private:
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
         auto commitTimestamp = FromProto<NTransactionClient::TTimestamp>(request->commit_timestamp());
         auto commitTimestampClusterTag = FromProto<TClusterTag>(request->commit_timestamp_cluster_tag());
-        auto stronglyOrdered = request->strongly_ordered();
 
         auto identity = NRpc::ParseAuthenticationIdentityFromProto(*request);
         NRpc::TCurrentAuthenticationIdentityGuard identityGuard(&identity);
 
-        if (stronglyOrdered) {
+        if (StrongOrderingManager_.IsTransactionPresent(transactionId)) {
             auto state = InvokeAndWrapHydraException(
                 &ITransactionManager::GetTransactionStateOrThrow,
                 TransactionManager_,
@@ -2308,7 +2405,7 @@ private:
 
             YT_TLOG_ALERT_AND_THROW_UNLESS(
                 StrongOrderingManager_.IsUniqueClockSource(commitTimestampClusterTag),
-                "Clocks for strong ordered transactions are not unique")
+                "Clocks for strongly ordered transactions are not unique")
                 .With("TransactionId", transactionId)
                 .With("CommitTimestampClusterTag", commitTimestampClusterTag)
                 .With("ExpectedClusterTag", StrongOrderingManager_.GetClockSourceClusterTag());
@@ -2384,11 +2481,10 @@ private:
         YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
 
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
-        auto stronglyOrdered = request->strongly_ordered();
-
         auto identity = NRpc::ParseAuthenticationIdentityFromProto(*request);
         NRpc::TCurrentAuthenticationIdentityGuard identityGuard(&identity);
 
+        auto stronglyOrdered = StrongOrderingManager_.IsTransactionPresent(transactionId);
         if (stronglyOrdered) {
             auto state = InvokeAndWrapHydraException(
                 &ITransactionManager::GetTransactionStateOrThrow,
@@ -2416,7 +2512,7 @@ private:
             };
             TransactionManager_->AbortTransaction(transactionId, options);
         } catch (const std::exception& ex) {
-            YT_TLOG_EVENT(Logger(), stronglyOrdered ? NLogging::ELogLevel::Alert : NLogging::ELogLevel::Debug, "Participant failure")
+            YT_TLOG_EVENT(Logger(), stronglyOrdered ? NLogging::ELogLevel::Fatal : NLogging::ELogLevel::Debug, "Participant failure")
                 .With("TransactionId", transactionId)
                 .With("State", ECommitState::Abort)
                 .With("AuthenticationIdentity", NRpc::GetCurrentAuthenticationIdentity())
@@ -2470,7 +2566,7 @@ private:
         bool inheritCommitTimestamp,
         ETransactionCoordinatorPrepareMode coordinatorPrepareMode,
         ETransactionCoordinatorCommitMode coordinatorCommitMode,
-        TStrongOrderingTagsMap strongOrderingTags,
+        TCellIdToStrongOrderingTagList strongOrderingTags,
         TTimestamp maxAllowedCommitTimestamp,
         NRpc::TAuthenticationIdentity identity)
     {
@@ -2506,7 +2602,7 @@ private:
         bool inheritCommitTimestamp,
         ETransactionCoordinatorPrepareMode coordinatorPrepareMode,
         ETransactionCoordinatorCommitMode coordinatorCommitMode,
-        TStrongOrderingTagsMap strongOrderingTags,
+        TCellIdToStrongOrderingTagList strongOrderingTags,
         TTimestamp maxAllowedCommitTimestamp,
         NRpc::TAuthenticationIdentity identity)
     {

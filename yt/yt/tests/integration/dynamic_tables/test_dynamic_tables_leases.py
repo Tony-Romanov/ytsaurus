@@ -1,4 +1,4 @@
-from yt_env_setup import YTEnvSetup, Restarter, NODES_SERVICE, MASTERS_SERVICE
+from yt_env_setup import YTEnvSetup, Restarter, NODES_SERVICE, MASTERS_SERVICE, with_additional_threads
 
 from yt_commands import (
     authors, ls, issue_lease, revoke_lease, reference_lease, unreference_lease, insert_rows, select_rows,
@@ -8,6 +8,10 @@ from yt_commands import (
     update_nodes_dynamic_config,
 )
 
+from yt_driver_bindings import Driver
+
+import yt_error_codes
+
 from yt_helpers import master_exit_read_only_sync
 
 from yt.test_helpers import (
@@ -16,6 +20,7 @@ from yt.test_helpers import (
 
 import pytest
 
+from copy import deepcopy
 import time
 
 ##################################################################
@@ -27,7 +32,25 @@ class TestDynamicTablesLeases(YTEnvSetup):
     NUM_NODES = 3
     USE_DYNAMIC_TABLES = True
 
+    # Failed assertions can leave deliberately held lease references blocking cleanup.
+    FORCE_ABORT_TRANSACTIONS_ON_CLEANUP = True
+
     LEASE_ID = "1-2-3-4"
+
+    DELTA_MASTER_CONFIG = {
+        "rpc_server": {
+            "services": {
+                "CypressTransactionService": {
+                    "methods": {
+                        "AbortTransaction": {
+                            "max_queue_size": 20,
+                            "max_concurrency": 20,
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     def _get_leases(self, cell_id):
         node = get(f"#{cell_id}/@peers/0/address")
@@ -689,3 +712,48 @@ class TestDynamicTablesLeases(YTEnvSetup):
 
         self._set_lease_removal_config(max_leases_per_removal=lease_count, lease_removal_period=1)
         wait(lambda: not exists(f"#{cell_id}"))
+
+    @authors("kvk1920")
+    @with_additional_threads
+    def test_lease_revocation_timeout(self):
+        cell_id = sync_create_cells(1)[0]
+        tx = self._create_lease(cell_id)
+
+        reference_lease(cell_id, tx)
+        self._check_lease(cell_id, "active", 1, 0, lease_id=tx)
+
+        driver_config = deepcopy(self.Env.configs["driver"])
+        driver_config["api_version"] = 4
+        driver_config["transaction_manager"].update({
+            "retry_timeout": 1000,
+            "retry_attempts": 1,
+        })
+        driver_config["cypress_proxy"].update({
+            "retry_timeout": 1000,
+            "retry_attempts": 1,
+        })
+        driver = Driver(driver_config)
+
+        def run_abort():
+            with raises_yt_error() as error:
+                abort_transaction(tx, driver=driver, verbose=False)
+            assert error[0].contains_code(yt_error_codes.Timeout) or error[0].contains_code(
+                yt_error_codes.RequestQueueSizeLimitExceeded)
+
+        abort_requests = [
+            self.spawn_additional_thread(target=run_abort)
+            for _ in range(50)
+        ]
+
+        for request in abort_requests:
+            request.join()
+
+        # NB: If all previous requests aren't stuck this request won't get
+        # "RequestQueueSizeLimitExceeded" error.
+        with raises_yt_error(code=yt_error_codes.Timeout):
+            abort_transaction(tx, driver=driver)
+
+        self._check_lease(cell_id, "revoking", 1, 0, lease_id=tx)
+        unreference_lease(cell_id, tx)
+
+        wait(lambda: not exists(f"#{tx}"))

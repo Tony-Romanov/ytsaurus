@@ -658,6 +658,9 @@ struct TComputationSpec
     std::optional<bool> ExperimentalEnableNonUintKey;
     THashSet<TStreamId> InputStreamIds;
     THashSet<TStreamId> OutputStreamIds;
+    //! Output messages up to this size are allowed when every output stream is consumed only by local sinks.
+    //! Only #TSwiftOrderedSourceComputation honors it.
+    std::optional<i64> MaxLocalMessageByteSize;
 
     THashMap<TStreamId, THashSet<TStreamId>> StreamsDependency;
 
@@ -737,6 +740,20 @@ bool ResolveUseCompactInputMessages(const TComputationSpecPtr& spec);
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct TFailureHandlerSpec
+    : public NYTree::TYsonStruct
+{
+    bool Enabled = false;
+
+    REGISTER_YSON_STRUCT(TFailureHandlerSpec);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TFailureHandlerSpec);
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct TPipelineSpec
     : public NYTree::TYsonStruct
 {
@@ -748,6 +765,8 @@ struct TPipelineSpec
     THashMap<TComputationId, TComputationSpecPtr> Computations;
     THashMap<TResourceId, TResourceSpecPtr> Resources;
     THashMap<TStreamId, TStreamSpecPtr> Streams;
+
+    TFailureHandlerSpecPtr FailureHandler;
 
     REGISTER_YSON_STRUCT(TPipelineSpec);
 

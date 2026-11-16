@@ -139,6 +139,14 @@ void AddFatalMessageToTaskResult(NProto::TTaskResult* taskResult, const TString&
 
 namespace {
 
+TProjectSettings ConvertProjectSettings(const NProto::TTaskData& taskData) {
+    TProjectSettings settings;
+    for (const auto& pragma : taskData.GetProject().GetSettings().GetPragmas()) {
+        settings.AddPragma(pragma.GetName(), TVector<TString>(pragma.GetValue().begin(), pragma.GetValue().end()));
+    }
+    return settings;
+}
+
 const size_t MAX_RESULT_LIMIT = 15 << 20; // 15Mb. MongoDB has 16Mb limit for one document
 constexpr TStringBuf AST_TOO_LARGE =
     "(\n"
@@ -509,6 +517,8 @@ public:
         } else {
             ExtAddRemoteLayersProvider(programFactory, baseLayerProvider);
         }
+
+        programFactory->SetProjectSettings(ConvertProjectSettings(*TaskData));
 
         for (ui8 i = 0; i < (HiddenMode != EHiddenMode::Disable ? 2 : 1); i++) {
             bool isHidden = i == 1;
@@ -1733,6 +1743,7 @@ private:
 
     NSQLTranslation::TTranslationSettings GetSqlTranslationSettings() const {
         NSQLTranslation::TTranslationSettings settings;
+        settings.ProjectSettings = ConvertProjectSettings(*TaskData);
         settings.ClusterMapping = Clusters;
         settings.ClusterPathPrefixes = ClusterPathPrefixes;
         if (DefaultTranslationCluster) {
@@ -1966,7 +1977,6 @@ struct TYqlRunnableTaskFactory::TImpl {
         YQL_LOG(INFO) << "CreateFuncRegistry over " << udfs.size() << " UDFs ...";
         FuncRegistry = CreateFuncRegistry(udfs);
         YQL_LOG(INFO) << "CreateFuncRegistry complete";
-        TString frozenUdfResolverPath;
 
         TVector<IUrlListerPtr> urlListers = {MakeYtUrlLister(YtClusters)};
         ExtUrlListers(urlListers);
@@ -1977,23 +1987,28 @@ struct TYqlRunnableTaskFactory::TImpl {
                        "File " << executorConfig.GetUdfResolverPath()
                        << " does not exist");
 
-            frozenUdfResolverPath = FreezeFile(executorConfig.GetUdfResolverPath());
+            NCommon::TOutProcUdfResolverOptions udfResolverOptions{
+                .ResolverPath = FreezeFile(executorConfig.GetUdfResolverPath()),
+                .FilterSysCalls = executorConfig.GetUdfResolverFilterSyscalls(),
+            };
+            if (executorConfig.HasUdfResolverUser()) {
+                udfResolverOptions.User = executorConfig.GetUdfResolverUser();
+            }
+            if (executorConfig.HasUdfResolverGroup()) {
+                udfResolverOptions.Group = executorConfig.GetUdfResolverGroup();
+            }
+            if (executorConfig.HasUdfResolverPortoProxyPath()) {
+                auto& portoConfig = udfResolverOptions.PortoConfig.ConstructInPlace();
+                portoConfig.ProxyBinaryPath = executorConfig.GetUdfResolverPortoProxyPath();
+                portoConfig.Layers.assign(executorConfig.GetUdfResolverPortoLayers().begin(), executorConfig.GetUdfResolverPortoLayers().end());
+            }
+            if (const auto& stubPath = executorConfig.GetUdfDependencyStubPath(); !stubPath.empty()) {
+                udfResolverOptions.UdfDependencyStubPath = FreezeFile(stubPath);
+            }
             const bool scanUdfs = executorConfig.GetScanUdfs();
             THoldingFileStorage holdingFileStorage(FileStorage);
             if (scanUdfs) {
-                TString frozenUdfDependencyStubPath = executorConfig.GetUdfDependencyStubPath();
-                if (frozenUdfDependencyStubPath) {
-                    frozenUdfDependencyStubPath = FreezeFile(frozenUdfDependencyStubPath);
-                }
-
-                UdfResolver = NCommon::CreateOutProcUdfResolver(
-                    FuncRegistry.Get(), FileStorage,
-                    frozenUdfResolverPath,
-                    executorConfig.GetUdfResolverUser(),
-                    executorConfig.GetUdfResolverGroup(),
-                    executorConfig.GetUdfResolverFilterSyscalls(),
-                    frozenUdfDependencyStubPath,
-                    udfsWithMd5);
+                UdfResolver = NCommon::CreateOutProcUdfResolver(FuncRegistry.Get(), FileStorage, udfResolverOptions, udfsWithMd5);
 
                 YQL_LOG(INFO) << "Build UdfIndex for " << udfsWithMd5.size() << " UDFs ...";
                 UdfIndex = new TUdfIndex();
@@ -2010,24 +2025,13 @@ struct TYqlRunnableTaskFactory::TImpl {
                     YQL_LOG(INFO) << "System UDFs scanned";
                 } else {
                     YQL_LOG(INFO) << "Load system UDFs into function registry ...";
-                    LoadSystemUdfsIntoFunctionRegistry(frozenUdfResolverPath, executorConfig.GetSystemUdfsDir());
+                    LoadSystemUdfsIntoFunctionRegistry(udfResolverOptions, executorConfig.GetSystemUdfsDir());
                     YQL_LOG(INFO) << "System UDFs are loaded into function registry";
                 }
             }
 
             if (!scanUdfs) {
-                TString frozenUdfDependencyStubPath = executorConfig.GetUdfDependencyStubPath();
-                if (frozenUdfDependencyStubPath) {
-                    frozenUdfDependencyStubPath = FreezeFile(frozenUdfDependencyStubPath);
-                }
-
-                UdfResolver = NCommon::CreateOutProcUdfResolver(
-                    FuncRegistry.Get(), FileStorage,
-                    frozenUdfResolverPath,
-                    executorConfig.GetUdfResolverUser(),
-                    executorConfig.GetUdfResolverGroup(),
-                    executorConfig.GetUdfResolverFilterSyscalls(),
-                    frozenUdfDependencyStubPath);
+                UdfResolver = NCommon::CreateOutProcUdfResolver(FuncRegistry.Get(), FileStorage, std::move(udfResolverOptions));
             }
 
         } else {
@@ -2213,7 +2217,7 @@ struct TYqlRunnableTaskFactory::TImpl {
         return DqCoordinator;
     }
 
-    void InitGateways(TTaskDataPtr taskData, const NProto::TFunctionRegistryData* data) {
+    void InitGateways(TTaskDataPtr taskData, const NProto::TFunctionRegistryData* data, const TQContext& qContext) {
         const bool disableAnonymousAccess = (Affiliation != NProto::EStaffAffiliation::YANDEX);
 
         DataProvidersInit.push_back(GetPgDataProviderInitializer());
@@ -2341,10 +2345,13 @@ struct TYqlRunnableTaskFactory::TImpl {
         SqlFlags = SampleSQLFlags(GatewaysConfig, taskData);
         ExtAddTranslators(ExecutorConfig.GetSparkParserPort(), TranslatorsRegistry);
 
-        InitModuleResolver(data);
+        const auto projectSettings = qContext.CanRead()
+            ? ProjectSettingsFromQContext(qContext)
+            : taskData ? ConvertProjectSettings(*taskData) : TProjectSettings{};
+        InitModuleResolver(data, projectSettings);
     }
 
-    void InitModuleResolver(const NProto::TFunctionRegistryData* data) {
+    void InitModuleResolver(const NProto::TFunctionRegistryData* data, const TProjectSettings& projectSettings) {
         LoadYqlDefaultMounts(UserData);
         ExtUserMounts(UserData);
 
@@ -2376,13 +2383,15 @@ struct TYqlRunnableTaskFactory::TImpl {
         );
 
         TModulesTable modules;
-        if (CompileLibraries(translators, UserData, LibrariesContext, modules)) {
+        if (CompileLibraries(translators, UserData, LibrariesContext, modules, /*optimize*/ true, projectSettings)) {
             ModuleResolver = std::make_shared<TModuleResolver>(translators, std::move(modules),
                 LibrariesContext.NextUniqueId, Clusters, sqlFlags);
         } else {
             ythrow yexception() << "Libraries compilation error: "
                 << LibrariesContext.IssueManager.GetIssues().ToString();
         }
+
+        ModuleResolver->SetProjectSettings(std::make_shared<const TProjectSettings>(projectSettings));
 
         // it is safe to Link mount files
         if (!ModuleResolver->Link(LibrariesContext)) {
@@ -2478,9 +2487,9 @@ private:
         }
     }
 
-    void LoadSystemUdfsIntoFunctionRegistry(const TString& udfResolverPath, const TString& systemUdfsDir) {
+    void LoadSystemUdfsIntoFunctionRegistry(const NCommon::TOutProcUdfResolverOptions& options, const TString& systemUdfsDir) {
         TUdfModulePathsMap systemModules;
-        NCommon::LoadSystemModulePaths(udfResolverPath, systemUdfsDir, &systemModules);
+        NCommon::LoadSystemModulePaths(options, systemUdfsDir, &systemModules);
 
         TUdfModulePathsMap filteredModules;
         for (auto& module : systemModules) {
@@ -2619,8 +2628,8 @@ TYqlRunnableTaskFactory::~TYqlRunnableTaskFactory()
 {
 }
 
-void TYqlRunnableTaskFactory::InitGateways(TTaskDataPtr taskData, const NProto::TFunctionRegistryData* data) {
-    Impl_->InitGateways(taskData, data);
+void TYqlRunnableTaskFactory::InitGateways(TTaskDataPtr taskData, const NProto::TFunctionRegistryData* data, const TQContext& qContext) {
+    Impl_->InitGateways(taskData, data, qContext);
 }
 
 void TYqlRunnableTaskFactory::SetUserAffiliation(NProto::EStaffAffiliation affiliation) {

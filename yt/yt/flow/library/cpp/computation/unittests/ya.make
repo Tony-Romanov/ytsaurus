@@ -3,6 +3,7 @@ GTEST()
 INCLUDE(${ARCADIA_ROOT}/yt/yt/flow/flow.make.inc)
 
 SRCS(
+    failed_messages_ut.cpp
     read_delay_ut.cpp
     availability_groups_ut.cpp
     compact_output_store_ut.cpp
@@ -30,6 +31,7 @@ SRCS(
     state_client_ut.cpp
     state_providers_ut.cpp
     swift_map_validation_ut.cpp
+    swift_map_computation_ut.cpp
     paged_timer_store_differential_ut.cpp
     paged_timer_store_ut.cpp
     timer_page_catalogue_ut.cpp

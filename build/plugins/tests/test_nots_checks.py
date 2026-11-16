@@ -133,10 +133,13 @@ def test_library_configure_preserves_regular_build_script_behavior(
 
 
 @pytest.mark.parametrize("hermetic", [False, True])
-def test_ts_check_preserves_docker_images_and_runs_user_recipes_after_setup(monkeypatch, hermetic):
+@pytest.mark.parametrize("check_type", ["lint", "test"])
+def test_ts_check_preserves_data_and_runs_user_recipes_after_setup(monkeypatch, hermetic, check_type):
     image = "docker://registry.yandex.net/test@sha256:" + "a" * 64 + "=test:latest"
+    policy = "arcadia/devtools/frontend_build_platform/nots/constants/src/tier0-settings.yaml"
     values = {
-        "_TS_CHECK_LIST": "~~~nots:test test no",
+        "_TS_CHECK_LIST": f"~~~nots:check {check_type} no",
+        "TEST_DATA_VALUE": "arcadia/app/fixture.json",
         "_TS_CHECK_SEPARATOR": "~~~",
         "TEST_RECIPES_VALUE": "podman-compose",
         "DOCKER_IMAGES_VALUE": image,
@@ -144,6 +147,8 @@ def test_ts_check_preserves_docker_images_and_runs_user_recipes_after_setup(monk
 
     def append_recipe(name):
         values["TEST_RECIPES_VALUE"] += " " + name
+        if name == "install-node-modules":
+            values["TEST_DATA_VALUE"] += " " + policy
 
     records = []
     unit = SimpleNamespace(
@@ -169,24 +174,82 @@ def test_ts_check_preserves_docker_images_and_runs_user_recipes_after_setup(monk
 
     create_dart_record = nots.create_dart_record
 
-    def recipe_and_image_record(fields, unit, flat_args, spec_args):
+    def recipe_data_and_image_record(fields, unit, flat_args, spec_args):
         # Keep real field selection and serialization, without unrelated toolchain metadata.
         return create_dart_record(
-            [field for field in fields if field.__self__ in (nots.df.TestRecipes, nots.df.DockerImage)],
+            [field for field in fields if field.__self__ in (nots.df.TestRecipes, nots.df.TestData, nots.df.DockerImage)],
             unit,
             flat_args,
             spec_args,
         )
 
-    monkeypatch.setattr(nots, "create_dart_record", recipe_and_image_record)
+    monkeypatch.setattr(nots, "create_dart_record", recipe_data_and_image_record)
     monkeypatch.setattr(nots.ytest, "dump_test", lambda _, record: record)
 
     nots._TS_CHECK_CONFIGURE(unit, "TS_TEST_FOR")
 
     assert len(records) == 1
     record = records[0][1]
-    assert nots.df.deserialize_list(record[nots.df.DockerImage.KEY]) == [image]
+    if check_type == "test":
+        assert nots.df.deserialize_list(record[nots.df.DockerImage.KEY]) == [image]
+    expected_data = ["arcadia/app/fixture.json"] + ([] if hermetic else [policy])
+    assert nots.df.deserialize_list(record[nots.df.TestData.KEY]) == expected_data
     setup = "extract-node-modules-layer" if hermetic else "install-node-modules"
     assert base64.b64decode(record[nots.df.TestRecipes.KEY]).decode().split() == [
-        setup, "extract-outputs", "podman-compose"
+        setup,
+        "extract-outputs",
+        "podman-compose",
     ]
+
+
+@pytest.mark.parametrize(
+    "settings,expected",
+    [
+        ({"HOST_OS_DARWIN": "yes", "HOST_ARCH_ARM64": "yes"}, ("darwin", "arm64", "unknown")),
+        ({"HOST_OS_LINUX": "yes", "HOST_ARCH_X86_64": "yes"}, ("linux", "x64", "unknown")),
+        ({"HOST_OS_LINUX": "yes", "HOST_ARCH_ARM64": "yes"}, ("linux", "arm64", "unknown")),
+        ({"HOST_OS_WINDOWS": "yes", "HOST_ARCH_X86_64": "yes"}, ("win32", "x64", "unknown")),
+        ({"HOST_OS_LINUX": "yes"}, None),
+        (
+            {"OS_LINUX": "yes", "ARCH_X86_64": "yes", "HOST_OS_DARWIN": "yes", "HOST_ARCH_ARM64": "yes"},
+            ("darwin", "arm64", "unknown"),
+        ),
+    ],
+)
+def test_tarballs_platform_uses_action_configuration(settings, expected):
+    values = dict(settings)
+    unit = SimpleNamespace(get=lambda name: values.get(name, ""), set=lambda pair: values.update([pair]))
+    assert nots._configure_tarballs_platform(unit) == expected
+    if expected:
+        assert values["_PREPARE_DEPS_PLATFORM_ARG"] == "--tarballs-platform " + " ".join(expected)
+    else:
+        assert "_PREPARE_DEPS_PLATFORM_ARG" not in values
+
+
+@pytest.mark.parametrize("configure", [nots._TS_PROTO_CONFIGURE, nots._PREPARE_DEPS_CONFIGURE])
+def test_non_recursive_proto_requires_auto_package(monkeypatch, configure):
+    errors = []
+    unit = SimpleNamespace(
+        get=lambda key: "yes" if key in ("_TS_PROTO_NON_RECURSIVE", "TS_PROTO_PREPARE_DEPS") else "",
+        message=lambda value: None,
+    )
+    monkeypatch.setattr(nots, "_is_ts_proto_auto", lambda unit: False)
+    monkeypatch.setattr(nots.ymake, "report_configure_error", errors.append, raising=False)
+    configure(unit)
+    assert len(errors) == 1
+    assert "TS_PROTO_NON_RECURSIVE() requires auto-proto" in errors[0]
+
+
+def test_non_recursive_auto_proto_attaches_only_auto_peers(monkeypatch):
+    peers = []
+    unit = SimpleNamespace(
+        get=lambda key: "yes" if key in ("TS_PROTO_PREPARE_DEPS", "_TS_PROTO_NON_RECURSIVE") else "",
+        get_subst=lambda key: "proto/auto proto/custom proto/raw",
+        resolve=lambda path: path,
+        onpeerdir=peers.extend,
+        on_ts_proto_auto_prepare_deps_configure=lambda: None,
+    )
+    monkeypatch.setattr(nots, "_is_ts_proto_auto", lambda unit: True)
+    monkeypatch.setattr(nots, "_is_real_file", lambda path: path == "$S/proto/custom/package.json")
+    nots._PREPARE_DEPS_CONFIGURE(unit)
+    assert peers == ["proto/auto", "proto/raw"]

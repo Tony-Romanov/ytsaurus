@@ -61,6 +61,8 @@
 #include <util/generic/scope.h>
 #include <util/string/join.h>
 
+#include <algorithm>
+
 namespace NYT::NFlow {
 
 using namespace NConcurrency;
@@ -522,10 +524,12 @@ std::vector<TStreamId> TComputationBase::BuildTopologicalStreamOrder(TComputatio
 TRootOutputCollector::TRootOutputCollector(
     TComputationSpecPtr spec,
     IMetaSetterPtr metaSetter,
-    bool supportsDistribute)
+    bool supportsDistribute,
+    EFailureHandlerMode failureHandlerMode)
     : Spec_(std::move(spec))
     , MetaSetter_(std::move(metaSetter))
     , SupportsDistribute_(supportsDistribute)
+    , FailureHandlerMode_(failureHandlerMode)
 { }
 
 IOutputCollectorPtr TRootOutputCollector::SetParents(
@@ -567,6 +571,14 @@ void TRootOutputCollector::AddTimer(TTimer&& timer, const TMessageParentsConstPt
     Result_.OutputTimersParentMessageIds.push_back(std::move(setterResult.ActualParentMessageIds));
 }
 
+void TRootOutputCollector::AddFailedMessage(const TInputMessageConstPtr& message, const TError& reason)
+{
+    THROW_ERROR_EXCEPTION_UNLESS(FailureHandlerMode_ != EFailureHandlerMode::Unsupported, "Failed message capture is supported only by transform computations");
+    THROW_ERROR_EXCEPTION_UNLESS(FailureHandlerMode_ == EFailureHandlerMode::Enabled, "Failure handler is disabled in the pipeline spec");
+
+    Result_.FailedMessages.push_back({message, reason});
+}
+
 TRootOutputCollector::TTransformResult TRootOutputCollector::CollectResult()
 {
     YT_VERIFY(Result_.OutputMessages.size() == Result_.OutputMessagesParentMessageIds.size());
@@ -594,6 +606,11 @@ IOutputCollectorPtr TOutputCollector::SetParents(
 void TOutputCollector::DoAddMessage(TMessage&& message, TAddMessageOptions options)
 {
     RootCollector_->AddMessage(std::move(message), Parents_, options.MessageIdSuffix, options.Distribute);
+}
+
+void TOutputCollector::DoAddFailedMessage(const TInputMessageConstPtr& message, const TError& reason)
+{
+    RootCollector_->AddFailedMessage(message, reason);
 }
 
 void TOutputCollector::AddTimer(TSystemTimestamp triggerTimestamp, std::optional<TSystemTimestamp> eventTimestamp)
@@ -695,6 +712,7 @@ TUniversalComputationBase::TUniversalComputationBase(
             for (const auto& [sinkId, sink] : Sinks_) {
                 auto dynamicSinkContext = New<TDynamicSinkContext>();
                 dynamicSinkContext->DynamicSinkSpec = GetOrDefault(GetDynamicSpec()->Sinks, sinkId, New<TDynamicSinkSpec>());
+                dynamicSinkContext->DynamicComputationSpec = GetDynamicSpec();
                 sink->Reconfigure(dynamicSinkContext);
             }
             if (TimerStore_) {
@@ -775,6 +793,13 @@ TComputationStatusPtr TUniversalComputationBase::GetStatus()
         auto partitionStatus = New<TComputationPartitionStatus>();
         if (ActiveSource_) {
             partitionStatus->ActiveSourceStatus = ActiveSource_->GetPartitionStatus();
+        }
+        if (const auto sinks = SinkSnapshot_.Acquire()) {
+            for (const auto& [sinkId, sink] : sinks->Sinks) {
+                if (auto sinkStatus = sink->GetPartitionStatus()) {
+                    partitionStatus->SinkStatuses.emplace(sinkId, std::move(sinkStatus));
+                }
+            }
         }
         status->PartitionStatus = ConvertTo<IMapNodePtr>(partitionStatus);
     }
@@ -1692,6 +1717,13 @@ void TUniversalComputationBase::NoteNonEmptyRunIteration()
 void TUniversalComputationBase::FinishRunIteration()
 {
     TTraceContextGuard traceGuard(Tracer_->CreateEpochPartTraceContext("Finish"));
+    const bool gracefulShutdown = GetDynamicContext()->DynamicPartitionSpec->FinishAfterCurrentEpoch;
+    if (gracefulShutdown) {
+        // Cleanup clears the sinks first, so a late shutdown signal reaches none.
+        for (const auto& [_, sink] : Sinks_) {
+            sink->BeforeGracefulShutdown();
+        }
+    }
     CurrentRunIterationPromise_.Set();
     CurrentRunIterationPromise_ = {};
     YT_TLOG_INFO("Run iteration finished");
@@ -1700,7 +1732,7 @@ void TUniversalComputationBase::FinishRunIteration()
     // the current iteration's commit is already done, exit the run loop via
     // a typed exception so the controller can distinguish this from a real
     // partition completion in job feedback.
-    if (GetDynamicContext()->DynamicPartitionSpec->FinishAfterCurrentEpoch) {
+    if (gracefulShutdown) {
         THROW_ERROR_EXCEPTION(
             EErrorCode::GracefulShutdown,
             "Job finished by graceful shutdown signal");
@@ -1875,6 +1907,7 @@ void TUniversalComputationBase::InitSinks()
 
         auto dynamicSinkContext = New<TDynamicSinkContext>();
         dynamicSinkContext->DynamicSinkSpec = GetOrDefault(dynamicSpec->Sinks, sinkId, New<TDynamicSinkSpec>());
+        dynamicSinkContext->DynamicComputationSpec = dynamicSpec;
         auto sink = TRegistry::Get()->CreateSink(context, dynamicSinkContext);
         EmplaceOrCrash(Sinks_, sinkId, sink);
         sink->UpdateWatermarkState(GetWatermarkState());
@@ -1887,7 +1920,12 @@ void TUniversalComputationBase::InitSinks()
             sink->Init(initContext->AsPartition()->WithPrefix(stateName));
         }
     }
+    SinkSnapshot_.Store(New<TSinkSnapshot>(Sinks_));
 }
+
+TUniversalComputationBase::TSinkSnapshot::TSinkSnapshot(THashMap<TSinkId, ISinkPtr> sinks)
+    : Sinks(std::move(sinks))
+{ }
 
 bool TUniversalComputationBase::HasSinkInflight() const
 {
@@ -2118,6 +2156,7 @@ void TUniversalComputationBase::DoCleanup(const IComputationRunContextPtr& conte
 
 void TUniversalComputationBase::ClearStateOwners()
 {
+    SinkSnapshot_.Store(nullptr);
     for (const auto& [_, sink] : Sinks_) {
         sink->Terminate();
     }

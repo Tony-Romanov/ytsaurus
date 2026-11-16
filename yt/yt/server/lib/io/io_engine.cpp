@@ -4,6 +4,7 @@
 #include "io_request_slicer.h"
 #include "huge_page_manager.h"
 #include "private.h"
+#include "read_request_combiner.h"
 
 #include <yt/yt/core/concurrency/action_queue.h>
 #include <yt/yt/core/concurrency/two_level_fair_share_thread_pool.h>
@@ -66,6 +67,14 @@ void TIOEngineHandle::MarkOpenForDirectIO(EOpenMode* oMode)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+struct TPreparedReadRequests
+{
+    std::vector<TReadRequest> Requests;
+    std::vector<TSharedMutableRef> Buffers;
+    std::vector<TSharedRef> OutputBuffers;
+    i64 PaddedBytes = 0;
+};
 
 TWriteResponse DoWriteAligned(
     const TWriteRequest& request,
@@ -165,6 +174,53 @@ std::vector<TSharedMutableRef> AllocateReadBuffers(
     return results;
 }
 
+TPreparedReadRequests PrepareReadRequests(
+    std::vector<TReadRequest> requests,
+    TRefCountedTypeCookie tagCookie,
+    bool useDedicatedAllocations,
+    int directIoBlockSize)
+{
+    TPreparedReadRequests result;
+
+    bool shouldBeAligned = ShouldBeAligned(requests);
+    auto paddingAlignment = shouldBeAligned ? directIoBlockSize : GetPageSize();
+    for (const auto& request : requests) {
+        result.PaddedBytes += GetPaddedSize(request.Offset, request.Size, paddingAlignment);
+    }
+
+    if (requests.size() > 1 &&
+        !useDedicatedAllocations &&
+        (!shouldBeAligned || static_cast<size_t>(directIoBlockSize) == GetPageSize()))
+    {
+        auto requestCombiner = CreateReadRequestCombiner();
+        auto combinedRequests = requestCombiner->Combine(
+            std::move(requests),
+            directIoBlockSize,
+            tagCookie);
+
+        result.Requests.reserve(combinedRequests.size());
+        result.Buffers.reserve(combinedRequests.size());
+        for (auto& combinedRequest : combinedRequests) {
+            result.Requests.push_back(std::move(combinedRequest.ReadRequest));
+            result.Buffers.push_back(std::move(combinedRequest.ResultBuffer));
+        }
+
+        result.OutputBuffers = requestCombiner->ReleaseOutputBuffers();
+    } else {
+        result.Buffers = AllocateReadBuffers(requests, tagCookie, useDedicatedAllocations, directIoBlockSize);
+        result.OutputBuffers.reserve(result.Buffers.size());
+        for (int index = 0; index < std::ssize(requests); ++index) {
+            result.OutputBuffers.push_back(UnwrapAlignedBuffer(
+                requests[index],
+                result.Buffers[index],
+                directIoBlockSize));
+        }
+        result.Requests = std::move(requests);
+    }
+
+    return result;
+}
+
 // Request execution path.
 // 1. IOEngine receives read requests, each request is processed according to
 //    the same principle in the Read methods.
@@ -238,6 +294,7 @@ TInternalReadResponse DoRead(
     if (hugePageBlob) {
         YT_VERIFY(reinterpret_cast<i64>(hugePageBlob.Begin()) % blockSize == 0);
         YT_VERIFY(hugePageBlob.Size() % blockSize == 0);
+        maxBytesPerRead = Min<i64>(maxBytesPerRead, hugePageBlob.Size());
     }
 
     TInternalReadResponse response;
@@ -417,7 +474,9 @@ TWriteResponse DoWriteAligned(
     auto fileOffset = request.Offset;
     YT_VERIFY(fileOffset % directIoBlockSize == 0);
 
-    maxBytesPerWrite = AlignDown<i64>(maxBytesPerWrite, directIoBlockSize);
+    maxBytesPerWrite = Min(
+        AlignDown<i64>(maxBytesPerWrite, directIoBlockSize),
+        AlignDown<i64>(hugePageBlob.Size(), directIoBlockSize));
 
     TWriteResponse response;
 
@@ -427,41 +486,61 @@ TWriteResponse DoWriteAligned(
         auto totalSize = static_cast<i64>(GetByteSize(request.Buffers));
 
         auto toWriteRemaining = AlignUp<i64>(totalSize, directIoBlockSize);
-        YT_VERIFY(static_cast<i64>(hugePageBlob.Size()) >= toWriteRemaining);
-        memset(hugePageBlob.Begin() + totalSize, 0, toWriteRemaining - totalSize);
-
-        i64 hugePageBlobBufferOffset = 0;
-        for (const auto& buffer : request.Buffers) {
-            memcpy(
-                hugePageBlob.Begin() + hugePageBlobBufferOffset,
-                buffer.Begin(),
-                buffer.Size());
-            hugePageBlobBufferOffset += buffer.Size();
-        }
-
+        int bufferIndex = 0;
         i64 bufferOffset = 0; // within current buffer
+        YT_VERIFY(maxBytesPerWrite > 0 || toWriteRemaining == 0);
 
         while (toWriteRemaining > 0) {
+            auto portionSize = Min(toWriteRemaining, maxBytesPerWrite);
+            i64 copiedSize = 0;
+            while (copiedSize < portionSize && bufferIndex < std::ssize(request.Buffers)) {
+                const auto& buffer = request.Buffers[bufferIndex];
+                if (std::ssize(buffer) == 0) {
+                    ++bufferIndex;
+                    continue;
+                }
+                auto size = Min<i64>(
+                    portionSize - copiedSize,
+                    std::ssize(buffer) - bufferOffset);
+                memcpy(
+                    hugePageBlob.Begin() + copiedSize,
+                    buffer.Begin() + bufferOffset,
+                    size);
+                copiedSize += size;
+                bufferOffset += size;
+                if (bufferOffset == std::ssize(buffer)) {
+                    ++bufferIndex;
+                    bufferOffset = 0;
+                }
+            }
+            memset(
+                hugePageBlob.Begin() + copiedSize,
+                0,
+                portionSize - copiedSize);
+
             const auto& buffer = hugePageBlob;
-            auto toWrite = static_cast<ui32>(Min(toWriteRemaining, maxBytesPerWrite, std::ssize(buffer) - bufferOffset));
+            i64 writeBufferOffset = 0;
+            while (writeBufferOffset < portionSize) {
+                auto toWrite = static_cast<ui32>(portionSize - writeBufferOffset);
 
-            i32 reallyWritten;
-            {
-                TRequestStatsGuard statsGuard(sensors->WriteSensors[category]);
-                NTracing::TNullTraceContextGuard nullTraceContextGuard;
-                reallyWritten = HandleEintr(::pwrite, *request.Handle, const_cast<char*>(buffer.Begin()) + bufferOffset, toWrite, fileOffset);
+                i32 reallyWritten;
+                {
+                    TRequestStatsGuard statsGuard(sensors->WriteSensors[category]);
+                    NTracing::TNullTraceContextGuard nullTraceContextGuard;
+                    reallyWritten = HandleEintr(::pwrite, *request.Handle, const_cast<char*>(buffer.Begin()) + writeBufferOffset, toWrite, fileOffset);
+                }
+
+                if (reallyWritten < 0) {
+                    ythrow TFileError();
+                }
+
+                sensors->RegisterWrittenBytes(reallyWritten, category);
+                fileOffset += reallyWritten;
+                writeBufferOffset += reallyWritten;
+                toWriteRemaining -= reallyWritten;
+
+                ++response.IOWriteRequests;
             }
-
-            if (reallyWritten < 0) {
-                ythrow TFileError();
-            }
-
-            sensors->RegisterWrittenBytes(reallyWritten, category);
-            fileOffset += reallyWritten;
-            bufferOffset += reallyWritten;
-            toWriteRemaining -= reallyWritten;
-
-            ++response.IOWriteRequests;
         }
     });
     response.WrittenBytes = fileOffset - request.Offset;
@@ -477,6 +556,10 @@ TWriteResponse DoWriteImpl(
     const TIOEngineSensorsPtr& sensors,
     bool enablePwritev)
 {
+#ifndef _linux_
+    Y_UNUSED(simulatedMaxBytesPerWrite);
+#endif
+
     sensors->UpdateKernelStatistics();
 
     YT_VERIFY(!request.Handle->IsOpenForDirectIO());
@@ -683,6 +766,7 @@ TFlushFileRangeResponse DoFlushFileRange(
     });
 #else
     Y_UNUSED(request);
+    Y_UNUSED(category);
 #endif
 
     return response;
@@ -967,25 +1051,18 @@ public:
         auto invoker = ThreadPool_.GetReadInvoker(category, sessionId);
 
         auto config = Config_.Acquire();
+        auto preparedRequests = PrepareReadRequests(
+            std::move(requests),
+            tagCookie,
+            useDedicatedAllocations,
+            config->DirectIOBlockSize);
 
-        i64 paddedBytes = 0;
-        bool shouldBeAligned = ShouldBeAligned(requests);
-
-        for (const auto& request : requests) {
-            if (shouldBeAligned) {
-                paddedBytes += GetPaddedSize(request.Offset, request.Size, config->DirectIOBlockSize);
-            } else {
-                paddedBytes += GetPaddedSize(request.Offset, request.Size, GetPageSize());
-            }
-        }
-
-        auto buffers = AllocateReadBuffers(requests, tagCookie, useDedicatedAllocations, config->DirectIOBlockSize);
-
-        for (int index = 0; index < std::ssize(requests); ++index) {
-            auto requestBuffer = buffers[index];
-            buffers[index] = UnwrapAlignedBuffer(requests[index], buffers[index], config->DirectIOBlockSize);
-
-            for (auto& slice : GetRequestSlicer().Slice(std::move(requests[index]), requestBuffer, config->DirectIOBlockSize)) {
+        for (int index = 0; index < std::ssize(preparedRequests.Requests); ++index) {
+            for (auto& slice : GetRequestSlicer().Slice(
+                std::move(preparedRequests.Requests[index]),
+                preparedRequests.Buffers[index],
+                config->DirectIOBlockSize))
+            {
                 auto future = BIND([=, this, this_ = MakeStrong(this), category = category, sessionId = sessionId] (
                     const TReadRequest& request,
                     TSharedMutableRef buffer,
@@ -1027,9 +1104,9 @@ public:
         }
 
         TReadResponse response{
-            .PaddedBytes = paddedBytes,
+            .OutputBuffers = std::move(preparedRequests.OutputBuffers),
+            .PaddedBytes = preparedRequests.PaddedBytes,
         };
-        response.OutputBuffers.assign(buffers.begin(), buffers.end());
 
         return AllSucceeded(std::move(futures))
             .Apply(BIND([
@@ -1072,7 +1149,7 @@ public:
                 auto toWriteRemaining = static_cast<i64>(GetByteSize(request.Buffers));
                 TSharedMutableRef writeBlob;
                 if (request.Handle->IsOpenForDirectIO()) {
-                    writeBlob = AllocateWriteBlob(toWriteRemaining, config->DirectIOBlockSize);
+                    writeBlob = AllocateWriteStagingBlob(toWriteRemaining, config->DirectIOBlockSize);
                 }
                 return DoWrite(
                     request,
@@ -1264,26 +1341,20 @@ public:
         futures.reserve(requests.size());
 
         auto config = Config_.Acquire();
+        auto preparedRequests = PrepareReadRequests(
+            std::move(requests),
+            tagCookie,
+            useDedicatedAllocations,
+            config->DirectIOBlockSize);
 
-        i64 paddedBytes = 0;
-        bool shouldBeAligned = ShouldBeAligned(requests);
-
-        for (const auto& request : requests) {
-            if (shouldBeAligned) {
-                paddedBytes += GetPaddedSize(request.Offset, request.Size, config->DirectIOBlockSize);
-            } else {
-                paddedBytes += GetPaddedSize(request.Offset, request.Size, GetPageSize());
-            }
-        }
-
-        auto buffers = AllocateReadBuffers(requests, tagCookie, useDedicatedAllocations, config->DirectIOBlockSize);
         auto guard = Guard(Lock_);
 
-        for (int index = 0; index < std::ssize(requests); ++index) {
-            auto requestBuffer = buffers[index];
-            buffers[index] = UnwrapAlignedBuffer(requests[index], buffers[index], config->DirectIOBlockSize);
-
-            for (auto& slice : GetRequestSlicer().Slice(std::move(requests[index]), requestBuffer, config->DirectIOBlockSize)) {
+        for (int index = 0; index < std::ssize(preparedRequests.Requests); ++index) {
+            for (auto& slice : GetRequestSlicer().Slice(
+                std::move(preparedRequests.Requests[index]),
+                preparedRequests.Buffers[index],
+                config->DirectIOBlockSize))
+            {
                 auto slotId = slice.Request.FairShareSlotId;
                 auto requestId = TGuid::Create();
                 auto promise = CreateRequestPromise<TInternalReadResponse>(
@@ -1347,9 +1418,9 @@ public:
         guard.Release();
 
         TReadResponse response{
-            .PaddedBytes = paddedBytes,
+            .OutputBuffers = std::move(preparedRequests.OutputBuffers),
+            .PaddedBytes = preparedRequests.PaddedBytes,
         };
-        response.OutputBuffers.assign(buffers.begin(), buffers.end());
 
         EventCount_.NotifyAll();
 
@@ -1408,7 +1479,7 @@ public:
 
                 TSharedMutableRef writeBlob;
                 if (request.Handle->IsOpenForDirectIO()) {
-                    writeBlob = AllocateWriteBlob(toWriteRemaining, config->DirectIOBlockSize);
+                    writeBlob = AllocateWriteStagingBlob(toWriteRemaining, config->DirectIOBlockSize);
                 }
                 return DoWrite(
                     request,

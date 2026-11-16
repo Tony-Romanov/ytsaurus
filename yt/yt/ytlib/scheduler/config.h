@@ -1554,6 +1554,9 @@ struct TVolume
 
     std::vector<TLayerPtr> Layers;
 
+    //! Add node-selected layers to a non-root volume.
+    bool EnableNodeLayers;
+
     //! If true, the volume can be reused between sequential jobs within the same allocation.
     //! This avoids re-creating the volume for each job.
     bool AllowReusing;
@@ -2233,6 +2236,8 @@ struct TSortOperationSpecBase
 
     // This option is used for partition/partition_map and sorted_reduce/sorted_merge jobs.
     bool ForceJobSizeAdjuster;
+
+    bool EnableSharedJobSizeAdjuster;
 
     std::optional<bool> EnableFinalPartitionsMerging;
 

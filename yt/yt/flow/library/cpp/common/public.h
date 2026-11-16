@@ -87,6 +87,7 @@ DECLARE_REFCOUNTED_STRUCT(IJobLineageTracker);
 
 struct TMessageMeta;
 struct TMessage;
+struct TParsedPipelineParameters;
 
 DECLARE_REFCOUNTED_STRUCT(TInputMessage);
 using TInputMessageConstPtr = TIntrusivePtr<const TInputMessage>;
@@ -268,6 +269,7 @@ DECLARE_REFCOUNTED_STRUCT(TProcessFunctionGraphSpec);
 DECLARE_REFCOUNTED_STRUCT(TProcessFunctionGraphParameters);
 DECLARE_REFCOUNTED_STRUCT(TProcessFunctionGraphDynamicParameters);
 DECLARE_REFCOUNTED_STRUCT(TPipelineSpec);
+DECLARE_REFCOUNTED_STRUCT(TFailureHandlerSpec);
 
 //! Computation classes that can host a process function graph.
 DEFINE_ENUM(EProcessFunctionGraphHost,

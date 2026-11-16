@@ -156,6 +156,17 @@ using NTransactionSupervisor::NProto::NTransactionSupervisor::TRspAbortTransacti
 
 namespace {
 
+////////////////////////////////////////////////////////////////////////////////
+
+std::optional<TInstant> GetDeadline(const auto& ctx)
+{
+    return ctx->GetTimeout().transform([&] (TDuration timeout) -> TInstant {
+        return ctx->GetStartTime().value_or(TInstant::Now()) + timeout;
+    });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 class TTransactionContextGuard
 {
 public:
@@ -257,6 +268,8 @@ private:
     std::optional<NLogging::TFiberMessageTagGuard> MessageTagGuard_;
     std::optional<TSequoiaRevisionGuard> SequoiaRevisionGuard_;
 };
+
+////////////////////////////////////////////////////////////////////////////////
 
 //! When a mirrored Cypress transaction is used as a prerequisite for another
 //! transaction commit (e.g. for committing Sequoia transactions), the
@@ -417,6 +430,8 @@ private:
     THashMap<TTransaction*, TCompactFlatSet<ILease*, 2>> TransactionToReferencedLeases_;
     THashMap<ILease*, TCompactFlatSet<TTransaction*, 4>> LeaseToReferencingTransactions_;
 };
+
+////////////////////////////////////////////////////////////////////////////////
 
 } // namespace
 
@@ -602,6 +617,9 @@ public:
         // Coordinator: TReqCommitCypressTransaction, late prepare
         // Participant: TReqCommitTransaction, commit only
         RegisterTransactionActionHandlers<NProto::TReqCommitCypressTransaction>({
+            .GenerateStrongOrderingTags = BIND_NO_PROPAGATE(
+                &TTransactionManager::GenerateStrongOrderingTagsCommitCypressTransactionInSequoia,
+                Unretained(this)),
             .Prepare = BIND_NO_PROPAGATE(
                 &TTransactionManager::HydraPrepareCommitCypressTransactionInSequoia,
                 Unretained(this)),
@@ -612,6 +630,9 @@ public:
         // TODO(kvk1920): consider renaming TReqCommitTransaction ->
         // TReqCommitForeignTransaction.
         RegisterTransactionActionHandlers<NProto::TReqCommitTransaction>({
+            .GenerateStrongOrderingTags = BIND_NO_PROPAGATE(
+                &TTransactionManager::GenerateStrongOrderingTagsCommitTransactionInSequoia,
+                Unretained(this)),
             .Commit = BIND_NO_PROPAGATE(
                 &TTransactionManager::HydraCommitCommitForeignTransactionInSequoia,
                 Unretained(this)),
@@ -2059,6 +2080,22 @@ public:
             .With("TransactionId", transaction->GetId());
     }
 
+    THashSet<std::string> GenerateStrongOrderingTags(TTransactionId transactionId) override
+    {
+        YT_ASSERT_THREAD_AFFINITY(AutomatonThread);
+
+        auto* transaction = FindTransaction(transactionId);
+        if (!IsObjectAlive(transaction)) {
+            YT_TLOG_DEBUG("Cannot fetch strong ordering tags; no such Sequoia transaction")
+                .With("TransactionId", transactionId)
+                .With("CellTag", Bootstrap_->GetCellTag());
+
+            return {};
+        }
+
+        return TTransactionManagerBase::GenerateStrongOrderingTags(transaction);
+    }
+
     void CommitTransaction(
         TTransactionId transactionId,
         const TTransactionCommitOptions& options,
@@ -2297,7 +2334,7 @@ public:
                     .AsyncVia(EpochAutomatonInvoker_));
         }
 
-        context->ReplyFrom(responseFuture);
+        context->ReplyFrom(responseFuture.WithDeadline(GetDeadline(context)));
     }
 
     // COMPAT(h0pless): Remove this after CTxS will be used by clients to manipulate Cypress transactions.
@@ -2369,7 +2406,7 @@ public:
                     .AsyncVia(EpochAutomatonInvoker_));
         }
 
-        context->ReplyFrom(responseFuture);
+        context->ReplyFrom(responseFuture.WithDeadline(GetDeadline(context)));
         return true;
     }
 
@@ -2514,11 +2551,13 @@ public:
 
         auto mutation = CreateMutation(HydraManager_, request);
         mutation->SetMutationId(context->GetMutationId(), context->IsRetry());
+
         context->ReplyFrom(DoAbortTransaction(
             std::move(mutation),
             transaction,
             force,
-            context->GetAuthenticationIdentity()));
+            context->GetAuthenticationIdentity())
+            .WithDeadline(GetDeadline(context)));
     }
 
     // COMPAT(h0pless): Remove this after CTxS will be used by clients to manipulate Cypress transactions.
@@ -2555,7 +2594,8 @@ public:
             std::move(mutation),
             transaction,
             force,
-            context->GetAuthenticationIdentity()));
+            context->GetAuthenticationIdentity())
+            .WithDeadline(GetDeadline(context)));
         return true;
     }
 
@@ -3011,6 +3051,38 @@ private:
         PrepareTransactionCommit(transactionId, options);
     }
 
+    THashSet<std::string> GenerateStrongOrderingTagsForTransactionCommit(auto* request)
+    {
+        YT_VERIFY(HasHydraContext());
+
+        const auto& config = Bootstrap_->GetConfigManager()->GetConfig();
+        if (!config->SequoiaManager->UseFineGrainedOrderingTags) {
+            return {};
+        }
+
+        auto transactionId = FromProto<TTransactionId>(request->transaction_id());
+        YT_VERIFY(IsCypressTransactionMirroredToSequoia(transactionId));
+
+        auto* transaction = FindTransaction(transactionId);
+        if (!IsObjectAlive(transaction)) {
+            return {};
+        }
+
+        THashSet<std::string> tags;
+        for (auto& branchedNode : transaction->BranchedNodes()) {
+            tags.insert(ToString(branchedNode->GetId()));
+        }
+
+        return tags;
+    }
+
+    THashSet<std::string> GenerateStrongOrderingTagsCommitTransactionInSequoia(
+        TTransaction* /*sequoiaTransaction*/,
+        NProto::TReqCommitTransaction* request)
+    {
+        return GenerateStrongOrderingTagsForTransactionCommit(request);
+    }
+
     void HydraCommitCommitForeignTransactionInSequoia(
         TTransaction* /*sequoiaTransaction*/,
         NProto::TReqCommitTransaction* request,
@@ -3099,6 +3171,13 @@ private:
 
             throw;
         }
+    }
+
+    THashSet<std::string> GenerateStrongOrderingTagsCommitCypressTransactionInSequoia(
+        TTransaction* /*sequoiaTransaction*/,
+        NProto::TReqCommitCypressTransaction* request)
+    {
+        return GenerateStrongOrderingTagsForTransactionCommit(request);
     }
 
     void HydraCommitCommitCypressTransactionInSequoia(

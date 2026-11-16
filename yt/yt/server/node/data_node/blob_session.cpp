@@ -996,10 +996,7 @@ TFuture<ISession::TFlushBlocksResult> TBlobSession::DoFlushBlocks(int blockIndex
     if (!IsInWindow(blockIndex)) {
         YT_TLOG_DEBUG("Blocks are already flushed")
             .With("Block", blockIndex);
-        return MakeFuture(TFlushBlocksResult {
-            .IOCounters = {},
-            .ChunkWriterStatistics = New<NChunkClient::TChunkWriterStatistics>(),
-        });
+        return MakeFuture(OnBlockFlushed(blockIndex));
     }
 
     const auto& slot = GetSlot(blockIndex);
@@ -1019,19 +1016,19 @@ ISession::TFlushBlocksResult TBlobSession::OnBlockFlushed(int blockIndex)
 {
     YT_ASSERT_INVOKER_AFFINITY(SessionInvoker_);
 
-    auto flushBlocksResult = TFlushBlocksResult {
-        .IOCounters = {},
-        .ChunkWriterStatistics = New<NChunkClient::TChunkWriterStatistics>(),
-    };
-
-    if (Canceled_.load()) {
-        return flushBlocksResult;
+    if (!Canceled_.load() && IsInWindow(blockIndex)) {
+        ReleaseBlocks(blockIndex);
     }
 
-    ReleaseBlocks(blockIndex);
-
-    // The data for blob chunks is flushed to disk only when the blob session is finished, so return empty IO counters here.
-    return flushBlocksResult;
+    // Preserve FinishChunk statistics for existing clients and the I/O tracker.
+    return TFlushBlocksResult{
+        .IOCounters = {},
+        .ChunkWriterStatistics = New<NChunkClient::TChunkWriterStatistics>(),
+        .CumulativeIOConsumed = Location_->IsIOFairShareEnabled()
+            ? std::make_optional(WriteBlocksOptions_.ClientOptions.ChunkWriterStatistics
+                ->DataBytesWrittenToDisk.load(std::memory_order::relaxed))
+            : std::nullopt,
+    };
 }
 
 void TBlobSession::DoCancel(const TError& error)

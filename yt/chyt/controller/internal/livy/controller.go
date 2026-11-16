@@ -36,9 +36,8 @@ func (c *Controller) IsControllerSnapshotOutdated(snapshot yson.RawValue, _ *str
 	return !bytes.Equal(snapshot, current), nil
 }
 
-func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
-	map[string]any, map[string]any, map[string]any, bool, error) {
-	return nil, nil, nil, false, yterrors.Err(
+func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (*strawberry.PrepareResult, error) {
+	return nil, yterrors.Err(
 		"starting oplets is not supported for deprecated strawberry family \"livy\"")
 }
 
@@ -72,12 +71,6 @@ func (c *Controller) GetOpBriefAttributes(parsedSpeclet any, opletInfo yson.RawV
 
 func (c *Controller) GetScalerTarget(ctx context.Context, opletInfo strawberry.OpletInfoForScaler) (*strawberry.ScalerTarget, error) {
 	return nil, nil
-}
-
-type livyOpletInfo struct{}
-
-func (c *Controller) GetOpletInfo(ctx context.Context, oplet *strawberry.Oplet) (any, error) {
-	return livyOpletInfo{}, nil
 }
 
 func parseConfig(rawConfig yson.RawValue) Config {

@@ -50,7 +50,7 @@ struct TTableSourceParameters
     // By default it is extracted from table creation_time attribute.
     TTableTimestampLocatorSpecPtr SystemTimestampLocator;
 
-    // Use the planned range read time for both message timestamps.
+    // Use the planned row read time for both message timestamps.
     bool UsePlannedTimestamps = false;
 
     // Ignore symlinks, so they do not process and count.
@@ -80,6 +80,9 @@ DEFINE_REFCOUNTED_TYPE(TTableSourceParameters);
 struct TDynamicTableSourceParameters
     : public TOrderedSourceBase::TDynamicParameters
 {
+    TDuration CatchupLagThreshold;
+    double CatchupSpeedupMultiplier{};
+
     // All the table needs to be read in this time.
     TDuration DesiredTableProcessTime;
 
@@ -136,7 +139,9 @@ struct TDynamicTableSourcePartitionSpec
     TSystemTimestamp EventTimestamp;
     TSystemTimestamp SystemTimestamp;
 
-    std::optional<TSystemTimestamp> PlannedTimestamp;
+    TSystemTimestamp PlannedTimestamp;
+    TDuration PlannedReadDuration;
+    bool UsePlannedTimestamps{};
 
     // Desired speed of reading. Can be updated by controller during work.
     double RowsPerSecond{};

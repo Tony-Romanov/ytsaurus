@@ -5,6 +5,7 @@
 #include <yt/yt/flow/library/cpp/common/registry.h>
 #include <yt/yt/flow/library/cpp/common/sink_controller.h>
 #include <yt/yt/flow/library/cpp/common/source_controller.h>
+#include <yt/yt/flow/library/cpp/common/state.h>
 
 #include <yt/yt/flow/library/cpp/misc/status_profiler.h>
 
@@ -163,7 +164,7 @@ void TUniversalComputationController::Init(IInitContextPtr initContext)
 {
     initContext->InitClient(PartitioningState_, "partitioning/v0");
     for (const auto& [streamId, source] : Sources_) {
-        auto sourceInitContext = initContext->WithPrefix(Format("sources/%v", streamId));
+        auto sourceInitContext = initContext->WithPrefix(Format("%v/%v", SourcesStateNameSegment, streamId));
         // Nest the source state under its identity - the same string that versions its partition
         // keys - so changing the identifying params orphans the previous state (it is then reclaimed
         // by the state manager) and the source starts fresh.
@@ -173,7 +174,7 @@ void TUniversalComputationController::Init(IInitContextPtr initContext)
         source->Init(std::move(sourceInitContext));
     }
     for (const auto& [sinkId, sink] : Sinks_) {
-        sink->Init(initContext->WithPrefix(Format("sinks/%v", sinkId)));
+        sink->Init(initContext->WithPrefix(Format("%v/%v", SinksStateNameSegment, sinkId)));
     }
 }
 
@@ -195,6 +196,44 @@ void TUniversalComputationController::Commit()
     for (const auto& [sinkId, sink] : Sinks_) {
         sink->Commit();
     }
+}
+
+TProcessPartitionTraverseDataResultPtr TUniversalComputationController::ProcessPartitionTraverseData(
+    const THashMap<TPartitionId, TNodeTraverseDataPtr>& traverseData,
+    const TNodeTraverseDataPtr& currentTraverseData,
+    const TFlowViewPtr& flowView)
+{
+    if (!Sinks_.empty()) {
+        THashMap<TSinkId, TSinkPartitionStatuses> sinkStatuses;
+        const auto& layout = flowView->State->ExecutionSpec->Layout;
+        const auto minUpdateTime = TInstant::Now() - flowView->State->ExecutionSpec->DynamicPipelineSpec->GetValue()->JobManager->LostJobTimeout;
+        for (const auto& [partitionId, _] : traverseData) {
+            const auto& partition = GetOrCrash(layout->Partitions, partitionId);
+            if (partition->ComputationId != GetComputationId() || !partition->SourceKey || !partition->CurrentJobId) {
+                continue;
+            }
+            const auto* job = layout->Jobs.FindPtr(*partition->CurrentJobId);
+            const auto& status = flowView->Feedback->GetFreshCurrentJobStatus(partitionId, minUpdateTime);
+            if (!job || !status || status->JobId != (*job)->JobId || status->IsFinished ||
+                !status->Error.IsOK() || !status->PartitionStatus)
+            {
+                continue;
+            }
+            // Only the sink part is parsed: this runs for every partition on each traverse.
+            const auto sinkStatusesNode = status->PartitionStatus->FindChild("sink_statuses");
+            if (!sinkStatusesNode) {
+                continue;
+            }
+            for (const auto& [sinkId, sinkStatus] : ConvertTo<THashMap<TSinkId, IMapNodePtr>>(sinkStatusesNode)) {
+                TSinkPartitionStatus sinkPartitionStatus{.Status = sinkStatus};
+                sinkStatuses[sinkId].emplace(*partition->SourceKey, std::move(sinkPartitionStatus));
+            }
+        }
+        for (const auto& [sinkId, sink] : Sinks_) {
+            sink->UpdatePartitionStatuses(GetOrDefault(sinkStatuses, sinkId));
+        }
+    }
+    return TComputationControllerBase::ProcessPartitionTraverseData(traverseData, currentTraverseData, flowView);
 }
 
 void TUniversalComputationController::UpdateWatermarkState(TWatermarkStatePtr watermarkState)

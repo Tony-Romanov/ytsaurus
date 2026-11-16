@@ -6,6 +6,7 @@
 #include "controller.h"
 #include "persisted_state_manager.h"
 #include "state_access.h"
+#include "supported_features.h"
 #include "yt_connector.h"
 
 #include <yt/yt/flow/library/cpp/common/authenticator.h>
@@ -289,6 +290,9 @@ TFlowExecutor::TFlowExecutor(IFlowExecutorRuntimePtr runtime)
     RegisterCommand("list", EPermission::Read, [this] (const auto&) {
         return ConvertToYsonString(Commands_);
     });
+    RegisterCommand("get-supported-features", EPermission::Read, [] (const auto&) {
+        return ConvertToYsonString(TEnumTraits<EControllerFeature>::GetDomainValues());
+    });
     RegisterCommand("get-command-required-permission", EPermission::Read, [this] (const auto& argument) {
         auto parsedArgument = ConvertTo<TGetCommandRequiredPermissionArg>(argument);
         return BuildYsonStringFluently()
@@ -308,6 +312,23 @@ TFlowExecutor::TFlowExecutor(IFlowExecutorRuntimePtr runtime)
     });
     RegisterCommand("set-pipeline-spec", EPermission::Write, [this] (const auto& argument) {
         return ConvertToYsonString(SetPipelineSpec(ConvertTo<TSetPipelineSpecArg>(argument)));
+    });
+    RegisterCommand("remove-pipeline-spec", EPermission::Write, [this] (const auto& argument) {
+        auto arg = ConvertTo<TRemovePipelineSpecArg>(argument);
+        auto spec = GetPipelineSpec(TGetPipelineSpecArg());
+        THROW_ERROR_EXCEPTION_IF(
+            arg.ExpectedVersion && spec.Version != *arg.ExpectedVersion,
+            NFlow::EErrorCode::SpecVersionMismatch,
+            "Spec version mismatch: expected %v, got %v",
+            *arg.ExpectedVersion,
+            spec.Version);
+
+        TSetPipelineSpecArg setArg;
+        setArg.Spec = CloneNode(spec.Spec);
+        SyncYPathRemove(setArg.Spec, TYPath(arg.Path));
+        setArg.ExpectedVersion = spec.Version;
+        setArg.Force = arg.Force;
+        return ConvertToYsonString(SetPipelineSpec(setArg));
     });
     RegisterCommand("get-pipeline-dynamic-spec", EPermission::Read, [this] (const auto& argument) {
         return ConvertToYsonString(GetPipelineDynamicSpec(ConvertTo<TGetPipelineDynamicSpecArg>(argument)));
@@ -1010,7 +1031,6 @@ TSetPipelineSpecsResult TLiveFlowExecutorRuntime::SetPipelineSpecs(const TSetPip
 
             if (argument.Spec) {
                 ValidatePipelineSpec(spec->GetValue(), YTConnector_->GetPipelinePath().GetCluster());
-                ValidateTimerStoreBackends(spec->GetValue(), Config_->EnablePagedTimerStore);
             }
             if (argument.DynamicSpec) {
                 dynamicSpec = UpdateDynamicSpecBase(dynamicSpec, *argument.DynamicSpec, Controller_->GetVersionProvider());
@@ -1932,6 +1952,8 @@ TYsonString TLiveFlowExecutorRuntime::RunCommand(
     // These commands let an operator view and repair the pipeline specs while the FlowView cannot be
     // recovered; get-command-required-permission precedes every flow-execute request of the native client.
     static const THashSet<std::string> CommandsAllowedWithoutFlowView = {
+        "list",
+        "get-supported-features",
         "get-command-required-permission",
         "get-pipeline-spec",
         "get-pipeline-dynamic-spec",
@@ -1978,21 +2000,6 @@ void TLiveFlowExecutorRuntime::AuthorizeCommand(EPermission permission, const st
 ////////////////////////////////////////////////////////////////////////////////
 
 } // anonymous namespace
-
-////////////////////////////////////////////////////////////////////////////////
-
-void ValidateTimerStoreBackends(const TPipelineSpecPtr& spec, bool enablePagedTimerStore)
-{
-    if (enablePagedTimerStore) {
-        return;
-    }
-    for (const auto& [computationId, computationSpec] : spec->Computations) {
-        if (computationSpec->TimerStoreBackend == ETimerStoreBackend::Paged) {
-            THROW_ERROR_EXCEPTION("\"timer_store_backend\" = \"paged\" is not enabled on this controller (enable_paged_timer_store)")
-                .With("computation_id", computationId);
-        }
-    }
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 

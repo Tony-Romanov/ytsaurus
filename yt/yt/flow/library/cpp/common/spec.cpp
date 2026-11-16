@@ -485,6 +485,9 @@ void TComputationSpec::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("output_stream_ids", &TThis::OutputStreamIds)
         .Default();
+    registrar.Parameter("max_local_message_byte_size", &TThis::MaxLocalMessageByteSize)
+        .Optional()
+        .InRange(NTableClient::MaxStringValueLength, NTableClient::MaxRowWeightLimit);
 
     registrar.Parameter("streams_dependency", &TThis::StreamsDependency)
         .Default();
@@ -763,6 +766,14 @@ void TResourceSpec::Register(TRegistrar registrar)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void TFailureHandlerSpec::Register(TRegistrar registrar)
+{
+    registrar.Parameter("enabled", &TThis::Enabled)
+        .Default(false);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void TPipelineSpec::Register(TRegistrar registrar)
 {
     // Keep unrecognized fields so they survive the round-trip through the struct;
@@ -783,6 +794,8 @@ void TPipelineSpec::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("streams", &TThis::Streams)
         .Default();
+    registrar.Parameter("failure_handler", &TThis::FailureHandler)
+        .DefaultNew();
 
     registrar.Postprocessor([] (TThis* spec) {
         ValidatePipelineDeclarationIds(spec);
@@ -2405,6 +2418,11 @@ void ValidatePipelineSpec(const TPipelineSpecPtr& spec, const std::optional<std:
                     streamId,
                     computationId);
             }
+            // Large local messages are never serialized for transfer to another computation.
+            THROW_ERROR_EXCEPTION_IF(GetOrCrash(spec->Computations, GetOrCrash(streamProducers, streamId))->MaxLocalMessageByteSize,
+                "Stream %Qv with large local messages cannot be consumed by computation %Qv",
+                streamId,
+                computationId);
         }
     }
 

@@ -125,6 +125,9 @@ struct TTestCase
     std::optional<double> IoFairShareWeight = 2.5;
     std::optional<double> JobIoFairShareWeight = 3.5;
     bool EnableJobIoStatistics = true;
+    std::optional<TForwardedIoFairShareState> ForwardedIoFairShareState;
+    bool ExpectUnbatchedReads = false;
+    bool IOFairShareEnabled = true;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -195,9 +198,19 @@ public:
 
     DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, GetBlockSet)
     {
+        auto requestCount = GetBlockSetRequestCount_.fetch_add(1) + 1;
+        if (ReadRequestBarrierSize_ > 0) {
+            if (requestCount == ReadRequestBarrierSize_) {
+                ReadRequestBarrier_.Set();
+            }
+            WaitFor(ReadRequestBarrier_.ToFuture().WithTimeout(TDuration::Seconds(10)))
+                .ThrowOnError();
+        }
+
         SetCalled();
         DataRequestCalled_.store(true);
         LastHasIoConsumed_.store(request->has_io_consumed());
+        LastIoConsumed_.store(request->io_consumed());
 
         if (request->has_io_fair_share_weight()) {
             LastIoFairShareWeight_.store(request->io_fair_share_weight());
@@ -226,6 +239,7 @@ public:
         SetCalled();
         DataRequestCalled_.store(true);
         LastHasIoConsumed_.store(request->has_io_consumed());
+        LastIoConsumed_.store(request->io_consumed());
 
         if (request->has_io_fair_share_weight()) {
             LastIoFairShareWeight_.store(request->io_fair_share_weight());
@@ -309,6 +323,11 @@ public:
         PostponeProbingReply_.store(postponeProbingReply);
     }
 
+    void SetIOFairShareEnabled(bool ioFairShareEnabled)
+    {
+        IOFairShareEnabled_.store(ioFairShareEnabled);
+    }
+
     void SetChunkMeta(
         TChunkId chunkId,
         NProto::TChunkMeta chunkMeta)
@@ -319,6 +338,16 @@ public:
     void SetProbeStatistics(TProbeStatistics probeStatistics)
     {
         ProbeStatistics_ = std::move(probeStatistics);
+    }
+
+    void SetReadRequestBarrier(int requestCount)
+    {
+        ReadRequestBarrierSize_ = requestCount;
+    }
+
+    int GetBlockSetRequestCount() const
+    {
+        return GetBlockSetRequestCount_.load();
     }
 
     void SetCalled()
@@ -334,6 +363,11 @@ public:
     double GetLastIoFairShareWeight() const
     {
         return LastIoFairShareWeight_.load();
+    }
+
+    i64 GetLastIoConsumed() const
+    {
+        return LastIoConsumed_.load();
     }
 
     bool GetLastHasIoConsumed() const
@@ -354,11 +388,16 @@ private:
     std::atomic<bool> EnablePartialThrottling_ = false;
     std::atomic<bool> HasFatalError_ = false;
     std::atomic<bool> PostponeProbingReply_ = false;
+    std::atomic<bool> IOFairShareEnabled_ = true;
     std::optional<TProbeStatistics> ProbeStatistics_;
     bool PeerCalled_ = false;
     std::atomic<double> LastIoFairShareWeight_ = -1;
     std::atomic<bool> LastHasIoConsumed_ = false;
+    std::atomic<i64> LastIoConsumed_ = 0;
     std::atomic<bool> DataRequestCalled_ = false;
+    std::atomic<int> GetBlockSetRequestCount_ = 0;
+    int ReadRequestBarrierSize_ = 0;
+    const TPromise<void> ReadRequestBarrier_ = NewPromise<void>();
 
     TRandomGenerator Generator_{42};
 
@@ -407,6 +446,11 @@ private:
         auto statistics = New<TChunkReaderStatistics>();
         for (const auto& block : blocks) {
             statistics->DataBytesReadFromDisk += block.Size();
+        }
+        statistics->WastedDataBytesReadFromDisk = statistics->DataBytesReadFromDisk.load() / 2;
+        statistics->MetaBytesReadFromDisk = 17;
+        if (IOFairShareEnabled_.load()) {
+            statistics->IOConsumed = statistics->DataBytesReadFromDisk.load() + statistics->MetaBytesReadFromDisk.load();
         }
         return statistics;
     }
@@ -481,6 +525,14 @@ TEST_P(TReplicationReaderTest, ReadTest)
     auto probeResults = testCase.ProbeResults;
     auto selectedPeers = testCase.SelectedPeers;
 
+    if (testCase.ExpectUnbatchedReads) {
+        ASSERT_EQ(nodeCount, 1);
+        ASSERT_EQ(blockCount, 1);
+        ASSERT_EQ(batchCount, 1);
+        ASSERT_GT(requestInBatch, 1);
+        ASSERT_TRUE(testCase.EnableChunkProber);
+    }
+
     if (probeResults || selectedPeers) {
         EXPECT_TRUE(probeResults && selectedPeers && testCase.EnableChunkProber && std::ssize(*probeResults) == nodeCount);
     }
@@ -513,6 +565,11 @@ TEST_P(TReplicationReaderTest, ReadTest)
         addressToService[address] = service;
         service->SetChunkBlocks(chunkId, blocks);
         service->SetPartiallyThrottle(testCase.PartiallyThrottling);
+        service->SetIOFairShareEnabled(testCase.IOFairShareEnabled);
+        if (testCase.ExpectUnbatchedReads) {
+            // Keep the first response pending until every overlapping read gets its own RPC.
+            service->SetReadRequestBarrier(requestInBatch);
+        }
 
         if (nodesToBan > 0) {
             nodesToBan--;
@@ -569,6 +626,10 @@ TEST_P(TReplicationReaderTest, ReadTest)
     config->BlockSetSubrequestThreshold = testCase.BlockSetSubrequestThreshold;
     config->PartialPeerProbingTimeouts = testCase.PartialPeerProbingTimeouts;
     config->IoFairShareWeight = testCase.IoFairShareWeight;
+    if (testCase.ExpectUnbatchedReads) {
+        config->RetryCount = 1;
+        config->PassCount = 1;
+    }
     config->Postprocess();
 
     auto reader = CreateReplicationReader(
@@ -588,6 +649,7 @@ TEST_P(TReplicationReaderTest, ReadTest)
         jobIoMeter->SetIoFairShareWeight(*testCase.JobIoFairShareWeight);
     }
     readBlockOptions.ClientOptions.JobIoMeter = jobIoMeter;
+    readBlockOptions.ClientOptions.ForwardedIoFairShareState = testCase.ForwardedIoFairShareState;
     for (int batchIndex = 0; batchIndex < batchCount; batchIndex++) {
         std::vector<TFuture<std::vector<TBlock>>> futures;
 
@@ -654,18 +716,21 @@ TEST_P(TReplicationReaderTest, ReadTest)
     EXPECT_GE(statistics->DataBytesReadFromDisk, minBytesToRead);
     EXPECT_LE(statistics->DataBytesReadFromDisk, maxBytesToRead);
 
-    // The job I/O meter accounts disk-read bytes in the same place chunk reader
-    // statistics are handled; since the mock reports only data_bytes_read_from_disk,
-    // the enabled meter must match DataBytesReadFromDisk exactly.
-    auto expectedIoConsumed = testCase.EnableJobIoStatistics
-        ? statistics->DataBytesReadFromDisk.load()
+    // Wasted bytes are already included in the total disk reads.
+    auto expectedReportedIoConsumed = testCase.IOFairShareEnabled
+        ? statistics->DataBytesReadFromDisk.load() + statistics->MetaBytesReadFromDisk.load()
         : 0;
-    EXPECT_EQ(jobIoMeter->GetIoConsumedInWindow(TDuration::Hours(1)), expectedIoConsumed);
+    auto expectedIoConsumed = testCase.EnableJobIoStatistics ? expectedReportedIoConsumed : 0;
+    EXPECT_EQ(statistics->IOConsumed.load(), expectedReportedIoConsumed);
+    EXPECT_EQ(jobIoMeter->GetIoConsumedInWindow(), expectedIoConsumed);
 
-    // Every node that served a read request must have observed the expected
-    // io_fair_share_weight, or none when job I/O statistics are disabled.
+    // Forwarded fields take precedence over the local meter and reader config.
+    auto expectedHasIoConsumed = testCase.EnableJobIoStatistics;
     std::optional<double> expectedIoFairShareWeight;
-    if (testCase.EnableJobIoStatistics) {
+    if (const auto& state = testCase.ForwardedIoFairShareState) {
+        expectedHasIoConsumed = state->IoConsumed.has_value();
+        expectedIoFairShareWeight = state->IoFairShareWeight;
+    } else if (testCase.EnableJobIoStatistics) {
         expectedIoFairShareWeight = testCase.IoFairShareWeight
             ? testCase.IoFairShareWeight
             : testCase.JobIoFairShareWeight;
@@ -677,10 +742,16 @@ TEST_P(TReplicationReaderTest, ReadTest)
         }
 
         dataRequestObserved = true;
-        EXPECT_EQ(service->GetLastHasIoConsumed(), testCase.EnableJobIoStatistics);
+        EXPECT_EQ(service->GetLastHasIoConsumed(), expectedHasIoConsumed);
+        if (testCase.ForwardedIoFairShareState && expectedHasIoConsumed) {
+            EXPECT_EQ(service->GetLastIoConsumed(), *testCase.ForwardedIoFairShareState->IoConsumed);
+        }
         EXPECT_EQ(service->GetLastIoFairShareWeight(), expectedIoFairShareWeight.value_or(-1));
     }
     EXPECT_TRUE(dataRequestObserved);
+    if (testCase.ExpectUnbatchedReads) {
+        EXPECT_EQ(services.front()->GetBlockSetRequestCount(), requestInBatch);
+    }
 
     pool->Shutdown();
     memoryTracker->ClearTrackers();
@@ -692,10 +763,87 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         TTestCase{},
         TTestCase{
+            .NodeCount = 1,
+            .BlockCount = 1,
+            .RequestInBatch = 3,
+            .BlockInRequest = 1,
+            .EnableChunkProber = true,
+            .ForwardedIoFairShareState = TForwardedIoFairShareState{12345, 1.25},
+            .ExpectUnbatchedReads = true,
+        },
+        TTestCase{
+            .NodeCount = 1,
+            .BlockCount = 1,
+            .RequestInBatch = 3,
+            .BlockInRequest = 1,
+            .EnableChunkProber = true,
+            .ForwardedIoFairShareState = TForwardedIoFairShareState{0, 0.0},
+            .ExpectUnbatchedReads = true,
+        },
+        TTestCase{
+            .EnableChunkProber = true,
+            .ForwardedIoFairShareState = TForwardedIoFairShareState{},
+        },
+        TTestCase{
+            .EnableChunkProber = true,
+            .IOFairShareEnabled = false,
+        },
+        TTestCase{
+            .EnableChunkProber = true,
+            .ForwardedIoFairShareState = TForwardedIoFairShareState{12345, std::nullopt},
+        },
+        TTestCase{
+            .EnableChunkProber = true,
+            .ForwardedIoFairShareState = TForwardedIoFairShareState{std::nullopt, 1.25},
+        },
+        TTestCase{
+            .NodeCount = 1,
+            .BlockCount = 1,
+            .RequestInBatch = 3,
+            .BlockInRequest = 1,
+            .EnableChunkProber = true,
+            .EnableJobIoStatistics = false,
+            .ForwardedIoFairShareState = TForwardedIoFairShareState{12345, 1.25},
+            .ExpectUnbatchedReads = true,
+        },
+        TTestCase{
+            .NodeCount = 1,
+            .BlockCount = 1,
+            .RequestInBatch = 3,
+            .BlockInRequest = 1,
+            .EnableChunkProber = true,
+            .ExpectUnbatchedReads = true,
+        },
+        TTestCase{
+            .NodeCount = 1,
+            .BlockCount = 1,
+            .RequestInBatch = 3,
+            .BlockInRequest = 1,
+            .EnableChunkProber = true,
+            .IoFairShareWeight = std::nullopt,
+            .ExpectUnbatchedReads = true,
+        },
+        TTestCase{
+            .NodeCount = 1,
+            .BlockCount = 1,
+            .RequestInBatch = 3,
+            .BlockInRequest = 1,
+            .EnableChunkProber = true,
+            .IoFairShareWeight = std::nullopt,
+            .JobIoFairShareWeight = 0.0,
+            .ExpectUnbatchedReads = true,
+        },
+        TTestCase{
             .IoFairShareWeight = std::nullopt,
         },
         TTestCase{
+            .EnableChunkProber = true,
             .EnableJobIoStatistics = false,
+        },
+        TTestCase{
+            .EnableChunkProber = true,
+            .IoFairShareWeight = std::nullopt,
+            .JobIoFairShareWeight = std::nullopt,
         },
         TTestCase{
             .BatchCount = 16,
@@ -1111,6 +1259,62 @@ INSTANTIATE_TEST_SUITE_P(
             .SelectedPeers = {{1}}
         }
     ));
+
+////////////////////////////////////////////////////////////////////////////////
+
+template <class TRequest>
+class TForwardedIoFairShareStateTest
+    : public ::testing::Test
+{ };
+
+using TReadRequestTypes = ::testing::Types<
+    NProto::TReqGetBlockSet,
+    NProto::TReqGetBlockRange,
+    NProto::TReqGetChunkMeta>;
+TYPED_TEST_SUITE(TForwardedIoFairShareStateTest, TReadRequestTypes);
+
+TYPED_TEST(TForwardedIoFairShareStateTest, PreservesSnapshotAndLocalFallback)
+{
+    TClientChunkReadOptions options;
+    options.JobIoMeter = New<TJobIoMeter>(TDuration::Hours(1), /*enabled*/ true);
+    options.JobIoMeter->Account(999);
+    options.JobIoMeter->SetIoFairShareWeight(3.5);
+
+    // Requests without forwarding retain the configured-weight-over-meter policy.
+    TypeParam directRequest;
+    SetRequestReadIoFairShareState(&directRequest, options, 2.5);
+    ASSERT_TRUE(directRequest.has_io_consumed());
+    EXPECT_EQ(directRequest.io_consumed(), 999);
+    ASSERT_TRUE(directRequest.has_io_fair_share_weight());
+    EXPECT_EQ(directRequest.io_fair_share_weight(), 2.5);
+
+    for (const auto& state : {
+        TForwardedIoFairShareState{12345, 1.25},
+        TForwardedIoFairShareState{0, 0.0},
+        TForwardedIoFairShareState{},
+        TForwardedIoFairShareState{12345, std::nullopt},
+        TForwardedIoFairShareState{std::nullopt, 1.25},
+    }) {
+        // A separate read's snapshot must not change the original options/meter.
+        auto forwardedOptions = options;
+        forwardedOptions.ForwardedIoFairShareState = state;
+        TypeParam forwardedRequest;
+        SetRequestReadIoFairShareState(&forwardedRequest, forwardedOptions, 2.5);
+        EXPECT_EQ(forwardedRequest.has_io_consumed(), state.IoConsumed.has_value());
+        EXPECT_EQ(forwardedRequest.has_io_fair_share_weight(), state.IoFairShareWeight.has_value());
+        if (state.IoConsumed) {
+            EXPECT_EQ(forwardedRequest.io_consumed(), *state.IoConsumed);
+        }
+        if (state.IoFairShareWeight) {
+            EXPECT_EQ(forwardedRequest.io_fair_share_weight(), *state.IoFairShareWeight);
+        }
+    }
+
+    TypeParam nextDirectRequest;
+    SetRequestReadIoFairShareState(&nextDirectRequest, options, std::nullopt);
+    EXPECT_EQ(nextDirectRequest.io_consumed(), 999);
+    EXPECT_EQ(nextDirectRequest.io_fair_share_weight(), 3.5);
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 

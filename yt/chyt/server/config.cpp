@@ -534,7 +534,7 @@ void TUserDefinedSqlObjectsStorageConfig::Register(TRegistrar registrar)
     registrar.Parameter("path", &TThis::Path)
         .Default();
     registrar.Parameter("update_period", &TThis::UpdatePeriod)
-        .Default(TDuration::Seconds(5));
+        .Default(TDuration::Seconds(30));
     registrar.Parameter("expire_after_successful_sync_time", &TThis::ExpireAfterSuccessfulSyncTime)
         .Default(TDuration::Seconds(60));
 
@@ -648,6 +648,14 @@ void TExecutionProfilingConfig::Register(TRegistrar registrar)
         exponentialBoundsConfig->Max = TDuration::Seconds(20);
         config->AttributeFetchTimeHistogram->ExponentialBounds = std::move(exponentialBoundsConfig);
     });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TYtDynamicConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("query_settings", &TThis::QuerySettings)
+        .DefaultNew();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -859,6 +867,11 @@ void TClickHouseServerBootstrapConfig::Register(TRegistrar registrar)
     registrar.Parameter("yt", &TThis::Yt)
         .DefaultNew();
 
+    registrar.Parameter("dynamic_config_path", &TThis::DynamicConfigPath)
+        .Default();
+    registrar.Parameter("dynamic_config_manager", &TThis::DynamicConfigManager)
+        .DefaultNew();
+
     registrar.Parameter("graceful_interruption_delay", &TThis::GracefulInterruptionDelay)
         .Default(TDuration::Seconds(2))
         // COMPAT(dakovalkov)
@@ -949,6 +962,14 @@ TPorts TClickHouseServerBootstrapConfig::GetPorts() const
         .Http = ClickHouse->HttpPort,
         .Tcp = ClickHouse->TcpPort
     };
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TClickHouseServerDynamicConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("yt", &TThis::Yt)
+        .DefaultNew();
 }
 
 ////////////////////////////////////////////////////////////////////////////////

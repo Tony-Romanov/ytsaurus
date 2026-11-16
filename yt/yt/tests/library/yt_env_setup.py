@@ -1,4 +1,5 @@
 import yt_commands
+import yt_error_codes
 import yt_sequoia_helpers
 import yt_scheduler_helpers
 
@@ -7,6 +8,7 @@ try:
 except ImportError:
     from yt_tests_opensource_settings import has_tvm_service_support
 
+from yt.common import YtError
 from yt.environment import YTInstance, arcadia_interop
 from yt.environment.api import LocalYtConfig
 from yt.environment.helpers import (
@@ -503,6 +505,7 @@ class YTEnvSetup(object):
     TEST_MAINTENANCE_FLAGS = False
 
     WAIT_FOR_DYNAMIC_CONFIG = True
+    FORCE_ABORT_TRANSACTIONS_ON_CLEANUP = False
 
     ENABLE_MULTIDAEMON = False
 
@@ -2143,7 +2146,13 @@ class YTEnvSetup(object):
             for scion in scions:
                 if yt_commands.get(f"#{scion}/@path", driver=driver) == "//sys/operations":
                     continue
-                yt_commands.remove(f"#{scion}", driver=driver)
+                while True:
+                    try:
+                        yt_commands.remove(f"#{scion}", driver=driver)
+                        break
+                    except YtError as error:
+                        if not error.contains_code(yt_error_codes.Unavailable):
+                            raise
             yt_commands.gc_collect(driver=driver)
 
             if self._is_ground_cluster(cluster_index):
@@ -2154,7 +2163,10 @@ class YTEnvSetup(object):
 
                 # NB: //sys/schemas links for object types added by a master update
                 # are mirrored to ground and are never removed.
-                paths_to_ignore = ["//sys/operations", "//sys/pools", "//sys/strawberry", "//sys/schemas"]
+                paths_to_ignore = [
+                    "//sys/operations", "//sys/pools", "//sys/strawberry", "//sys/schemas",
+                    "//sys/account_tree", "//sys/cluster_masters",
+                ]
 
                 non_empty_tables = list(yt_sequoia.DESCRIPTORS.get_group("resolve_tables"))
 
@@ -2245,7 +2257,10 @@ class YTEnvSetup(object):
         test_cleanup.abort_transactions(
             list_action=lambda *args, **kwargs: yt_commands.ls(*args, driver=driver, **kwargs),
             abort_action=lambda transaction_id: requests.append(
-                yt_commands.make_batch_request(abort_command, transaction_id=transaction_id)),
+                yt_commands.make_batch_request(
+                    abort_command,
+                    transaction_id=transaction_id,
+                    force=self.FORCE_ABORT_TRANSACTIONS_ON_CLEANUP)),
             exists_action=lambda *args, **kwargs: yt_commands.exists(*args, driver=driver, **kwargs),
             get_action=lambda *args, **kwargs: yt_commands.get(*args, driver=driver, **kwargs))
 
@@ -2953,9 +2968,28 @@ class YTEnvSetup(object):
         # Resource holders are released asynchronously after a job vanishes, so the
         # resource manager may still report acquired resources right after the active
         # job count drops to zero. Poll instead of checking once.
-        resource_types = ["pending_resources", "acquired_resources"]
+        resource_types = ["pending_resources", "acquired_resources", "releasing_resources"]
+        cleanup_delays_released = False
+
+        def resources_released():
+            nonlocal cleanup_delays_released
+            nonzero = get_nonzero_resources(resource_types)
+            if (not cleanup_delays_released and
+                    any(type == "releasing_resources" for _, type, _ in nonzero) and
+                    not any("node" in components for components in self.ARTIFACT_COMPONENTS.values())):
+                config = yt_commands.get("//sys/cluster_nodes/@config", driver=driver)
+                if not config:
+                    config["%true"] = {}
+                for patch in config.values():
+                    update_inplace(patch, {
+                        "exec_node": {"job_controller": {"testing": {"release_job_cleanup_delays": True}}},
+                    })
+                yt_commands.set("//sys/cluster_nodes/@config", config, driver=driver)
+                cleanup_delays_released = True
+            return not nonzero
+
         try:
-            wait(lambda: not get_nonzero_resources(resource_types), iter=300)
+            wait(resources_released)
         except WaitFailed:
             nonzero = get_nonzero_resources(resource_types)
             assert not nonzero, "\n".join(

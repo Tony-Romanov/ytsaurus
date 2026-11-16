@@ -57,6 +57,8 @@ message THistoryTimeIndex
     optional EIndexMode mode = 6;
     // Included attributes are part of the index and can be used as selectors of select history query.
     repeated string included_attributes = 7;
+    // Hash column expression; mutually exclusive with hash_modulo.
+    optional string hash_expression = 8;
 }
 
 enum EMigrationState
@@ -173,6 +175,7 @@ message TAttributeSensor
     optional string path = 1;
     optional EAttributeSensorPolicy policy = 2;
     optional bool per_user = 3;
+    optional bool include_removed = 4;
 }
 
 message TAccessControlEntry
@@ -908,6 +911,8 @@ message TReferencesOption
 
     message TEndpoint
     {
+        extensions 1000 to 1999;
+
         // The object type that owns this side of the reference (snake_case).
         optional string object_type = 1;
 

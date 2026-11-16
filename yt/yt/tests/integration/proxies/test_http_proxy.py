@@ -151,6 +151,12 @@ class TestHttpProxy(HttpProxyTestBase):
         rsp = requests.get(self._get_proxy_address() + "/ping")
         rsp.raise_for_status()
 
+    @authors("shamteev")
+    def test_pull_rows_requires_root(self):
+        create_user("careless_ai_user")
+        with raises_yt_error("PullRows is only allowed", code=yt_error_codes.AuthorizationErrorCode):
+            self._execute_command("POST", "pull_rows", params={}, user="careless_ai_user")
+
     @authors("prime")
     def test_version(self):
         rsp = requests.get(self._get_proxy_address() + "/version")
@@ -773,6 +779,9 @@ class TestHttpProxyMemoryDrop(HttpProxyTestBase):
             "X-YT-Parameters": yson.dumps({"path": path}),
             "X-YT-Header-Format": "<format=text>yson",
             "X-YT-User-Name": "root",
+            # Identity, otherwise compressed output might fit into the socket buffer,
+            # so the response would finish before the client reads it.
+            "Accept-Encoding": "identity",
         }
         rsp = requests.get(
             f"{self._get_proxy_address()}/api/v4/read_file",
@@ -785,13 +794,11 @@ class TestHttpProxyMemoryDrop(HttpProxyTestBase):
     @authors("achains")
     @pytest.mark.timeout(180)
     def test_heavy_request_memory_reservation(self):
-        # https://st.yandex-team.ru/YT-30254
-        return
         proxy_name = ls("//sys/http_proxies")[0]
         reservation = 300 * 10**6
 
         create("file", "//tmp/file")
-        write_file("//tmp/file", b"x" * (128 * 2**20))
+        write_file("//tmp/file", b"x" * (64 * 2**20))
 
         set("//sys/http_proxies/@config", {
             "api": {

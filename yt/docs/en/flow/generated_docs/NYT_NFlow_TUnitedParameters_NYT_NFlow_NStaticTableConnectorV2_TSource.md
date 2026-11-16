@@ -22,7 +22,7 @@ By default, takes the timestamp from the table name. This time corresponds to th
 By default, takes the timestamp from the table creation time. This time corresponds to when the data is written to the source. That is, the moment when the pipeline can see this data and start reading. This time is forwarded to the SystemTimestamp of messages. ||
 || `use_planned_timestamps` | **Type**: `bool`
 **Default value**: `false`
-Use the persisted planned start time of each row range for both input message timestamps. The plan is fixed when the controller starts a table and survives restarts and rate changes. Timestamp locators still determine table discovery and ordering. Disabled by default. ||
+Use each row's planned read time for both input message timestamps. ||
 || `ignore_symlinks` | **Type**: `bool`
 **Default value**: `false`
 A flag that allows ignoring symlinks inside the table folder. ||
@@ -48,6 +48,8 @@ Period for refreshing the source's auxiliary partition information. A connector 
 || `byte_size_alpha` | **Type**: `double`
 **Default value**: `0.05`
 Exponential smoothing coefficient for the average byte total and message count per offset: larger values make the estimate react to new data faster. ||
+|| `write_time_column` | **Type**: `std::optional<std::string>`
+Column to materialize the source write time of the message into, as `uint64` milliseconds. Required by the static table export. The column is not created unless the parameter is set. ||
 |#
 
 

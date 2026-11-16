@@ -3,10 +3,7 @@ package chyt
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"hash"
 	"maps"
 	"math"
 	"os"
@@ -201,31 +198,6 @@ var clusterConnectionFields = []string{
 	"chyt",
 }
 
-type ysonHashEncoder struct {
-	*yson.Encoder
-	hasher hash.Hash
-}
-
-func (encoder *ysonHashEncoder) Sum() string {
-	return hex.EncodeToString(encoder.hasher.Sum(nil))
-}
-
-func newYsonHashEncoder() ysonHashEncoder {
-	hasher := sha256.New()
-	return ysonHashEncoder{
-		Encoder: yson.NewEncoderWriter(
-			yson.NewWriterConfig(
-				hasher,
-				yson.WriterConfig{
-					Format: yson.FormatBinary,
-					Kind:   yson.StreamListFragment,
-				},
-			),
-		),
-		hasher: hasher,
-	}
-}
-
 func (c *Controller) updateClusterConnection(ctx context.Context) (changed bool, err error) {
 	var clusterConnection map[string]any
 	err = c.ytc.GetNode(ctx, ypath.Path("//sys/@cluster_connection"), &clusterConnection, nil)
@@ -237,7 +209,7 @@ func (c *Controller) updateClusterConnection(ctx context.Context) (changed bool,
 		c.l.Error("failed to update cluster connection: cluster connection contains block_cache section")
 		return false, fmt.Errorf("chyt: cluster connection contains block_cache section; looks like a misconfiguration")
 	}
-	encoder := newYsonHashEncoder()
+	encoder := strawberry.NewYsonHashEncoder()
 	for _, field := range clusterConnectionFields {
 		if value, ok := clusterConnection[field]; ok {
 			if err := encoder.Encode(field); err != nil {
@@ -259,7 +231,7 @@ func (c *Controller) updateClusterConnection(ctx context.Context) (changed bool,
 }
 
 func (c *Controller) updateSecrets() (changed bool, err error) {
-	encoder := newYsonHashEncoder()
+	encoder := strawberry.NewYsonHashEncoder()
 	for _, secret := range slices.Sorted(maps.Keys(c.config.SecureVaultFiles)) {
 		var value []byte
 		if value, err = os.ReadFile(c.config.SecureVaultFiles[secret]); err != nil {
@@ -336,25 +308,25 @@ func (c *Controller) Root() ypath.Path {
 	return c.root
 }
 
-func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
-	spec map[string]any, description map[string]any, annotations map[string]any, runAsUser bool, err error) {
+func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (*strawberry.PrepareResult, error) {
+	result := &strawberry.PrepareResult{}
 	alias := oplet.Alias()
 
-	description = buildDescription(c.cluster, alias, c.config.EnableYandexSpecificLinksOrDefault())
+	result.Description = buildDescription(c.cluster, alias, c.config.EnableYandexSpecificLinksOrDefault())
 	speclet := oplet.ControllerSpeclet().(Speclet)
 
-	var opletInfo chytOpletInfo
+	var info chytOpletInfo
 	var filePaths []ypath.Rich
 
 	// Populate resources.
-	err = c.populateResources(&speclet)
+	err := c.populateResources(&speclet)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	err = c.prepareCypressDirectories(ctx, oplet.Alias())
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	if speclet.ODBCConfig.EnableOrDefault() {
@@ -372,39 +344,38 @@ func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
 
 	// Build artifacts if there are no local binaries.
 	if c.config.LocalBinariesDir == nil {
-		err = c.appendOpArtifacts(ctx, &speclet, &filePaths, &description, &opletInfo)
+		err = c.appendOpArtifacts(ctx, &speclet, &filePaths, &result.Description, &info)
 		if err != nil {
-			return
+			return nil, err
 		}
 	} else {
-		opletInfo.CHYTRunningVersion = "LocalVersion"
-		opletInfo.CHYTRunningVersionPath = filepath.Join(*c.config.LocalBinariesDir, "ytserver-clickhouse")
+		info.CHYTRunningVersion = "LocalVersion"
+		info.CHYTRunningVersionPath = filepath.Join(*c.config.LocalBinariesDir, "ytserver-clickhouse")
 	}
 	speclet.logsDir, err = c.prepareLocalLogs(oplet)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("failed to prepare local logs directory: %w", err)
+		return nil, fmt.Errorf("failed to prepare local logs directory: %w", err)
 	}
 
 	// Build configs.
-	opletInfo.ClusterConnectionDynamicConfigMode = speclet.ClusterConnectionDynamicConfigModeOrDefault(c.config.DefaultClusterConnectionDynamicConfigModeOrDefault())
+	info.ClusterConnectionDynamicConfigMode = speclet.ClusterConnectionDynamicConfigModeOrDefault(c.config.DefaultClusterConnectionDynamicConfigModeOrDefault())
 	err = c.appendConfigs(ctx, oplet, &speclet, &filePaths)
 	if err != nil {
-		return
+		return nil, err
 	}
-	oplet.SetOpletInfo(opletInfo)
 
 	// Upload odbcinst.ini and odbc.ini as Cypress file artifacts so they land in the job sandbox.
 	if speclet.ODBCConfig.EnableOrDefault() {
 		err = c.appendODBCConfigs(ctx, oplet, &speclet, &filePaths)
 		if err != nil {
-			return
+			return nil, err
 		}
 	}
 
 	if speclet.JDBCConfig.EnableOrDefault() {
 		err = c.appendJDBCConfig(ctx, oplet, &speclet, &filePaths)
 		if err != nil {
-			return
+			return nil, err
 		}
 	}
 
@@ -415,7 +386,7 @@ func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
 		portCount++
 	}
 
-	spec = map[string]any{
+	result.Spec = map[string]any{
 		"tasks": map[string]any{
 			"instances": map[string]any{
 				"command":                            command,
@@ -434,7 +405,7 @@ func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
 		"max_stderr_count":     150,
 		"title":                "CHYT clique *" + alias,
 	}
-	annotations = map[string]any{
+	result.Annotations = map[string]any{
 		"is_clique": true,
 		"expose":    true,
 	}
@@ -456,15 +427,20 @@ func (c *Controller) Prepare(ctx context.Context, oplet *strawberry.Oplet) (
 		var runtimePaths runtimePaths
 		runtimePaths, err = c.prepareRuntime(ctx, runtimeSpec, oplet.NextIncarnationIndex())
 		if err != nil {
-			return
+			return nil, err
 		}
-		spec["stderr_table_path"] = runtimePaths.StderrTable
-		spec["core_table_path"] = runtimePaths.CoreTable
+		result.Spec["stderr_table_path"] = runtimePaths.StderrTable
+		result.Spec["core_table_path"] = runtimePaths.CoreTable
 	}
 
-	runAsUser = false
+	result.RunAsUser = false
 
-	return
+	opletInfo, err := yson.Marshal(info)
+	if err != nil {
+		return nil, err
+	}
+	result.OpletInfo = opletInfo
+	return result, nil
 }
 
 func (c *Controller) Family() string {
@@ -487,6 +463,10 @@ func (c *Controller) ParseSpeclet(specletYson yson.RawValue) (any, error) {
 func (c *Controller) needsRestart(ctx context.Context, oplet *strawberry.Oplet) (bool, error) {
 	speclet := oplet.ControllerSpeclet().(Speclet)
 	if !speclet.RestartOnVersionDriftOrDefault() {
+		return false, nil
+	}
+
+	if len(oplet.OpletInfo()) == 0 {
 		return false, nil
 	}
 
@@ -805,55 +785,6 @@ func getVersionMetric(opletInfo yson.RawValue) (strawberry.Metric, bool) {
 		},
 		Value: 1,
 	}, true
-}
-
-func (c *Controller) GetOpletInfo(ctx context.Context, oplet *strawberry.Oplet) (any, error) {
-	opID := oplet.GetBriefInfo().YTOperation.ID
-	if opID == yt.NullOperationID {
-		return chytOpletInfo{}, nil
-	}
-
-	opInfo, err := c.ytc.GetOperation(
-		ctx,
-		opID,
-		&yt.GetOperationOptions{
-			Attributes: []string{"full_spec"},
-			MasterReadOptions: &yt.MasterReadOptions{
-				ReadFrom: yt.ReadFromFollower,
-			},
-		})
-	if err != nil {
-		return nil, err
-	}
-
-	var s struct {
-		Description struct {
-			Artifacts struct {
-				CH struct {
-					Version string `yson:"version"`
-				} `yson:"ytserver-clickhouse"`
-			} `yson:"artifacts"`
-		} `yson:"description"`
-
-		Tasks struct {
-			Instances struct {
-				FilePaths []ypath.Rich `yson:"file_paths"`
-			} `yson:"instances"`
-		} `yson:"tasks"`
-	}
-	err = yson.Unmarshal(opInfo.FullSpec, &s)
-	if err != nil {
-		return nil, err
-	}
-
-	opletInfo := chytOpletInfo{CHYTRunningVersion: s.Description.Artifacts.CH.Version}
-	for _, fp := range s.Tasks.Instances.FilePaths {
-		if fp.FileName == "ytserver-clickhouse" {
-			opletInfo.CHYTRunningVersionPath = fp.Path.String()
-			break
-		}
-	}
-	return opletInfo, nil
 }
 
 func (c *Controller) RunAsUser() bool {

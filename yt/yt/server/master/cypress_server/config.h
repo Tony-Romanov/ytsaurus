@@ -64,6 +64,12 @@ struct TDynamicCypressManagerConfig
 
     bool EnableSymlinkCyclicityCheck;
 
+    //! Enqueue existing Cypress symlinks on switch toggle.
+    bool EnableSymlinkBackfill;
+
+    //! Maximum number of candidate link versions allowed in a backfill.
+    int SymlinkBackfillMaxLinkCount;
+
     // COMPAT(h0pless): YT-26842. Remove in 25.4.
     bool UseBetterCheckWhenRewritingPath;
 
@@ -101,6 +107,10 @@ struct TDynamicCypressManagerConfig
 
     // Instead of iterating over all known locks, check each transaction only once during conflict resolution.
     bool EnableEvenMoreEfficientConflictCheck;
+
+    // Disabling this triggers an alert.
+    // TODO(ivpiskarev): remove after making sure that new behaviour does not cause issues.
+    bool CheckPendingLocksAfterPrelockRelease;
 
     NTableClient::EOptimizeFor DefaultOptimizeFor;
     NTableClient::EOptimizeFor DefaultDynamicTableOptimizeFor;

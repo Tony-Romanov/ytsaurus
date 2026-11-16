@@ -194,6 +194,11 @@ message TRspFlushBlocks
 {
     optional bool close_demanded = 1 [default = false];
     optional TChunkWriterStatistics chunk_writer_statistics = 2;
+
+    // Data bytes written to disk by this blob replica so far.
+    // Only reported for locations with I/O fair share enabled.
+    // FinishChunk includes the same bytes in chunk_writer_statistics.io_consumed.
+    optional int64 cumulative_io_consumed = 3;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

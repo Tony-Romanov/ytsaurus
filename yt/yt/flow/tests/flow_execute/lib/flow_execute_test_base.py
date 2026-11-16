@@ -197,11 +197,13 @@ class FlowExecuteTestBase(FlowTestBase):
 
             known_commands = [
                 "list",
+                "get-supported-features",
                 "get-command-required-permission",
                 "get-flow-view",
                 "get-flow-view-v2",
                 "get-pipeline-spec",
                 "set-pipeline-spec",
+                "remove-pipeline-spec",
                 "get-pipeline-dynamic-spec",
                 "set-pipeline-dynamic-spec",
                 "get-pipeline-dynamic-spec-patches",
@@ -234,6 +236,9 @@ class FlowExecuteTestBase(FlowTestBase):
             res = self.client.flow_execute(self.pipeline_path, flow_command="list")
             if self.CHECK_KNOWN_COMMANDS:
                 assert res == known_commands
+
+            features = self.client.flow_execute(self.pipeline_path, flow_command="get-supported-features")
+            assert features == ["dynamic_spec_patches"]
 
             # Test get-command-required-permission.
             res = self.client.flow_execute(
@@ -454,6 +459,33 @@ class FlowExecuteTestBase(FlowTestBase):
             assert (
                 new_static_spec["spec"]["computations"]["reader"]["watermark_strategy"]["watermark_percentile"]["value"]
                 == 0.5
+            )
+
+            remove_path = "/computations/reader/watermark_strategy"
+            wait(lambda: self.client.get_pipeline_state(self.pipeline_path) == "paused")
+            with pytest.raises(YtResponseError, match="stop the pipeline"):
+                self.client.remove_pipeline_spec(self.pipeline_path, spec_path=remove_path)
+            with pytest.raises(YtResponseError, match="Spec version mismatch"):
+                self.client.remove_pipeline_spec(
+                    self.pipeline_path,
+                    spec_path=remove_path,
+                    expected_version=new_static_spec_version + 1,
+                    force=True,
+                )
+            removed = self.client.remove_pipeline_spec(
+                self.pipeline_path,
+                spec_path=remove_path,
+                expected_version=new_static_spec_version,
+                force=True,
+            )
+            assert removed["version"] > new_static_spec_version
+            after_remove = self.client.flow_execute(
+                self.pipeline_path, flow_command="get-pipeline-spec", flow_argument={}
+            )
+            assert after_remove["version"] == removed["version"]
+            assert (
+                after_remove["spec"]["computations"]["reader"]["watermark_strategy"]["watermark_percentile"]["value"]
+                == 100.0
             )
 
             self.client.flow_execute(

@@ -4,15 +4,18 @@
 
 #include <library/cpp/streams/zstd/zstd.h>
 
-#include <library/cpp/yt/assert/assert.h>
 #include <library/cpp/yt/error/error.h>
+
+#include <library/cpp/yt/assert/assert.h>
 
 #include <util/generic/size_literals.h>
 #include <util/generic/strbuf.h>
 #include <util/generic/string.h>
+
 #include <util/stream/file.h>
 #include <util/stream/str.h>
 #include <util/stream/zlib.h>
+
 #include <util/system/shellcommand.h>
 
 #include <algorithm>
@@ -56,9 +59,6 @@ constexpr i64 ScanWindowSize = 1 << 20;
 
 //! Buffer size for the final decode pass.
 constexpr i64 DecodeChunkSize = 256 << 10;
-
-//! Sliced lines are cut to this length.
-constexpr i64 MaxLineLength = 16_MB;
 
 TString ReadFileRange(TFile& file, i64 offset, i64 size)
 {
@@ -168,18 +168,34 @@ class TBlockSliceEngine
 public:
     void Slice(TFile& file, TInstant from, TInstant to, TDuration seekMargin, IOutputStream& output) final
     {
-        i64 fileSize = file.GetLength();
-        if (fileSize == 0) {
-            return;
-        }
-
-        i64 startOffset = FindStartOffset(file, fileSize, from - seekMargin, to + seekMargin);
-        i64 endOffset = FindEndOffset(file, fileSize, to + seekMargin);
+        auto [startOffset, endOffset] = FindRange(file, from, to, seekMargin);
         if (endOffset <= startOffset) {
             return;
         }
 
         DecodeAndFilter(file, startOffset, endOffset, from, to, output);
+    }
+
+    std::pair<i64, i64> FindRange(TFile& file, TInstant from, TInstant to, TDuration seekMargin) final
+    {
+        i64 fileSize = file.GetLength();
+        if (fileSize == 0) {
+            return {0, 0};
+        }
+
+        i64 startOffset = FindStartOffset(file, fileSize, from - seekMargin, to + seekMargin);
+        i64 endOffset = FindEndOffset(file, fileSize, to + seekMargin);
+        return {startOffset, std::max(startOffset, endOffset)};
+    }
+
+    void Decode(TFile& file, i64 start, i64 end, const std::function<void(TStringBuf)>& consumer) final
+    {
+        if (start >= end) {
+            return;
+        }
+        DecodeRange(file, start, end, [&] (const char* data, size_t size) {
+            consumer(TStringBuf(data, size));
+        });
     }
 
     std::optional<std::pair<TInstant, TInstant>> GetTimeRange(TFile& file) final
@@ -197,7 +213,7 @@ public:
         // The last log line lives in the physically last decodable block. Find
         // that block directly by scanning backward from the end of the file for
         // a boundary marker -- no need to walk the whole file or binary-search.
-        i64 lastOffset = FindLastBlockOffset(file, fileSize).value_or(first->Offset);
+        i64 lastOffset = FindLastBlock(file, fileSize).value_or(*first).Offset;
         auto last = DecodeLastTime(file, lastOffset, fileSize);
 
         return std::make_pair(first->FirstTime, last.value_or(first->FirstTime));
@@ -380,26 +396,29 @@ private:
     }
 
     //! Start of the found start block, or of the head block when it begins with a
-    //! "Logging started" line within [startKey, endKey].
+    //! "Logging started" line within [startKey, endKey]; 0 when the first block
+    //! starts after [startKey].
     i64 FindStartOffset(TFile& file, i64 fileSize, TInstant startKey, TInstant endKey)
     {
+        auto firstBlock = FindBlockAtOrAfter(file, /*pos*/ 0, fileSize);
+        if (!firstBlock || firstBlock->FirstTime > startKey) {
+            return 0;
+        }
         auto startBlock = FindStartBlock(file, fileSize, startKey);
         if (!startBlock) {
             return 0;
         }
-        auto firstBlock = FindBlockAtOrAfter(file, /*pos*/ 0, fileSize);
-        bool startsLogInWindow = firstBlock &&
-            firstBlock->Offset < startBlock->Offset &&
+        bool startsLogInWindow = firstBlock->Offset < startBlock->Offset &&
             firstBlock->LogStartTime &&
             *firstBlock->LogStartTime >= startKey &&
             *firstBlock->LogStartTime <= endKey;
         return startsLogInWindow ? firstBlock->Offset : startBlock->Offset;
     }
 
-    //! Offset of the physically last decodable block in the file, located by
-    //! scanning backward for a boundary marker and validating each candidate by
-    //! decoding its head (see TryDecodeBlockInfo). Returns null if no valid block is found.
-    std::optional<i64> FindLastBlockOffset(TFile& file, i64 fileSize)
+    //! The physically last decodable block in the file, located by scanning
+    //! backward for a boundary marker and validating each candidate by decoding
+    //! its head (see TryDecodeBlockInfo). Returns null if no valid block is found.
+    std::optional<TBlockInfo> FindLastBlock(TFile& file, i64 fileSize)
     {
         i64 endPos = fileSize;
         while (endPos > 0) {
@@ -407,8 +426,8 @@ private:
             if (!candidate) {
                 break;
             }
-            if (TryDecodeBlockInfo(file, *candidate, fileSize)) {
-                return *candidate;
+            if (auto block = TryDecodeBlockInfo(file, *candidate, fileSize)) {
+                return block;
             }
             // Spurious marker (or undecodable tail): keep looking before it.
             endPos = *candidate;
@@ -416,9 +435,14 @@ private:
         return std::nullopt;
     }
 
-    //! Offset of the first block whose first timestamp is > [key], or [fileSize].
+    //! [fileSize] when the last block's first timestamp is <= [key]; otherwise the
+    //! offset of the first block whose first timestamp is > [key], or [fileSize].
     i64 FindEndOffset(TFile& file, i64 fileSize, TInstant key)
     {
+        auto lastBlock = FindLastBlock(file, fileSize);
+        if (!lastBlock || lastBlock->FirstTime <= key) {
+            return fileSize;
+        }
         i64 result = fileSize;
         i64 lo = 0;
         i64 hi = fileSize;

@@ -16,6 +16,7 @@ namespace NYql {
     namespace NCommonJobVars {
         extern const TString ACTOR_PORT;
         extern const TString GRPC_PORT;
+        extern const TString MONITORING_PORT;
         extern const TString ACTOR_NODE_ID;
         extern const TString LOG_LEVEL;
         extern const TString ADDRESS_RESOLVER_CONFIG;
@@ -82,6 +83,7 @@ namespace NYql {
 
         // Pinger
         TString DieOnFileAbsence; // see YQL-14099
+        ui16 MonitoringPort = 0;
 
         // Cleaner
         TMaybe<int> KeepFirst;

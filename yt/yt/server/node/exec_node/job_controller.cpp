@@ -374,7 +374,7 @@ public:
 
         StartAllocationsScheduled_ = true;
 
-        auto delay = GetDynamicConfig()->TestResourceAcquisitionDelay;
+        auto delay = GetDynamicConfig()->Testing->ResourceAcquisitionDelay;
         auto readyFuture = delay
             ? TDelayedExecutor::MakeDelayed(*delay)
             : OKFuture;
@@ -476,6 +476,14 @@ public:
             .AsVoid();
     }
 
+    TFuture<void> GetJobCleanupDelayReleasedFuture() const override
+    {
+        YT_ASSERT_THREAD_AFFINITY_ANY();
+
+        auto guard = ReaderGuard(JobsLock_);
+        return JobCleanupDelaysReleased_.ToFuture().ToUncancelable();
+    }
+
     void OnDynamicConfigChanged(
         const TJobControllerDynamicConfigPtr& oldConfig,
         const TJobControllerDynamicConfigPtr& newConfig) override
@@ -487,6 +495,21 @@ public:
         }
 
         DynamicConfig_.Store(newConfig);
+
+        if (newConfig->Testing->ReleaseJobCleanupDelays != oldConfig->Testing->ReleaseJobCleanupDelays) {
+            TPromise<void> promiseToRelease;
+            {
+                auto guard = WriterGuard(JobsLock_);
+                if (newConfig->Testing->ReleaseJobCleanupDelays) {
+                    promiseToRelease = JobCleanupDelaysReleased_;
+                } else {
+                    JobCleanupDelaysReleased_ = NewPromise<void>();
+                }
+            }
+            if (promiseToRelease) {
+                promiseToRelease.TrySet();
+            }
+        }
 
         ProfilingExecutor_->SetPeriod(
             newConfig->ProfilingPeriod);
@@ -581,6 +604,7 @@ private:
     THashMap<TOperationId, THashSet<TJobPtr>> OperationIdToJobs_;
 
     THashSet<TJobPtr> JobsWaitingForCleanup_;
+    TPromise<void> JobCleanupDelaysReleased_ = NewPromise<void>();
 
     // Map of jobs to hold after remove. It is used to prolong lifetime of stderrs and job specs.
     struct TRecentlyRemovedJobRecord
@@ -721,7 +745,7 @@ private:
                         .With("IncarnationId", incarnationId);
 
                     auto error = TError(Message)
-                        .With("abort_reason", EAbortReason::Other);
+                        .With("abort_reason", EAbortReason::ControllerAgentDescriptorNotFound);
                     allocation->Abort(error);
                 }
                 continue;
@@ -1329,7 +1353,7 @@ private:
                     YT_TLOG_DEBUG("Requested to remove running job; aborting job")
                         .With("JobId", jobId)
                         .With("JobState", job->GetState());
-                    AbortJob(job, EAbortReason::Other, /*graceful*/ false, /*requestNewJob*/ false);
+                    AbortJob(job, EAbortReason::JobRemovedByControllerAgent, /*graceful*/ false, /*requestNewJob*/ false);
                     RemoveJob(job, jobToRemove.ReleaseFlags);
                 }
             } else {

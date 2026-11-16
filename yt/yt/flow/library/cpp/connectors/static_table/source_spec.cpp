@@ -115,13 +115,23 @@ void TTableSourceParameters::Register(TRegistrar registrar)
 
 void TDynamicTableSourceParameters::Register(TRegistrar registrar)
 {
+    registrar.Parameter("catchup_lag_threshold", &TThis::CatchupLagThreshold)
+        .Default(TDuration::Seconds(10))
+        .GreaterThanOrEqual(TDuration::Zero());
+
+    registrar.Parameter("catchup_speedup_multiplier", &TThis::CatchupSpeedupMultiplier)
+        .Default(1.2)
+        .GreaterThanOrEqual(1.0);
+
     registrar.Parameter("desired_table_process_time", &TThis::DesiredTableProcessTime)
         .Default(TDuration::Hours(1));
 
     registrar.Parameter("max_rows_per_second", &TThis::MaxRowsPerSecond)
-        .Default(1e12);
+        .Default(1e12)
+        .GreaterThan(0);
     registrar.Parameter("max_bytes_per_second", &TThis::MaxBytesPerSecond)
-        .Default(1e12);
+        .Default(1e12)
+        .GreaterThan(0);
 
     registrar.Parameter("min_event_timestamp", &TThis::MinEventTimestamp)
         .Default();
@@ -165,6 +175,10 @@ void TDynamicTableSourcePartitionSpec::Register(TRegistrar registrar)
 
     registrar.Parameter("planned_timestamp", &TThis::PlannedTimestamp)
         .Default();
+    registrar.Parameter("planned_read_duration", &TThis::PlannedReadDuration)
+        .Default();
+    registrar.Parameter("use_planned_timestamps", &TThis::UsePlannedTimestamps)
+        .Default(false);
 
     registrar.Parameter("rows_per_second", &TThis::RowsPerSecond)
         .Default(1.0);

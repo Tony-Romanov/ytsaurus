@@ -126,11 +126,6 @@ protected:
     bool BlockNextPersist_ = false;
     int PersistCount_ = 0;
 
-    virtual bool EnablePagedTimerStore() const
-    {
-        return false;
-    }
-
     void SetUp() override
     {
         Queue_ = New<TActionQueue>("SpecUpdateTest");
@@ -190,7 +185,6 @@ protected:
 
         auto config = New<TControllerServiceConfig>();
         config->SetSpecRetryCount = 1;
-        config->EnablePagedTimerStore = EnablePagedTimerStore();
         Executor_ = CreateFlowExecutor(
             controller,
             stateManager,
@@ -281,14 +275,103 @@ protected:
     }
 };
 
+TEST_P(TFlowExecutorSpecUpdateTest, SupportedFeaturesWithoutFlowView)
+{
+    WaitFor(BIND([this] {
+        Keeper_->Reset();
+        const auto argument = TYsonString(TStringBuf("{}"));
+        auto commands = ConvertTo<std::vector<std::string>>(Executor_->Execute("list", argument, "alice"));
+        EXPECT_THAT(commands, ::testing::Contains("get-supported-features"));
+        auto features = ConvertTo<std::vector<std::string>>(Executor_->Execute("get-supported-features", argument, "alice"));
+        EXPECT_THAT(features, ::testing::ElementsAre("dynamic_spec_patches"));
+        auto permission = ConvertTo<IMapNodePtr>(Executor_->Execute(
+            "get-command-required-permission",
+            TYsonString(TStringBuf("{command=get-supported-features;}")),
+            "alice"));
+        EXPECT_EQ(permission->GetChildValueOrThrow<EPermission>("permission"), EPermission::Read);
+        EXPECT_EQ(PersistCount_, 0);
+    }).AsyncVia(Queue_->GetInvoker())
+            .Run())
+        .ThrowOnError();
+}
+
 TEST_P(TFlowExecutorSpecUpdateTest, DynamicUpdateRevalidatesAfterStaticUpdate)
 {
     RunConcurrentUpdates(/*staticFirst*/ true);
 }
 
+TEST_P(TFlowExecutorSpecUpdateTest, RemovePipelineSpecPreservesVersionAndStateGuards)
+{
+    WaitFor(BIND([this] {
+        State_->ExecutionSpec->PipelineState->TrySetValue(EPipelineState::Paused, VersionProvider_);
+        SyncFlowView();
+        auto version = Spec_->GetVersion();
+        TRemovePipelineSpecArg argument;
+        argument.Path = "/computations/graph/processing_function_parameters/graph/nodes/removed";
+        argument.ExpectedVersion = TVersion(version.Underlying() + 1);
+        argument.Force = true;
+        auto remove = [&] {
+            return ConvertTo<TSetPipelineSpecResult>(Executor_->Execute(
+                "remove-pipeline-spec",
+                ConvertToYsonString(argument),
+                "alice"));
+        };
+
+        EXPECT_THROW_THAT(remove(), HasSubstr("Spec version mismatch"));
+        argument.ExpectedVersion = version;
+        argument.Force = false;
+        EXPECT_THROW_THAT(remove(), HasSubstr("stop the pipeline"));
+        EXPECT_EQ(PersistCount_, 0);
+
+        argument.Force = true;
+        auto result = remove();
+        EXPECT_GT(result.Version, version);
+        EXPECT_EQ(result.Version, Spec_->GetVersion());
+        EXPECT_EQ(PersistCount_, 1);
+        EXPECT_TRUE(AreNodesEqual(
+            ConvertToNode(Spec_->GetValue()),
+            ConvertToNode(MakeGraphPipelineSpec(/*includeRemovedNode*/ false))));
+
+        argument.ExpectedVersion.reset();
+        EXPECT_THROW(remove(), TErrorException);
+        EXPECT_EQ(PersistCount_, 1);
+        EXPECT_EQ(Spec_->GetVersion(), result.Version);
+
+        auto permission = ConvertTo<IMapNodePtr>(Executor_->Execute(
+            "get-command-required-permission",
+            TYsonString(TStringBuf("{command=remove-pipeline-spec;}")),
+            "alice"));
+        EXPECT_EQ(permission->GetChildValueOrThrow<EPermission>("permission"), EPermission::Write);
+    }).AsyncVia(Queue_->GetInvoker())
+            .Run())
+        .ThrowOnError();
+}
+
 TEST_P(TFlowExecutorSpecUpdateTest, StaticUpdateRevalidatesAfterDynamicUpdate)
 {
     RunConcurrentUpdates(/*staticFirst*/ false);
+}
+
+TEST_P(TFlowExecutorSpecUpdateTest, PagedTimerStoreBackend)
+{
+    WaitFor(BIND([this] {
+        auto spec = MakeGraphPipelineSpec(/*includeRemovedNode*/ true);
+        spec->Computations["graph"]->TimerStoreBackend = ETimerStoreBackend::Paged;
+        if (GetParam()) {
+            TSetPipelineSpecsArg argument;
+            argument.Spec = ConvertToNode(spec);
+            Executor_->SetPipelineSpecs(argument);
+        } else {
+            TSetPipelineSpecArg argument;
+            argument.Spec = ConvertToNode(spec);
+            Executor_->SetPipelineSpec(argument);
+        }
+        EXPECT_EQ(PersistCount_, 1);
+        EXPECT_EQ(Spec_->GetValue()->Computations["graph"]->TimerStoreBackend, ETimerStoreBackend::Paged);
+    }).AsyncVia(Queue_->GetInvoker())
+            .Run()
+            .WithTimeout(TDuration::Seconds(20)))
+        .ThrowOnError();
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -297,53 +380,6 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Bool(),
     [] (const ::testing::TestParamInfo<bool>& info) {
         return info.param ? "Combined" : "Separate";
-    });
-
-////////////////////////////////////////////////////////////////////////////////
-
-class TFlowExecutorPagedTimerStoreTest
-    : public TFlowExecutorSpecUpdateTest
-{
-protected:
-    bool EnablePagedTimerStore() const override
-    {
-        return GetParam();
-    }
-
-    void SetPipelineSpecAndCheck(const TPipelineSpecPtr& spec)
-    {
-        WaitFor(BIND([&] {
-            TSetPipelineSpecArg argument;
-            argument.Spec = ConvertToNode(spec);
-            if (EnablePagedTimerStore()) {
-                Executor_->SetPipelineSpec(argument);
-                EXPECT_EQ(PersistCount_, 1);
-            } else {
-                EXPECT_THROW_WITH_SUBSTRING(
-                    Executor_->SetPipelineSpec(argument),
-                    "\"timer_store_backend\" = \"paged\" is not enabled on this controller (enable_paged_timer_store)");
-                EXPECT_EQ(PersistCount_, 0);
-            }
-        }).AsyncVia(Queue_->GetInvoker())
-                .Run()
-                .WithTimeout(TDuration::Seconds(20)))
-            .ThrowOnError();
-    }
-};
-
-TEST_P(TFlowExecutorPagedTimerStoreTest, ComputationLevelBackend)
-{
-    auto spec = MakeGraphPipelineSpec(/*includeRemovedNode*/ true);
-    spec->Computations["graph"]->TimerStoreBackend = ETimerStoreBackend::Paged;
-    SetPipelineSpecAndCheck(spec);
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    PagedTimerStoreFlag,
-    TFlowExecutorPagedTimerStoreTest,
-    ::testing::Bool(),
-    [] (const ::testing::TestParamInfo<bool>& info) {
-        return info.param ? "Enabled" : "Disabled";
     });
 
 ////////////////////////////////////////////////////////////////////////////////

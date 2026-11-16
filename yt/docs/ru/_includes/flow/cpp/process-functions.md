@@ -1,5 +1,7 @@
 # Process function в {{product-name}} Flow (C++)
 
+Process-функции также могут работать в отдельном процессе под управлением воркера. Регистрация, сборочные зависимости, доступ к ресурсам и подключение к воркеру описаны в статье [Запуск C++ process-функций в companion](../../../flow/cpp/companion.md).
+
 ## Зачем это нужно
 
 Новую пользовательскую логику на C++ реализуйте только как process function. Прямое наследование от `TTransformComputation`, `TSwiftMapComputation`, `TSwiftOrderedSourceComputation` или `TTransformOrderedSourceComputation` — low-level API для фреймворка и сопровождения legacy-кода, а не способ создания новых пользовательских компьютейшенов. Такая логика «вплетена» в объект `Computation`, наследует десятки protected-методов и конструируется только из полностью собранного `TComputationContext`, поэтому её практически невозможно покрыть юнит-тестами в изоляции.
@@ -81,6 +83,10 @@ classDiagram
 В `Process` (`IBatchProcessFunction`) и `ProcessKey` у `output` не проставлены родительские сообщения — проставляйте их сами через `output->SetParents(...)`; в поэлементных методах `IProcessFunction` (`ProcessMessage` / `ProcessTimer` / `ProcessVisit`) они уже проставлены на соответствующую сущность.
 
 Поле `Distribute` в `TAddMessageOptions` повторяет семантику `OutputCollector` у `Computation`: для source сообщение с `Distribute = false` не публикуется, но всё равно учитывается при оценке [вотермарка](../../../flow/concepts/glossary.md#timestamps-and-watermarks); для остальных `Computation` такое сообщение просто отбрасывается.
+
+### Сохранение проблемных сообщений {#failed-messages}
+
+См. раздел [Сохранение проблемных сообщений](../../../flow/concepts/failed-messages.md).
 
 ### Суффикс message id в Swift {#message-id-suffixes}
 
@@ -326,6 +332,8 @@ YT_FLOW_DEFINE_PROCESS_FUNCTION(TTextReadFunction, TTextReaderParameters);  // �
 - `entity_builders.h` — `MakeTestMessage` / `MakeTestRawMessage` / `MakeTestTimer` / `MakeTestVisit`.
 - `TProcessFunctionGraphTestHarness` — прогоняет [граф process function](#function-graph-testing) по эпохам.
 - `TProcessFunctionTestHarness` — прогоняет функцию по эпохам так же, как воркер: оборачивает функцию как batch (через `WrapAsBatch`, поэтому одинаково работают per-element, whole-batch и per-key формы, а таймеры и визиты диспатчатся рядом с сообщениями), один раз вызывает `Init`, а на каждый `RunEpoch(...)` прелоадит стейт, обрабатывает вход, выполняет end-of-epoch `Sync` для `ISyncProcessFunction` и коммитит стейт. Сообщения и таймеры последней эпохи доступны через `GetMessages()` / `GetTimers()`.
+
+Метод `GetFailedMessages()` у `TRecordingOutputCollector` и `TProcessFunctionTestHarness` возвращает входные сообщения, сохранённые через `AddFailedMessage()`, вместе с ошибками. Харнесс возвращает только ошибки последней эпохи.
 
 Зонтичный заголовок `process_function/testing/unittest.h` подключает весь перечисленный набор утилит; в тесте достаточно включить его вместо отдельных заголовков харнесса.
 

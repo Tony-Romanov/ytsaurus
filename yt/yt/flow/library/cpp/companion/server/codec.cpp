@@ -96,8 +96,17 @@ TBatchInput ParseProcessBatchRequest(
     input.JoinedExternalStates = ParseStates<TPayload>(request.joined_external_states());
 
     for (const auto& protoWatermark : request.watermarks()) {
-        input.Watermarks[TStreamId(protoWatermark.stream_id())] =
-            TSystemTimestamp(protoWatermark.watermark());
+        input.Watermarks[TStreamId(protoWatermark.stream_id())] = TStreamWatermarks{
+            .EventWatermark = TSystemTimestamp(protoWatermark.watermark()),
+            .SystemWatermark = TSystemTimestamp(protoWatermark.system_watermark()),
+        };
+    }
+
+    if (request.has_current_timestamp()) {
+        input.CurrentTimestamp = TSystemTimestamp(request.current_timestamp());
+    }
+    if (request.has_epoch_unique_seq_no()) {
+        input.EpochUniqueSeqNo = TUniqueSeqNo(request.epoch_unique_seq_no());
     }
 
     return input;

@@ -1291,6 +1291,8 @@ void TVolume::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("layers", &TThis::Layers)
         .Default();
+    registrar.Parameter("enable_node_layers", &TThis::EnableNodeLayers)
+        .Default(false);
     registrar.Parameter("allow_reusing", &TThis::AllowReusing)
         .Default(false);
 }
@@ -1984,6 +1986,9 @@ void TSortOperationSpecBase::Register(TRegistrar registrar)
         .Default();
 
     registrar.Parameter("force_job_size_adjuster", &TThis::ForceJobSizeAdjuster)
+        .Default(false);
+
+    registrar.Parameter("enable_shared_job_size_adjuster", &TThis::EnableSharedJobSizeAdjuster)
         .Default(false);
 
     registrar.Parameter("use_push_based_shuffle", &TThis::UsePushBasedShuffle)

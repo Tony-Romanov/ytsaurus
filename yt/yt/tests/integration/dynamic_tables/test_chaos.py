@@ -52,7 +52,7 @@ class TestChaos(ChaosTestBase):
     # TODO(nadya73): split this test suite.
     ENABLE_MULTIDAEMON = True
     NUM_REMOTE_CLUSTERS = 2
-    NUM_TEST_PARTITIONS = 40
+    NUM_TEST_PARTITIONS = 60
     NUM_SECONDARY_MASTER_CELLS_REMOTE_0 = 1
     NUM_SECONDARY_MASTER_CELLS_REMOTE_1 = 1
 
@@ -80,13 +80,16 @@ class TestChaos(ChaosTestBase):
         "31": {"roles": ["chunk_host", "cypress_node_host"]},
     }
 
-    def setup_method(self, method):
-        super(TestChaos, self).setup_method(method)
-
+    @pytest.fixture
+    def native_driver(self):
         native_config = deepcopy(self.Env.configs["driver"])
         native_config["connection_type"] = "native"
         native_config["api_version"] = 3
-        self.native_driver = Driver(native_config)
+        driver = Driver(native_config)
+        try:
+            yield driver
+        finally:
+            driver.terminate()
 
     @authors("savrus")
     def test_virtual_maps(self):
@@ -1376,14 +1379,31 @@ class TestChaos(ChaosTestBase):
         replica_ids = self._create_chaos_table_replicas(replicas, replication_card_id=card_id)
         assert len(replica_ids) == 2
 
+        self._create_sorted_table("//tmp/t", upstream_replica_id=replica_ids[0])
+
+        card_attributes = (
+            "era",
+            "coordinator_cell_ids",
+            "replicas",
+            "replication_collocation_id",
+            "replicated_table_options",
+            "collocated_replication_card_ids",
+        )
+        assert builtins.set(card_attributes) <= builtins.set(ls("//tmp/t/@"))
+
         wait(lambda: get("#{0}/@era".format(card_id)) == 1)
 
         assert get("//tmp/crt/@era") == get("#{0}/@era".format(card_id))
         wait(lambda: get("//tmp/crt/@coordinator_cell_ids") == get("#{0}/@coordinator_cell_ids".format(card_id)))
+        for attribute in card_attributes:
+            if attribute != "replicas":
+                assert get("//tmp/t/@" + attribute) == get("//tmp/crt/@" + attribute)
         card = get("#{0}/@".format(card_id))
 
         crt_replicas = get("//tmp/crt/@replicas")
+        table_replicas = get("//tmp/t/@replicas")
         assert len(crt_replicas) == 2
+        assert len(table_replicas) == 2
 
         def _assert_replicas_equal(lhs, rhs):
             return all(lhs[key] == rhs[key] for key in ("cluster_name", "replica_path", "mode", "state", "content_type"))
@@ -1392,7 +1412,8 @@ class TestChaos(ChaosTestBase):
             replica = card["replicas"][replica_id]
             del replica["history"]
             del replica["replication_progress"]
-            _assert_replicas_equal(replica, crt_replicas[replica_id])
+            assert _assert_replicas_equal(replica, crt_replicas[replica_id])
+            assert _assert_replicas_equal(table_replicas[replica_id], crt_replicas[replica_id])
 
     @authors("babenko")
     def test_chaos_replicated_table_replication_card_ownership(self):
@@ -2792,14 +2813,14 @@ class TestChaos(ChaosTestBase):
 
         assert _get_coordinator_suspension_status(coordinator_cell_id) == "normal"
         suspend_coordinator(coordinator_cell_id)
-        assert _get_coordinator_suspension_status(coordinator_cell_id) in {"suspending", "suspended"}
         # NB: Chaos cell orchid reads from follower do not sync with upstream.
+        wait(lambda: _get_coordinator_suspension_status(coordinator_cell_id) in {"suspending", "suspended"})
         wait(lambda: self._get_chaos_cell_orchid(coordinator_cell_id, "/coordinator_manager/internal/suspended"))
         assert _get_coordinator_suspension_status(coordinator_cell_id) == "suspended"
         wait(lambda: get("#{0}/@coordinator_cell_ids".format(card_id)) == [cell_id])
 
         resume_coordinator(coordinator_cell_id)
-        assert _get_coordinator_suspension_status(coordinator_cell_id) == "normal"
+        wait(lambda: _get_coordinator_suspension_status(coordinator_cell_id) == "normal")
         wait(lambda: not self._get_chaos_cell_orchid(coordinator_cell_id, "/coordinator_manager/internal/suspended"))
         wait(lambda: sorted(get("#{0}/@coordinator_cell_ids".format(card_id))) == sorted(chaos_cell_ids))
 
@@ -3611,7 +3632,7 @@ class TestChaos(ChaosTestBase):
         set("//sys/chaos_cell_bundles/c/@metadata_cell_id", cell_id)
 
         replicated_table_options = {
-            "enable_replicated_table_tracker": True,
+            "enable_replicated_table_tracker": False,
             "tablet_cell_bundle_name_ttl": 1000,
             "tablet_cell_bundle_name_failure_interval": 100,
             "preferred_sync_replica_clusters": ["primary"],
@@ -3621,8 +3642,6 @@ class TestChaos(ChaosTestBase):
             "replicated_table_options": replicated_table_options
         })
         card_id = get("//tmp/crt/@replication_card_id")
-        options = get("//tmp/crt/@replicated_table_options")
-        assert options["enable_replicated_table_tracker"]
 
         replicas = [
             {"cluster_name": "primary", "content_type": "data", "mode": "sync", "enabled": True, "replica_path": "//tmp/t"},
@@ -3636,6 +3655,9 @@ class TestChaos(ChaosTestBase):
             set("//sys/@config/tablet_manager/replicated_table_tracker/use_new_replicated_table_tracker", True, driver=driver)
 
         self._sync_replication_era(card_id, replicas)
+
+        alter_replication_card(card_id, enable_replicated_table_tracker=True)
+        assert get("//tmp/crt/@replicated_table_options/enable_replicated_table_tracker")
 
         for driver in self._get_drivers():
             set("//sys/@config/tablet_manager/replicated_table_tracker/replicator_hint/banned_replica_clusters", ["primary"], driver=driver)
@@ -3772,9 +3794,16 @@ class TestChaos(ChaosTestBase):
         })
 
         cards = sorted([card1, card2])
-        for crt in [crt1, crt2]:
+        for crt, table_replicas in [(crt1, replicas1), (crt2, replicas2)]:
             assert get("{0}/@replication_collocation_id".format(crt)) == collocation_id
             assert sorted(get("{0}/@collocated_replication_card_ids".format(crt))) == cards
+
+            replica = table_replicas[0]
+            driver = get_driver(cluster=replica["cluster_name"])
+            path = replica["replica_path"]
+            assert get("{0}/@replication_collocation_id".format(path), driver=driver) == collocation_id
+            assert sorted(get("{0}/@collocated_replication_card_ids".format(path), driver=driver)) == cards
+            assert get("{0}/@replicated_table_options".format(path), driver=driver) == get("{0}/@replicated_table_options".format(crt))
 
         collocation = self._get_chaos_cell_orchid(cell_id, "/chaos_manager/replication_card_collocations/{0}".format(collocation_id))
         assert collocation["state"] == "normal"
@@ -4142,7 +4171,9 @@ class TestChaos(ChaosTestBase):
         ]
         replica_ids = self._create_chaos_table_replicas(replicas, table_path="//tmp/crt")
 
-        sync_create_cells(1)
+        map_in_parallel(
+            lambda driver: sync_create_cells(1, driver=driver),
+            self._get_drivers())
         create("replicated_table", "//tmp/rt", attributes={"schema": schema, "dynamic": True, "preserve_tablet_index": True})
         if tablet_count > 1:
             reshard_table("//tmp/rt", tablet_count)
@@ -4154,33 +4185,39 @@ class TestChaos(ChaosTestBase):
             sync_enable_table_replica(replica_id)
             rt_replica_ids.append(replica_id)
 
-        self._create_replica_tables(replicas, replica_ids, mount_tables=False, ordered=True)
-        if tablet_count > 1:
-            for replica in replicas:
-                driver = get_driver(cluster=replica["cluster_name"])
-                path = replica["replica_path"]
-                reshard_table(path, tablet_count, driver=driver)
+        self._create_replica_tables(
+            replicas,
+            replica_ids,
+            create_tablet_cells=False,
+            mount_tables=False,
+            ordered=True,
+            tablet_count=tablet_count)
 
-        def _check(tablet_index, values):
+        def _check(replica_and_tablet_index):
             import logging
             logger = logging.getLogger()
-            logger.debug("Expected: {0}".format(values))
+            replica, tablet_index = replica_and_tablet_index
+            expected_values = values[tablet_index]
+            logger.debug("Expected: {0}".format(expected_values))
 
-            for replica in replicas:
+            driver = get_driver(cluster=replica["cluster_name"])
+            path = replica["replica_path"]
+            query = "key, value from [{0}] where [$tablet_index] = {1}". format(path, tablet_index)
+            wait(lambda: select_rows(query, driver=driver) == expected_values)
+
+        def _switch(new_replica_ids, progress=None, unmount_tables=True):
+            def _switch_replica(replica_and_id):
+                replica, new_id = replica_and_id
                 driver = get_driver(cluster=replica["cluster_name"])
                 path = replica["replica_path"]
-                query = "key, value from [{0}] where [$tablet_index] = {1}". format(path, tablet_index)
-                wait(lambda: select_rows(query, driver=driver) == values)
-
-        def _switch(new_replica_ids, progress=None):
-            for replica, new_id in zip(replicas, new_replica_ids):
-                driver = get_driver(cluster=replica["cluster_name"])
-                path = replica["replica_path"]
-                sync_unmount_table(path, driver=driver)
+                if unmount_tables:
+                    sync_unmount_table(path, driver=driver)
                 alter_table(path, upstream_replica_id=new_id, driver=driver)
                 if progress:
                     alter_table(path, replication_progress=progress, driver=driver)
                 sync_mount_table(path, driver=driver)
+
+            map_in_parallel(_switch_replica, zip(replicas, new_replica_ids))
 
         values = [[] for i in range(tablet_count)]
 
@@ -4191,11 +4228,11 @@ class TestChaos(ChaosTestBase):
                     "segments": [{"lower_key": [], "timestamp": timestamp}],
                     "upper_key": MAX_KEY,
                 }
-                _switch(replica_ids, progress)
+                _switch(replica_ids, progress, unmount_tables=iteration > 0)
                 self._sync_replication_era(card_id, replicas)
                 table = "//tmp/crt"
             else:
-                _switch(rt_replica_ids)
+                _switch(rt_replica_ids, unmount_tables=iteration > 0)
                 table = "//tmp/rt"
 
             new_values = [{"$tablet_index": i % tablet_count, "key": i, "value": str(i + iteration)} for i in range(0, 10, iteration + 1)]
@@ -4207,8 +4244,7 @@ class TestChaos(ChaosTestBase):
             logger.debug("Inserting: {0}".format(new_values))
 
             insert_rows(table, new_values)
-            for tablet_index in range(tablet_count):
-                _check(tablet_index, values[tablet_index])
+            map_in_parallel(_check, product(replicas, range(tablet_count)))
 
     @authors("ponasenko-rs")
     @pytest.mark.parametrize("mode", ["data/ordered", "ordered/replication_log"])
@@ -4765,7 +4801,7 @@ class TestChaos(ChaosTestBase):
         assert get_table_mount_info("//tmp/crt")["upper_cap_bound"][0] == 5
 
     @authors("osidorkin")
-    def test_crt_tablets_info(self):
+    def test_crt_tablets_info(self, native_driver):
         cell_id = self._sync_create_chaos_bundle_and_cell()
         set("//sys/chaos_cell_bundles/c/@metadata_cell_id", cell_id)
 
@@ -4811,7 +4847,7 @@ class TestChaos(ChaosTestBase):
         def _get_safe_trim_row_count(path: str, tablet_index: int):
             results = get_safe_trim_row_count(
                 [(path, tablet_index, ts)],
-                driver=self.native_driver
+                driver=native_driver
             )
             assert len(results) == 1
             return results[0]["value"]
@@ -5049,7 +5085,12 @@ class TestChaosSpecial(ChaosTestBase):
 
     @authors("ashishkin")
     def test_chaos_table_remove_column(self):
-        cell_id = self._sync_create_chaos_bundle_and_cell(name="chaos_bundle")
+        _, remote_driver0, remote_driver1 = self._get_drivers()
+        cell_id, _, _ = map_in_parallel(lambda create_cells: create_cells(), [
+            lambda: self._sync_create_chaos_bundle_and_cell(name="chaos_bundle"),
+            lambda: sync_create_cells(1, driver=remote_driver0),
+            lambda: sync_create_cells(1, driver=remote_driver1),
+        ])
         set("//sys/chaos_cell_bundles/chaos_bundle/@metadata_cell_id", cell_id)
 
         # create chaos tables federation
@@ -5075,13 +5116,12 @@ class TestChaosSpecial(ChaosTestBase):
             {"cluster_name": "remote_1", "content_type": "queue", "mode": "async", "enabled": True, "replica_path": "//tmp/q"},
         ]
         replica_ids = self._create_chaos_table_replicas(replicas, table_path="//tmp/crt")
-        self._create_replica_tables(replicas, replica_ids, schema=schema)
+        self._create_replica_tables(replicas, replica_ids, schema=schema, create_tablet_cells=False)
 
-        _, remote_driver0, remote_driver1 = self._get_drivers()
-        _validate_schema(schema, "//tmp/t", driver=remote_driver0)
-        _validate_schema(schema, "//tmp/q", driver=remote_driver0)
-        _validate_schema(schema, "//tmp/t", driver=remote_driver1)
-        _validate_schema(schema, "//tmp/q", driver=remote_driver1)
+        map_in_parallel(
+            lambda replica: _validate_schema(schema, replica["replica_path"], get_driver(cluster=replica["cluster_name"])),
+            replicas,
+        )
 
         card_id = get("//tmp/crt/@replication_card_id")
         self._sync_replication_era(card_id, replicas)
@@ -5128,21 +5168,26 @@ class TestChaosSpecial(ChaosTestBase):
         new_replica_ids = [None] * len(new_replicas)
 
         # create queue replicas
-        for i, r in enumerate(new_replicas):
-            if r["content_type"] == "data":
-                continue
+        queue_indexes = [i for i, replica in enumerate(new_replicas) if replica["content_type"] == "queue"]
+        for i in queue_indexes:
             new_replica_ids[i] = self._create_chaos_table_replica(new_replicas[i], table_path="//tmp/crt")
-            self._create_replica_tables([new_replicas[i]], [new_replica_ids[i]], schema=new_schema)
-            _validate_schema(new_schema, "//tmp/q.new", get_driver(cluster=r["cluster_name"]))
+        self._create_replica_tables(
+            [new_replicas[i] for i in queue_indexes],
+            [new_replica_ids[i] for i in queue_indexes],
+            schema=new_schema,
+            create_tablet_cells=False,
+        )
 
-        def _remove_replica(replica_id, driver):
+        map_in_parallel(
+            lambda replica: _validate_schema(new_schema, replica["replica_path"], get_driver(cluster=replica["cluster_name"])),
+            (new_replicas[i] for i in queue_indexes),
+        )
+
+        def _remove_replica(replica_id, replica_path, driver):
             alter_table_replica(replica_id, enabled=False, driver=driver)
             wait(lambda: get(f"#{replica_id}/@state", driver=driver) == "disabled")
             remove(f"#{replica_id}", driver=driver)
-
-        def _remove_table(path, driver):
-            sync_unmount_table(path, driver=driver)
-            remove(path, driver=driver)
+            remove(replica_path, driver=driver)
 
         def _get_replica_indexes(cluster_name, replicas):
             data_replica_index = -1
@@ -5161,21 +5206,18 @@ class TestChaosSpecial(ChaosTestBase):
             new_replica = new_replicas[data_replica_index]
             driver = get_driver(cluster=cluster_name)
 
-            create(
-                "table",
-                "//tmp/t.new",
-                schema=make_schema(new_schema, unique_keys=True),
-                driver=driver,
-            )
+            table_attributes = {"schema": make_schema(new_schema, unique_keys=True)}
+            self._update_mount_config(table_attributes)
+            create("table", "//tmp/t.new", attributes=table_attributes, driver=driver)
 
             timestamp = generate_timestamp(driver=driver)
             wait(lambda: get(f"//tmp/crt/@replicas/{replica_ids[data_replica_index]}/replication_lag_timestamp") > timestamp)
             sync_unmount_table("//tmp/t", driver=driver)
             merge(
-                in_="//tmp/t",
+                in_="//tmp/t{key,value}",
                 out=f"<output_timestamp={timestamp}>//tmp/t.new",
                 mode="ordered",
-                schema_inference_mode="from_output",
+                spec={"schema_inference_mode": "from_output"},
                 driver=driver
             )
             replication_progress = get("//tmp/t/@replication_progress", driver=driver)
@@ -5193,12 +5235,13 @@ class TestChaosSpecial(ChaosTestBase):
                 driver=driver
             )
             sync_mount_table("//tmp/t.new", driver=driver)
+            _validate_schema(new_schema, "//tmp/t.new", driver=driver)
 
             # remove old replicas and tables
-            for i in (data_replica_index, queue_replica_index):
-                _remove_replica(replica_ids[i], driver)
-            for t in ("//tmp/t", "//tmp/q"):
-                _remove_table(t, driver)
+            map_in_parallel(
+                lambda i: _remove_replica(replica_ids[i], replicas[i]["replica_path"], driver),
+                (data_replica_index, queue_replica_index),
+            )
 
             # check old data is present in new data replica
             _check_read_replica(values0, "//tmp/t.new", driver, new_schema)
@@ -5344,6 +5387,19 @@ class TestChaosRpcProxy(TestChaos):
             "expiration_period": 0,
         },
     }
+
+    @authors("shamteev")
+    def test_pull_rows_requires_root(self):
+        create_user("careless_ai_user")
+        with raises_yt_error("PullRows is only allowed", code=yt_error_codes.AuthorizationErrorCode):
+            pull_rows(
+                "//tmp/nonexistent",
+                replication_progress={
+                    "segments": [{"lower_key": [], "timestamp": 0}],
+                    "upper_key": MAX_KEY,
+                },
+                upstream_replica_id="0-0-0-0",
+                authenticated_user="careless_ai_user")
 
     @authors("savrus")
     def test_in_sync_async_replicas(self):
@@ -6070,7 +6126,7 @@ class TestChaosMetaCluster(ChaosTestBase):
     ENABLE_MULTIDAEMON = True
     NUM_REMOTE_CLUSTERS = 3
     NUM_CHAOS_NODES = 2
-    NUM_TEST_PARTITIONS = 3
+    NUM_TEST_PARTITIONS = 6
 
     DELTA_CHAOS_NODE_CONFIG = {
         "chaos_node": {

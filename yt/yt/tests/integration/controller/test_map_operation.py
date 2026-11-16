@@ -11,7 +11,8 @@ from yt_commands import (
     map, merge, sort, interrupt_job, get_first_chunk_id, abort_job, get_job, get_operation,
     get_singular_chunk_id, check_all_stderrs, make_random_string,
     create_test_tables, assert_statistics, extract_statistic_v2, sync_create_cells,
-    set_node_banned, update_inplace, update_controller_agent_config, update_nodes_dynamic_config, get_table_columnar_statistics)
+    set_node_banned, update_inplace, update_controller_agent_config, update_nodes_dynamic_config, get_table_columnar_statistics,
+    update_scheduler_config)
 
 from yt_type_helpers import make_schema, normalize_schema, make_column, list_type, tuple_type, optional_type
 
@@ -2792,76 +2793,6 @@ for row in sys.stdin.buffer:
 
         assert first_read <= first_written <= chunk_reader_spent_time
 
-    @authors("coteeq")
-    def test_writer_timing_statistics(self):
-        skip_if_component_old(self.Env, (26, 2), "node")
-        sync_create_cells(1)
-        init_operations_archive.create_tables_latest_version(
-            self.Env.create_native_client(), override_tablet_cell_bundle="default"
-        )
-        create("table", "//tmp/t1")
-        create("table", "//tmp/t_out0", attributes={"chunk_writer": {"testing_delay_before_chunk_close": 100}})
-        create("table", "//tmp/t_out1", attributes={"chunk_writer": {"testing_delay_before_chunk_close": 100}})
-        create("table", "//tmp/t_out2", attributes={"chunk_writer": {"testing_delay_before_chunk_close": 100}})
-
-        write_table("//tmp/t1", [{"key": i, "value": "val_{i}"} for i in range(10000)])
-        op = map(
-            in_=["//tmp/t1"],
-            out=["//tmp/t_out0", "//tmp/t_out1", "//tmp/t_out2"],
-            command="sleep 1 && tee /proc/self/fd/4 | (sleep 1 && cat)",
-            spec={
-                "job_io": {
-                    # Try really hard to write as slow as possible
-                    "table_writer": {
-                        "block_size": 1,
-                        "desired_chunk_size": 1,
-                    }
-                }
-            }
-        )
-
-        progress = get_operation(op.id, attributes=["progress"])["progress"]
-        statistics = progress["job_statistics_v2"]
-        chunk_count = len(get("//tmp/t_out0/@chunk_ids"))
-
-        assert progress["jobs"]["completed"]["total"] == 1
-        wait(lambda: len(op.list_jobs()) == 1)
-        job_id, = op.list_jobs()
-        wait(lambda: "running" in get_job_phase_durations(get_job(op.id, job_id).get("events", [])))
-        phase_durations = get_job_phase_durations(get_job(op.id, job_id)["events"])
-        running_time_ms = phase_durations["running"].total_seconds() * 1000
-
-        eps_ms = 20
-        # The empty writer's Close() shares the single-threaded ChunkWriter queue with the two
-        # writers closing real chunks, so its overhead over the injected delay is not tiny.
-        close_eps_ms = 1000
-
-        def assert_total_time(total_time):
-            # Not very precise :(.
-            assert abs(running_time_ms - total_time) < 1000
-
-        for table_index in [0, 1]:
-            wait_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.wait_time")
-            write_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.write_time")
-            idle_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.idle_time")
-            close_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.close_time")
-
-            assert wait_time > eps_ms
-            assert write_time > eps_ms
-            assert close_time >= 100 * chunk_count
-            assert_total_time(idle_time + wait_time + write_time + close_time)
-
-        for table_index in [2]:
-            wait_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.wait_time")
-            write_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.write_time")
-            idle_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.idle_time")
-            close_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.close_time")
-
-            assert wait_time == 0
-            assert write_time == 0
-            assert 100 <= close_time < 100 + close_eps_ms  # testing_delay_before_chunk_close + eps.
-            assert_total_time(idle_time + wait_time + write_time + close_time)
-
     @authors("apollo1321")
     def test_job_count_with_skewed_row_sizes(self):
         skip_if_component_old(self.Env, (25, 2), "controller-agent")
@@ -3148,13 +3079,6 @@ print(json.dumps(input))
 
     @authors("apollo1321")
     def test_fail_tactics_with_chunk_scraper(self):
-        """
-        This test ensures that unavailable input chunk is not added to chunk scraper if
-        unavailable_chunk_tactics is set to fail. Otherwise internal invariants may be
-        violated, because when this chunk is found, `Resume` is called without preceding
-        `Suspend` call.
-        """
-
         create("table", "//tmp/t_in")
         set("//tmp/t_in/@replication_factor", 1)
 
@@ -3199,6 +3123,47 @@ print(json.dumps(input))
         time.sleep(5)
 
         set_nodes_banned(replicas, False)
+
+        with raises_yt_error(f"Input chunk {chunk_id} is unavailable"):
+            op.track()
+
+    @authors("apollo1321")
+    def test_fail_tactics_with_chunk_available_again(self):
+        skip_if_component_old(self.Env, (27, 1), "controller-agent")
+
+        update_scheduler_config(
+            "testing_options/finish_operation_transition_delay",
+            {"duration": 20000, "type": "async"})
+
+        create("table", "//tmp/t_in", attributes={"replication_factor": 1})
+
+        write_table("<append=%true>//tmp/t_in", [{"col": "1"}])
+        skipped_chunk_id = get_first_chunk_id("//tmp/t_in")
+        set_nodes_banned(get(f"#{skipped_chunk_id}/@stored_replicas"), True)
+
+        write_table("<append=%true>//tmp/t_in", [{"col": "2"}])
+        chunk_id = get("//tmp/t_in/@chunk_ids/1")
+        replicas = get(f"#{chunk_id}/@stored_replicas")
+
+        op = map(
+            in_="//tmp/t_in",
+            out="<create=true>//tmp/t_out",
+            command=with_breakpoint("BREAKPOINT ; cat"),
+            spec={
+                "unavailable_chunk_strategy": "skip",
+                "unavailable_chunk_tactics": "fail",
+            },
+            track=False,
+        )
+        wait_breakpoint(op)
+
+        unavailable_chunks_path = op.get_orchid_path() + "/unavailable_input_chunks/<local>"
+
+        set_nodes_banned(replicas, True)
+        wait(lambda: op.get_state() == "failing")
+
+        set_nodes_banned(replicas, False)
+        wait(lambda: get(unavailable_chunks_path) == [skipped_chunk_id])
 
         with raises_yt_error(f"Input chunk {chunk_id} is unavailable"):
             op.track()
@@ -3291,6 +3256,110 @@ class TestSchedulerMapCommandsSysOperationsRootstock(TestSchedulerMapCommandsSha
 class TestSchedulerMapCommandsSequoia(TestSchedulerMapCommandsSysOperationsRootstock):
     ENABLE_MULTIDAEMON = True
     ENABLE_TMP_ROOTSTOCK = True
+
+
+##################################################################
+
+
+class TestWriterTimingStatistics(YTEnvSetup):
+    ENABLE_MULTIDAEMON = True
+    NUM_MASTERS = 1
+    NUM_NODES = 3
+    NUM_SCHEDULERS = 1
+    USE_DYNAMIC_TABLES = True
+
+    DELTA_DYNAMIC_NODE_CONFIG = {
+        "%true": {
+            "exec_node": {
+                "job_reporter": {
+                    "min_repeat_delay": 1000,
+                    "max_repeat_delay": 5000,
+                },
+            },
+        },
+    }
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "controller_agent": {
+            "job_reporter": {
+                "min_repeat_delay": 1000,
+                "max_repeat_delay": 5000,
+            },
+        },
+    }
+
+    def setup_method(self, method):
+        super().setup_method(method)
+        sync_create_cells(1)
+        init_operations_archive.create_tables_latest_version(
+            self.Env.create_native_client(), override_tablet_cell_bundle="default"
+        )
+
+    @authors("coteeq")
+    def test_writer_timing_statistics(self):
+        skip_if_component_old(self.Env, (26, 2), "node")
+        create("table", "//tmp/t1")
+        create("table", "//tmp/t_out0", attributes={"chunk_writer": {"testing_delay_before_chunk_close": 100}})
+        create("table", "//tmp/t_out1", attributes={"chunk_writer": {"testing_delay_before_chunk_close": 100}})
+        create("table", "//tmp/t_out2", attributes={"chunk_writer": {"testing_delay_before_chunk_close": 100}})
+
+        write_table("//tmp/t1", [{"key": i, "value": "val_{i}"} for i in range(10000)])
+        op = map(
+            in_=["//tmp/t1"],
+            out=["//tmp/t_out0", "//tmp/t_out1", "//tmp/t_out2"],
+            command="sleep 1 && tee /proc/self/fd/4 | (sleep 1 && cat)",
+            spec={
+                "job_io": {
+                    # Try really hard to write as slow as possible
+                    "table_writer": {
+                        "block_size": 1,
+                        "desired_chunk_size": 1,
+                    }
+                }
+            }
+        )
+
+        progress = get_operation(op.id, attributes=["progress"])["progress"]
+        statistics = progress["job_statistics_v2"]
+        chunk_count = len(get("//tmp/t_out0/@chunk_ids"))
+
+        assert progress["jobs"]["completed"]["total"] == 1
+        wait(lambda: len(op.list_jobs()) == 1)
+        job_id, = op.list_jobs()
+        wait(lambda: "running" in get_job_phase_durations(get_job(op.id, job_id).get("events", [])))
+        phase_durations = get_job_phase_durations(get_job(op.id, job_id)["events"])
+        running_time_ms = phase_durations["running"].total_seconds() * 1000
+
+        eps_ms = 20
+        # The empty writer's Close() shares the single-threaded ChunkWriter queue with the two
+        # writers closing real chunks, so its overhead over the injected delay is not tiny.
+        close_eps_ms = 1000
+
+        def assert_total_time(total_time):
+            # Not very precise :(.
+            assert abs(running_time_ms - total_time) < 1000
+
+        for table_index in [0, 1]:
+            wait_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.wait_time")
+            write_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.write_time")
+            idle_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.idle_time")
+            close_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.close_time")
+
+            assert wait_time > eps_ms
+            assert write_time > eps_ms
+            assert close_time >= 100 * chunk_count
+            assert_total_time(idle_time + wait_time + write_time + close_time)
+
+        for table_index in [2]:
+            wait_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.wait_time")
+            write_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.write_time")
+            idle_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.idle_time")
+            close_time = extract_statistic_v2(statistics, f"chunk_writer_statistics.{table_index}.close_time")
+
+            assert wait_time == 0
+            assert write_time == 0
+            assert 100 <= close_time < 100 + close_eps_ms  # testing_delay_before_chunk_close + eps.
+            assert_total_time(idle_time + wait_time + write_time + close_time)
 
 
 ##################################################################

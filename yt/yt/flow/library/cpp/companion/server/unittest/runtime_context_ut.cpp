@@ -52,8 +52,8 @@ TEST(TCompanionRuntimeContextTest, WatermarksAndDynamicParameters)
     auto context = MakeRuntimeContext();
 
     auto watermarkState = BuildWatermarkState({
-        {TStreamId("in1"), TSystemTimestamp(100)},
-        {TStreamId("in2"), TSystemTimestamp(50)},
+        {TStreamId("in1"), {.EventWatermark = TSystemTimestamp(100), .SystemWatermark = TSystemTimestamp(110)}},
+        {TStreamId("in2"), {.EventWatermark = TSystemTimestamp(50), .SystemWatermark = TSystemTimestamp(60)}},
     });
     auto dynamicParameters = ConvertTo<IMapNodePtr>(NYson::TYsonString(TStringBuf("{limit=7}")));
     context->RefreshEpochState(watermarkState, dynamicParameters);
@@ -61,6 +61,8 @@ TEST(TCompanionRuntimeContextTest, WatermarksAndDynamicParameters)
     EXPECT_EQ(context->GetWatermark(TStreamId("in1")), TSystemTimestamp(100));
     EXPECT_EQ(context->GetWatermark(TStreamId("in2")), TSystemTimestamp(50));
     EXPECT_EQ(context->GetInputEventWatermark(), TSystemTimestamp(50));
+    EXPECT_EQ(context->GetEpochWatermarkState()->GetSystemWatermark(TStreamId("in1")), TSystemTimestamp(110));
+    EXPECT_EQ(context->GetEpochWatermarkState()->GetSystemWatermark(TStreamId("in2")), TSystemTimestamp(60));
     EXPECT_EQ(
         context->GetDynamicParametersNode()->GetChildOrThrow("limit")->AsInt64()->GetValue(),
         7);
@@ -92,22 +94,41 @@ TEST(TCompanionRuntimeContextTest, ThrottlerThrows)
         "not available in a companion process");
 }
 
-TEST(TCompanionRuntimeContextTest, CurrentTimestampThrows)
+TEST(TCompanionRuntimeContextTest, EpochStateThrowsWhenNotSent)
 {
     auto context = MakeRuntimeContext();
-    context->RefreshEpochState(BuildWatermarkState({}), nullptr);
+    context->RefreshBatchState(TBatchInput{}, nullptr);
     EXPECT_THROW_WITH_SUBSTRING(
         Y_UNUSED(context->GetCurrentTimestamp()),
-        "not available in a companion process");
-}
-
-TEST(TCompanionRuntimeContextTest, EpochUniqueSeqNoThrows)
-{
-    auto context = MakeRuntimeContext();
-    context->RefreshEpochState(BuildWatermarkState({}), nullptr);
+        "was not sent to the companion process");
     EXPECT_THROW_WITH_SUBSTRING(
         Y_UNUSED(context->GetEpochUniqueSeqNo()),
-        "not available in a companion process");
+        "was not published");
+}
+
+TEST(TCompanionRuntimeContextTest, EpochStateFromBatch)
+{
+    auto context = MakeRuntimeContext();
+    TBatchInput input;
+    input.Watermarks[TStreamId("in1")] = {.EventWatermark = TSystemTimestamp(100), .SystemWatermark = TSystemTimestamp(110)};
+    input.CurrentTimestamp = TSystemTimestamp(200);
+    input.EpochUniqueSeqNo = TUniqueSeqNo(300);
+    context->RefreshBatchState(input, nullptr);
+
+    EXPECT_EQ(context->GetCurrentTimestamp(), TSystemTimestamp(200));
+    EXPECT_EQ(context->GetEpochWatermarkState()->GetCurrentTimestamp(), TSystemTimestamp(200));
+    EXPECT_EQ(context->GetEpochUniqueSeqNo(), TUniqueSeqNo(300));
+    EXPECT_EQ(context->GetWatermark(TStreamId("in1")), TSystemTimestamp(100));
+    EXPECT_EQ(context->GetEpochWatermarkState()->GetSystemWatermark(TStreamId("in1")), TSystemTimestamp(110));
+
+    // A later batch without the epoch state does not keep the previous one.
+    context->RefreshBatchState(TBatchInput{}, nullptr);
+    EXPECT_THROW_WITH_SUBSTRING(
+        Y_UNUSED(context->GetCurrentTimestamp()),
+        "was not sent to the companion process");
+    EXPECT_THROW_WITH_SUBSTRING(
+        Y_UNUSED(context->GetEpochUniqueSeqNo()),
+        "was not published");
 }
 
 ////////////////////////////////////////////////////////////////////////////////

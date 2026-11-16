@@ -43,6 +43,7 @@
 #include <yt/yt/core/misc/fs.h>
 #include <yt/yt/core/misc/proc.h>
 #include <yt/yt/core/misc/fair_share_hierarchical_queue.h>
+#include <yt/yt/core/misc/shutdown.h>
 
 #include <yt/yt/core/logging/log_manager.h>
 
@@ -409,6 +410,14 @@ bool TChunkLocation::ShouldUseUncategorizedThrottler() const
 
     auto config = GetRuntimeConfig();
     return config->EnableUncategorizedThrottler;
+}
+
+bool TChunkLocation::IsIOFairShareEnabled() const
+{
+    YT_ASSERT_THREAD_AFFINITY_ANY();
+
+    auto config = GetRuntimeConfig();
+    return config->EnableIOFairShare;
 }
 
 void TChunkLocation::Reconfigure(TChunkLocationConfigPtr config)
@@ -1749,7 +1758,7 @@ void TStoreLocation::CheckTrashTtl()
 {
     auto config = GetRuntimeConfig();
     auto deadline = TInstant::Now() - config->MaxTrashTtl;
-    while (true) {
+    while (!IsShutdownStarted()) {
         TTrashChunkEntry entry;
         {
             auto guard = Guard(TrashMapSpinLock_);
@@ -1769,6 +1778,10 @@ void TStoreLocation::CheckTrashTtl()
 
 void TStoreLocation::CheckTrashWatermark()
 {
+    if (IsShutdownStarted()) {
+        return;
+    }
+
     auto config = GetRuntimeConfig();
 
     bool needsCleanup;
@@ -1787,7 +1800,7 @@ void TStoreLocation::CheckTrashWatermark()
     YT_TLOG_INFO("Low available disk space, starting trash cleanup")
         .With("AvailableSpace", availableSpace);
 
-    while (availableSpace < config->TrashCleanupWatermark) {
+    while (!IsShutdownStarted() && availableSpace < config->TrashCleanupWatermark) {
         TTrashChunkEntry entry;
         {
             auto guard = Guard(TrashMapSpinLock_);

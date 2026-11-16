@@ -48,6 +48,8 @@ DEFINE_REFCOUNTED_TYPE(ITimerPageCatalogue);
 struct TComputationContextBase
 {
     TComputationSpecPtr ComputationSpec;
+    bool FailureHandlerEnabled = false;
+    TFlowCoreTarget FlowCoreTarget;
     NClient::NCache::IClientsCachePtr ClientsCache;
     NYPath::TRichYPath PipelinePath;
     TPartitionPtr Partition;
@@ -182,6 +184,7 @@ struct TComputationPartitionStatus
     : public NYTree::TYsonStruct
 {
     std::optional<NYTree::IMapNodePtr> ActiveSourceStatus;
+    THashMap<TSinkId, NYTree::IMapNodePtr> SinkStatuses;
 
     REGISTER_YSON_STRUCT(TComputationPartitionStatus);
 

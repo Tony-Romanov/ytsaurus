@@ -646,6 +646,49 @@ class MultiTypeAndOutcomeTest(unittest.TestCase):
             ["error"], None, None, allow_broad=False)
 
 
+class ReadOnlyCliBoundaryTest(unittest.TestCase):
+    def test_validated_request_reaches_access_preflight_before_building(self):
+        argv = [
+            'pod-tab.example',
+            '--type',
+            'error',
+            '-t',
+            '2026-11-10 12:00:00',
+            '-e',
+            '2026-11-10 12:00:10',
+            '--',
+            '-F',
+            'needle',
+        ]
+        with (
+            mock.patch('sys.argv', ['logslice.py', *argv]),
+            mock.patch.object(logslice.Ssh, '__init__', return_value=None) as ssh,
+            mock.patch.object(logslice, 'ssh_access_preflight', return_value='ssh_authentication') as access,
+            mock.patch.object(logslice, 'resolve_logslice') as build,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(logslice.main(), logslice.OPERATIONAL_FAILURE_EXIT)
+        self.assertEqual(ssh.call_args.args[0], 'pod-tab.example')
+        access.assert_called_once()
+        build.assert_not_called()
+
+    def test_invalid_requests_do_not_reach_ssh(self):
+        for arguments in (
+            ['pod-tab.example'],
+            ['pod-tab.example', '--type', 'unknown'],
+            ['pod-tab.example', '--type', 'error', '-x', 'rm /tmp/forbidden'],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch('sys.argv', ['logslice.py', *arguments]),
+                mock.patch.object(logslice.Ssh, '__init__') as ssh,
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                logslice.main()
+            ssh.assert_not_called()
+
+
 class StructuredLogContractTest(unittest.TestCase):
     HOST = "m003-hahn.sas.yp-c.yandex.net"
     COMPONENT = "master-sas5-4416"
@@ -653,12 +696,8 @@ class StructuredLogContractTest(unittest.TestCase):
     END = "2026-08-21 17:35:00,000"
 
     def _run(
-            self,
-            pipeline_result,
-            file_count=1,
-            log_types="access",
-            access_pipeline=None,
-            legacy_selection_result=False):
+        self, pipeline_result, file_count=1, log_types="access", access_pipeline=None, legacy_selection_result=False
+    ):
         log_type = logslice.parse_log_types(log_types)[0]
         is_yson = log_type in logslice.YSON_LOG_TYPES
         component = "scheduler-test" if is_yson else self.COMPONENT

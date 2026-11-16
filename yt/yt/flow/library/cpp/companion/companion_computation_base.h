@@ -59,6 +59,9 @@ void AddJoinedExternalStates(
     const THashMap<std::string, ICompanionStateAdapterPtr>& joiners,
     const IInputContextPtr& input);
 
+//! The epoch event and system watermarks of |streamId|, as an in-process host exposes them.
+TStreamWatermark MakeStreamWatermark(const TWatermarkStatePtr& watermarkState, const TStreamId& streamId);
+
 //! Rejects an external state manager with ``auto_preload = %false``: companion states are
 //! shipped with the batch, so the companion cannot preload on demand.
 void ValidateExternalStateManagersAutoPreload(const TComputationSpec& spec);
@@ -159,7 +162,8 @@ protected:
     //! Creates a new companion request of the specified type.
     /*!
      *  Creates a new request of type TRequestType and initializes it with the current job's
-     *  information including job ID, computation ID, computation static and dynamic specs, and stream specs.
+     *  information including job ID, computation ID, partition ID, computation static and dynamic specs,
+     *  stream specs and the current epoch's timestamp and sequence number. Must be called from DoProcess().
      *  This template method is used to create TCompanionProcessRequest.
      *
      *  \tparam TRequestType The type of request to create (e.g., TCompanionProcessRequest).
