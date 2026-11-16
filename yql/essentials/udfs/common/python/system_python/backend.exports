@@ -1,0 +1,6 @@
+C Register
+C AbiVersion
+C RunPython
+C BindSymbols
+C SetBackTraceCallback
+C CreateSystemPython3Module

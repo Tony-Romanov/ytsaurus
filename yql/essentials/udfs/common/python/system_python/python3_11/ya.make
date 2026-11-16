@@ -9,6 +9,12 @@ IF (USE_LOCAL_PYTHON)
     LDFLAGS("-lpython3.11")
 ENDIF()
 
+SET(EXPORTS_FILE ${ARCADIA_ROOT}/yql/essentials/udfs/common/python/system_python/backend.exports)
+
+SRCS(
+    ../backend.cpp
+)
+
 PEERDIR(
     yql/essentials/public/udf
 )

@@ -16,15 +16,23 @@ export YQL_BUILD_PATH=$(realpath $YQL_BUILD_PATH)
 
 mkdir -p $YQL_BUILD_PATH
 
+backends=()
+
 for version in 3.8 \
                3.9 \
                3.10 \
                3.11 \
-               3.12
+               3.12 \
+               3.13 \
+               3.14
 do
   udf_suffix=$(echo "$version" | tr . _)
   udf_name="python${udf_suffix}"
   python_name="python${version}"
+  if ! command -v "${python_name}-config" >/dev/null; then
+    echo "Skipping SystemPython ${version}: ${python_name}-config is not installed"
+    continue
+  fi
 
   # USE_LOCAL_PYTHON leads to a failure due to a bug in ya.
   # /usr/include/pythonX/pyconfig.h cannot include ARCH/pythonX/pyconfig.h without -I/usr/include
@@ -42,4 +50,21 @@ do
   if [[ "$BUILD_FLAGS" != *"--bazel-remote-put"* ]]; then
     strip --remove-section=.gnu_debuglink $YQL_BUILD_PATH/yql/essentials/udfs/common/python/system_python/${udf_name}/libsystem${udf_name}_udf.so
   fi
+  backends+=(--backend "$version" "$YQL_BUILD_PATH/yql/essentials/udfs/common/python/system_python/${udf_name}/libsystem${udf_name}_udf.so")
 done
+
+# Build the version-independent dispatcher in system Python mode, then bundle
+# the available backends. Package after stripping: strip discards the appended data.
+dispatcher_source="$YTSAURUS_SOURCE_PATH/yql/essentials/udfs/common/python/system_python/python3"
+python3 "$YTSAURUS_SOURCE_PATH/ya" make "$dispatcher_source" \
+  -T ${BUILD_FLAGS} --ignore-recurses -DSTRIP=yes \
+  -DUSE_ARCADIA_PYTHON=no -DUSE_LOCAL_PYTHON \
+  -DPYTHON_CONFIG=python3-config -DPYTHON_BIN=python3 \
+  --output "$YQL_BUILD_PATH"
+dispatcher="$YQL_BUILD_PATH/yql/essentials/udfs/common/python/system_python/python3/libsystempython3_udf.so"
+if [[ "$BUILD_FLAGS" != *"--bazel-remote-put"* ]]; then
+  strip --remove-section=.gnu_debuglink "$dispatcher"
+fi
+mv "$dispatcher" "$dispatcher.unpacked"
+python3 "$dispatcher_source/pack.py" --dispatcher "$dispatcher.unpacked" \
+  "${backends[@]}" --output "$dispatcher"

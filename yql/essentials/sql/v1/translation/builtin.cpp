@@ -2791,7 +2791,7 @@ public:
         } else {
             // Python supports getting functions signatures right from docstrings
             type = Y("EvaluateType", Y("ParseTypeHandle", Y("Apply",
-                                                            Y("bind", "core_module", Q("PythonFuncSignature")),
+                                                            Y("bind", "core_module", Q(ModuleName_ == "SystemPython3" ? "SystemPython3FuncSignature" : "PythonFuncSignature")),
                                                             Q(ModuleName_),
                                                             scriptNode,
                                                             Y("String", nameAtom))));

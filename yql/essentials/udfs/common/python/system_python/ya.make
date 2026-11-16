@@ -1,4 +1,5 @@
 RECURSE(
+    python3
     python3_8
     python3_9
     python3_10

@@ -22,7 +22,7 @@ def python_2_unicode_compatible(klass):
     return klass
 
 
-def main():
+def main(ti_base=None, ti_typing=None):
     import importlib.abc
     import importlib.machinery
 
@@ -36,11 +36,12 @@ def main():
 
     sys.meta_path.append(Finder())
 
-    try:
-        import yandex.type_info.type_base as ti_base
-        import yandex.type_info.typing as ti_typing
-    except ImportError as e:
-        raise ImportError(str(e) + ". Make sure that library/python/type_info is in your PEERDIR list")
+    if ti_base is None or ti_typing is None:
+        try:
+            import yandex.type_info.type_base as ti_base
+            import yandex.type_info.typing as ti_typing
+        except ImportError as e:
+            raise ImportError(str(e) + ". Make sure that library/python/type_info is in your PEERDIR list")
 
     from yql import typing
 

@@ -81,14 +81,20 @@ def parse_annotations(func, ann, name):
     else:
         return "(" + ",".join(convert_annotation(arg[0], arg[1], name) for arg in args) + ")->" + convert_annotation("return", ret, name);
 
-def signature(script, name):
+def signature(script, name, isolated_globals=False):
     import sys
     if sys.version_info >= (3, 0):
         name = name.decode("utf-8")
 
+    script_module = None
     try:
         local_variables = {}
-        exec(script, None, local_variables)
+        if isolated_globals:
+            import types
+            script_module = types.ModuleType("__yql_signature_" + str(id(local_variables)))
+            sys.modules[script_module.__name__] = script_module
+            local_variables = script_module.__dict__
+        exec(script, local_variables if isolated_globals else None, local_variables)
         func = local_variables[name]
         if typing is not None and hasattr(func, "__annotations__"):
             ann = func.__annotations__
@@ -119,10 +125,17 @@ def signature(script, name):
         out = StringIO()
         nested = traceback.print_exc(file=out)
         raise RuntimeError("Failed to extract type signature in the function: " + name + ", reason: \n" + out.getvalue())
+    finally:
+        if script_module is not None:
+            sys.modules.pop(script_module.__name__, None)
 @@))
 
 (let PythonFuncSignature (lambda '(flavor script name) (Apply 
     (ScriptUdf flavor 'signature (ParseType '"(String, String)->String") PythonFuncSignatureScript) script name)))
+
+(let SystemPython3FuncSignature (lambda '(flavor script name) (Apply
+    (Udf 'SystemPython3TypeInfo.Signature) PythonFuncSignatureScript script name)))
+
 
 (let KeysImpl (lambda '(seq)
    (MatchType seq 'Dict (lambda '() (DictKeys seq)) (lambda '() 
@@ -553,6 +566,7 @@ def signature(script, name):
 (export FlipBit)
 (export Decode)
 (export PythonFuncSignature)
+(export SystemPython3FuncSignature)
 (export ToSet)
 (export SetIsDisjoint)
 (export SetIntersection2)
